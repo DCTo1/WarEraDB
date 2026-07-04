@@ -1,0 +1,1006 @@
+[
+    {
+        "result": {
+            "data": {
+                "items": [
+                    {
+                        "_id": "697d03af53d6ad7bf1e86022",
+                        "money": 5,
+                        "buyerId": "681cf480427137e17d2e0ee8",
+                        "sellerMuId": "6873e948112cfb733a4992d9",
+                        "transactionType": "applicationFee",
+                        "createdAt": "2026-01-30T19:17:03.550Z",
+                        "updatedAt": "2026-01-30T19:17:03.550Z",
+                        "__v": 0
+                    },
+                    {
+                        "_id": "6945c3f74b3a1183899554a2",
+                        "money": 500,
+                        "buyerId": "681cf480427137e17d2e0ee8",
+                        "sellerMuId": "68e6858b97ef61438565d180",
+                        "transactionType": "applicationFee",
+                        "createdAt": "2025-12-19T21:30:31.419Z",
+                        "updatedAt": "2025-12-19T21:30:31.419Z",
+                        "__v": 0
+                    },
+                    {
+                        "_id": "68c078e4868c438675664072",
+                        "money": 5,
+                        "buyerId": "681cf480427137e17d2e0ee8",
+                        "sellerMuId": "6892c2a0b289f75a7db9da16",
+                        "transactionType": "applicationFee",
+                        "createdAt": "2025-09-09T18:58:44.536Z",
+                        "updatedAt": "2025-09-09T18:58:44.536Z",
+                        "__v": 0
+                    },
+                    {
+                        "_id": "68753faaf201ad88d214a5d0",
+                        "money": 25,
+                        "buyerId": "681cf480427137e17d2e0ee8",
+                        "sellerMuId": "6873ebf206cf11a5f9dbf7eb",
+                        "transactionType": "applicationFee",
+                        "createdAt": "2025-07-14T17:34:34.691Z",
+                        "updatedAt": "2025-07-14T17:34:34.691Z",
+                        "__v": 0
+                    }
+                ]
+            }
+        }
+    }
+]
+[
+    {
+        "result": {
+            "data": {
+                "items": [
+                    {
+                        "_id": "6a46185581b4c98aa42ba5f3",
+                        "money": 3.695,
+                        "itemCode": "steak",
+                        "quantity": 1,
+                        "sellerId": "69b908d18b78d77c48e76c84",
+                        "buyerId": "69c257c97cabe04a81f59629",
+                        "transactionType": "trading",
+                        "offerCreatedAt": "2026-07-02T07:44:51.243Z",
+                        "createdAt": "2026-07-02T07:50:45.160Z",
+                        "updatedAt": "2026-07-02T07:50:45.160Z",
+                        "__v": 0
+                    },
+                    {
+                        "_id": "6a4618534a250457fc866722",
+                        "money": 52.5,
+                        "itemCode": "lightAmmo",
+                        "quantity": 300,
+                        "sellerId": "698c1bd4067d5663f1f21a75",
+                        "buyerId": "68e0f6006555f19119ac310e",
+                        "transactionType": "trading",
+                        "offerCreatedAt": "2026-07-02T07:50:30.470Z",
+                        "createdAt": "2026-07-02T07:50:43.975Z",
+                        "updatedAt": "2026-07-02T07:50:43.975Z",
+                        "__v": 0
+                    },
+                    {
+                        "_id": "6a4618534a250457fc866710",
+                        "money": 35,
+                        "itemCode": "lightAmmo",
+                        "quantity": 200,
+                        "sellerId": "6945bd36a3e161cb35b91c52",
+                        "buyerId": "68e0f6006555f19119ac310e",
+                        "transactionType": "trading",
+                        "offerCreatedAt": "2026-07-02T07:47:59.827Z",
+                        "createdAt": "2026-07-02T07:50:43.961Z",
+                        "updatedAt": "2026-07-02T07:50:43.961Z",
+                        "__v": 0
+                    },
+                    {
+                        "_id": "6a4618532fdbd660fb484b3f",
+                        "money": 99.60000000000001,
+                        "itemCode": "limestone",
+                        "quantity": 1200,
+                        "sellerId": "69b6886f7903e4b84cd2646f",
+                        "buyerId": "6a07545cd5f7866834bbe53f",
+                        "transactionType": "trading",
+                        "offerCreatedAt": "2026-07-01T21:49:18.840Z",
+                        "createdAt": "2026-07-02T07:50:43.868Z",
+                        "updatedAt": "2026-07-02T07:50:43.868Z",
+                        "__v": 0
+                    },
+                    {
+                        "_id": "6a461852b8a3eb1503f45566",
+                        "money": 3.382,
+                        "itemCode": "case1",
+                        "quantity": 1,
+                        "sellerId": "6a2fe9ac7f2c49efdd7ad448",
+                        "buyerId": "699d48f719024e80579755d3",
+                        "transactionType": "trading",
+                        "offerCreatedAt": "2026-07-02T07:47:18.712Z",
+                        "createdAt": "2026-07-02T07:50:42.453Z",
+                        "updatedAt": "2026-07-02T07:50:42.453Z",
+                        "__v": 0
+                    }
+                ],
+                "nextCursor": "Thu Jul 02 2026 07:50:42 GMT+0000 (Coordinated Universal Time)|6a461852b8a3eb1503f45566"
+            }
+        }
+    }
+]
+[
+    {
+        "result": {
+            "data": {
+                "items": [
+                    {
+                        "_id": "6a461877e2c160a61af18873",
+                        "money": 43.024,
+                        "itemCode": "helmet4",
+                        "quantity": 1,
+                        "sellerId": "69dea12f056e34a95615bfdc",
+                        "buyerId": "697b433e8008928d1e180d89",
+                        "transactionType": "itemMarket",
+                        "item": {
+                            "_id": "6a461877e2c160a61af1886b",
+                            "type": "equipment",
+                            "code": "helmet4",
+                            "skills": {
+                                "criticalDamages": 72
+                            },
+                            "state": 100,
+                            "maxState": 100,
+                            "quantity": 1,
+                            "lastAcquisitionAt": "2026-07-02T07:23:16.713Z"
+                        },
+                        "offerCreatedAt": "2026-07-02T07:44:43.441Z",
+                        "createdAt": "2026-07-02T07:51:19.305Z",
+                        "updatedAt": "2026-07-02T07:51:19.305Z",
+                        "__v": 0
+                    },
+                    {
+                        "_id": "6a461873e6ad519efd526bab",
+                        "money": 1.33,
+                        "itemCode": "pants1",
+                        "quantity": 1,
+                        "sellerId": "699b543b08b4a182810ab355",
+                        "buyerId": "697c7f7d1a0bc85db39b585c",
+                        "transactionType": "itemMarket",
+                        "item": {
+                            "_id": "6a461873e6ad519efd526b98",
+                            "type": "equipment",
+                            "code": "pants1",
+                            "skills": {
+                                "armor": 4
+                            },
+                            "state": 100,
+                            "maxState": 100,
+                            "quantity": 1,
+                            "lastAcquisitionAt": "2026-07-02T07:11:20.583Z"
+                        },
+                        "offerCreatedAt": "2026-07-02T07:11:49.562Z",
+                        "createdAt": "2026-07-02T07:51:15.771Z",
+                        "updatedAt": "2026-07-02T07:51:15.771Z",
+                        "__v": 0
+                    },
+                    {
+                        "_id": "6a461872bab4daf62a6ff493",
+                        "money": 11.9,
+                        "itemCode": "rifle",
+                        "quantity": 1,
+                        "sellerId": "69d7446155f7de3a0998f9f4",
+                        "buyerId": "6a16d59e1649e2b0af8b0d62",
+                        "transactionType": "itemMarket",
+                        "item": {
+                            "_id": "6a461872bab4daf62a6ff48b",
+                            "code": "rifle",
+                            "skills": {
+                                "attack": 78,
+                                "criticalChance": 13
+                            },
+                            "state": 100,
+                            "maxState": 100,
+                            "quantity": 1,
+                            "lastAcquisitionAt": "2026-07-02T07:23:46.383Z"
+                        },
+                        "offerCreatedAt": "2026-07-02T07:25:06.374Z",
+                        "createdAt": "2026-07-02T07:51:14.590Z",
+                        "updatedAt": "2026-07-02T07:51:14.590Z",
+                        "__v": 0
+                    },
+                    {
+                        "_id": "6a46186bc7089bd9c20e1699",
+                        "money": 39.7,
+                        "itemCode": "sniper",
+                        "quantity": 1,
+                        "sellerId": "69967dad6d4c5be8198c6faf",
+                        "buyerId": "697b433e8008928d1e180d89",
+                        "transactionType": "itemMarket",
+                        "item": {
+                            "_id": "6a46186bc7089bd9c20e1691",
+                            "code": "sniper",
+                            "skills": {
+                                "attack": 106,
+                                "criticalChance": 17
+                            },
+                            "state": 100,
+                            "maxState": 100,
+                            "quantity": 1,
+                            "lastAcquisitionAt": "2026-06-30T13:47:26.653Z"
+                        },
+                        "offerCreatedAt": "2026-07-01T20:00:33.322Z",
+                        "createdAt": "2026-07-02T07:51:07.953Z",
+                        "updatedAt": "2026-07-02T07:51:07.953Z",
+                        "__v": 0
+                    },
+                    {
+                        "_id": "6a461866722e31e106e2c776",
+                        "money": 39.55,
+                        "itemCode": "sniper",
+                        "quantity": 1,
+                        "sellerId": "69cbfb2870c44f98fc1cbdc5",
+                        "buyerId": "697b433e8008928d1e180d89",
+                        "transactionType": "itemMarket",
+                        "item": {
+                            "_id": "6a461866722e31e106e2c76e",
+                            "code": "sniper",
+                            "skills": {
+                                "attack": 106,
+                                "criticalChance": 16
+                            },
+                            "state": 100,
+                            "maxState": 100,
+                            "quantity": 1,
+                            "lastAcquisitionAt": "2026-07-02T05:27:50.867Z"
+                        },
+                        "offerCreatedAt": "2026-07-02T07:39:03.092Z",
+                        "createdAt": "2026-07-02T07:51:02.111Z",
+                        "updatedAt": "2026-07-02T07:51:02.111Z",
+                        "__v": 0
+                    }
+                ],
+                "nextCursor": "Thu Jul 02 2026 07:51:02 GMT+0000 (Coordinated Universal Time)|6a461866722e31e106e2c776"
+            }
+        }
+    }
+]
+[
+    {
+        "result": {
+            "data": {
+                "items": [
+                    {
+                        "_id": "6a4618824322d7202ae153c4",
+                        "money": 3.753,
+                        "quantity": 27,
+                        "sellerId": "69aa2b72c4801396859d58ed",
+                        "buyerId": "69d400ff84a05d7230dcbec1",
+                        "transactionType": "wage",
+                        "createdAt": "2026-07-02T07:51:30.576Z",
+                        "updatedAt": "2026-07-02T07:51:30.576Z",
+                        "__v": 0
+                    },
+                    {
+                        "_id": "6a4618824322d7202ae1537d",
+                        "money": 1.4000000000000001,
+                        "quantity": 10,
+                        "sellerId": "697e0f1241475206a1e60ce2",
+                        "buyerId": "69ae103e44d829344025ea94",
+                        "transactionType": "wage",
+                        "createdAt": "2026-07-02T07:51:30.147Z",
+                        "updatedAt": "2026-07-02T07:51:30.147Z",
+                        "__v": 0
+                    },
+                    {
+                        "_id": "6a4618810e52425b5eb2fcb3",
+                        "money": 1.54,
+                        "quantity": 11,
+                        "sellerId": "697e0f1241475206a1e60ce2",
+                        "buyerId": "69ae103e44d829344025ea94",
+                        "transactionType": "wage",
+                        "createdAt": "2026-07-02T07:51:29.907Z",
+                        "updatedAt": "2026-07-02T07:51:29.907Z",
+                        "__v": 0
+                    },
+                    {
+                        "_id": "6a46188127059b41a0764533",
+                        "money": 5.016,
+                        "quantity": 38,
+                        "sellerId": "6908bc6893563e22a8c10c9c",
+                        "buyerId": "697e04673241f8b0eb865ee2",
+                        "transactionType": "wage",
+                        "createdAt": "2026-07-02T07:51:29.675Z",
+                        "updatedAt": "2026-07-02T07:51:29.675Z",
+                        "__v": 0
+                    },
+                    {
+                        "_id": "6a4618814322d7202ae151f4",
+                        "money": 1.54,
+                        "quantity": 11,
+                        "sellerId": "697e0f1241475206a1e60ce2",
+                        "buyerId": "69ae103e44d829344025ea94",
+                        "transactionType": "wage",
+                        "createdAt": "2026-07-02T07:51:29.472Z",
+                        "updatedAt": "2026-07-02T07:51:29.472Z",
+                        "__v": 0
+                    }
+                ],
+                "nextCursor": "Thu Jul 02 2026 07:51:29 GMT+0000 (Coordinated Universal Time)|6a4618814322d7202ae151f4"
+            }
+        }
+    }
+]
+[
+    {
+        "result": {
+            "data": {
+                "items": [
+                    {
+                        "_id": "6a46187f29ea4d0015ff2b58",
+                        "money": 5,
+                        "buyerId": "69bd1167df738acef6dfe032",
+                        "sellerMuId": "69f62a92788ef30e56b5311e",
+                        "transactionType": "donation",
+                        "createdAt": "2026-07-02T07:51:27.506Z",
+                        "updatedAt": "2026-07-02T07:51:27.506Z",
+                        "__v": 0
+                    },
+                    {
+                        "_id": "6a46187dcebb749b8cb5f98a",
+                        "money": 5,
+                        "buyerId": "699d4a61334c07324739c56a",
+                        "sellerMuId": "6967be23f21806fb47c0503b",
+                        "transactionType": "donation",
+                        "createdAt": "2026-07-02T07:51:25.541Z",
+                        "updatedAt": "2026-07-02T07:51:25.541Z",
+                        "__v": 0
+                    },
+                    {
+                        "_id": "6a46187b0e52425b5eb2f6bf",
+                        "money": 15,
+                        "buyerId": "698072a562a3fc2178c05154",
+                        "sellerCountryId": "6813b6d446e731854c7ac7a8",
+                        "transactionType": "donation",
+                        "createdAt": "2026-07-02T07:51:23.294Z",
+                        "updatedAt": "2026-07-02T07:51:23.294Z",
+                        "__v": 0
+                    },
+                    {
+                        "_id": "6a46187571e99502be75b6a8",
+                        "money": 5,
+                        "buyerId": "6980ad733a5b010ec4875abd",
+                        "sellerMuId": "697b4103e8e4d9fac4a56809",
+                        "transactionType": "donation",
+                        "createdAt": "2026-07-02T07:51:17.660Z",
+                        "updatedAt": "2026-07-02T07:51:17.660Z",
+                        "__v": 0
+                    },
+                    {
+                        "_id": "6a461874b3a290600a0694cc",
+                        "money": 5,
+                        "buyerId": "6a39a2cb073032b03f2a48d8",
+                        "sellerMuId": "6979055ac52da0aa0ccf98a3",
+                        "transactionType": "donation",
+                        "createdAt": "2026-07-02T07:51:16.599Z",
+                        "updatedAt": "2026-07-02T07:51:16.599Z",
+                        "__v": 0
+                    }
+                ],
+                "nextCursor": "Thu Jul 02 2026 07:51:16 GMT+0000 (Coordinated Universal Time)|6a461874b3a290600a0694cc"
+            }
+        }
+    }
+]
+[
+    {
+        "result": {
+            "data": {
+                "items": [
+                    {
+                        "_id": "6a4618804322d7202ae14fc2",
+                        "money": 5,
+                        "sellerId": "69762c0ea4c4d66462d1ffba",
+                        "buyerId": "6a00a490437f78a1d8a82bee",
+                        "transactionType": "articleTip",
+                        "createdAt": "2026-07-02T07:51:28.494Z",
+                        "updatedAt": "2026-07-02T07:51:28.494Z",
+                        "__v": 0
+                    },
+                    {
+                        "_id": "6a46185f0e52425b5eb2dac7",
+                        "money": 5,
+                        "sellerId": "699b2ff0e71fa94cb553b3c4",
+                        "buyerId": "69e9ee77fbb589bf37f27c48",
+                        "transactionType": "articleTip",
+                        "createdAt": "2026-07-02T07:50:55.538Z",
+                        "updatedAt": "2026-07-02T07:50:55.538Z",
+                        "__v": 0
+                    },
+                    {
+                        "_id": "6a4618534707a311291bfefa",
+                        "money": 5,
+                        "sellerId": "69ceb1117c3130bf835309fd",
+                        "buyerId": "68d65117471352ce35fb0ba4",
+                        "transactionType": "articleTip",
+                        "createdAt": "2026-07-02T07:50:43.554Z",
+                        "updatedAt": "2026-07-02T07:50:43.554Z",
+                        "__v": 0
+                    },
+                    {
+                        "_id": "6a46182ecf782be507b72b9b",
+                        "money": 5,
+                        "sellerId": "699b2ff0e71fa94cb553b3c4",
+                        "buyerId": "6977f8ef335f4c769c2a6722",
+                        "transactionType": "articleTip",
+                        "createdAt": "2026-07-02T07:50:06.615Z",
+                        "updatedAt": "2026-07-02T07:50:06.615Z",
+                        "__v": 0
+                    },
+                    {
+                        "_id": "6a46170342bcfbf6b7b25de0",
+                        "money": 5,
+                        "sellerId": "69cffe827e13cd10a82497aa",
+                        "buyerId": "697698a3aed8e4532613c1cb",
+                        "transactionType": "articleTip",
+                        "createdAt": "2026-07-02T07:45:07.915Z",
+                        "updatedAt": "2026-07-02T07:45:07.915Z",
+                        "__v": 0
+                    }
+                ],
+                "nextCursor": "Thu Jul 02 2026 07:45:07 GMT+0000 (Coordinated Universal Time)|6a46170342bcfbf6b7b25de0"
+            }
+        }
+    }
+]
+[
+    {
+        "result": {
+            "data": {
+                "items": [
+                    {
+                        "_id": "6a46189f27059b41a0765891",
+                        "itemCode": "case1",
+                        "quantity": 1,
+                        "sellerId": "6a05fcc18acffb56ac5a7fc4",
+                        "buyerId": "6a05fcc18acffb56ac5a7fc4",
+                        "transactionType": "openCase",
+                        "item": {
+                            "_id": "6a46189f27059b41a076588f",
+                            "code": "knife",
+                            "skills": {
+                                "attack": 32,
+                                "criticalChance": 4
+                            },
+                            "state": 100,
+                            "maxState": 100,
+                            "quantity": 1,
+                            "lastAcquisitionAt": "2026-07-02T07:51:59.693Z"
+                        },
+                        "createdAt": "2026-07-02T07:51:59.695Z",
+                        "updatedAt": "2026-07-02T07:51:59.695Z",
+                        "__v": 0
+                    },
+                    {
+                        "_id": "6a46189eb8a3eb1503f47d4a",
+                        "itemCode": "case1",
+                        "quantity": 1,
+                        "sellerId": "6a05fcc18acffb56ac5a7fc4",
+                        "buyerId": "6a05fcc18acffb56ac5a7fc4",
+                        "transactionType": "openCase",
+                        "item": {
+                            "_id": "6a46189eb8a3eb1503f47d47",
+                            "type": "equipment",
+                            "code": "boots1",
+                            "skills": {
+                                "dodge": 4
+                            },
+                            "state": 100,
+                            "maxState": 100,
+                            "quantity": 1,
+                            "lastAcquisitionAt": "2026-07-02T07:51:58.393Z"
+                        },
+                        "createdAt": "2026-07-02T07:51:58.399Z",
+                        "updatedAt": "2026-07-02T07:51:58.399Z",
+                        "__v": 0
+                    },
+                    {
+                        "_id": "6a46189d94abdb5413fa05b1",
+                        "itemCode": "case1",
+                        "quantity": 1,
+                        "sellerId": "68c54987551a038619c4c4ab",
+                        "buyerId": "68c54987551a038619c4c4ab",
+                        "transactionType": "openCase",
+                        "item": {
+                            "_id": "6a46189d94abdb5413fa05af",
+                            "code": "knife",
+                            "skills": {
+                                "attack": 33,
+                                "criticalChance": 1
+                            },
+                            "state": 100,
+                            "maxState": 100,
+                            "quantity": 1,
+                            "lastAcquisitionAt": "2026-07-02T07:51:57.778Z"
+                        },
+                        "createdAt": "2026-07-02T07:51:57.779Z",
+                        "updatedAt": "2026-07-02T07:51:57.779Z",
+                        "__v": 0
+                    },
+                    {
+                        "_id": "6a46189d94abdb5413fa05a1",
+                        "itemCode": "case1",
+                        "quantity": 1,
+                        "sellerId": "6a3ab91caa749b2b5c0bd3dd",
+                        "buyerId": "6a3ab91caa749b2b5c0bd3dd",
+                        "transactionType": "openCase",
+                        "item": {
+                            "_id": "6a46189d94abdb5413fa059e",
+                            "type": "equipment",
+                            "code": "pants1",
+                            "skills": {
+                                "armor": 5
+                            },
+                            "state": 100,
+                            "maxState": 100,
+                            "quantity": 1,
+                            "lastAcquisitionAt": "2026-07-02T07:51:57.765Z"
+                        },
+                        "createdAt": "2026-07-02T07:51:57.766Z",
+                        "updatedAt": "2026-07-02T07:51:57.766Z",
+                        "__v": 0
+                    },
+                    {
+                        "_id": "6a46189ab8a3eb1503f4750f",
+                        "itemCode": "case1",
+                        "quantity": 1,
+                        "sellerId": "69e0a79e80230b5a126f9f2c",
+                        "buyerId": "69e0a79e80230b5a126f9f2c",
+                        "transactionType": "openCase",
+                        "item": {
+                            "_id": "6a46189ab8a3eb1503f4750c",
+                            "type": "equipment",
+                            "code": "pants1",
+                            "skills": {
+                                "armor": 1
+                            },
+                            "state": 100,
+                            "maxState": 100,
+                            "quantity": 1,
+                            "lastAcquisitionAt": "2026-07-02T07:51:54.555Z"
+                        },
+                        "createdAt": "2026-07-02T07:51:54.558Z",
+                        "updatedAt": "2026-07-02T07:51:54.558Z",
+                        "__v": 0
+                    }
+                ],
+                "nextCursor": "Thu Jul 02 2026 07:51:54 GMT+0000 (Coordinated Universal Time)|6a46189ab8a3eb1503f4750f"
+            }
+        }
+    }
+]
+[
+    {
+        "result": {
+            "data": {
+                "items": [
+                    {
+                        "_id": "6a4618ab81b4c98aa42bd9aa",
+                        "itemCode": "scraps",
+                        "quantity": 18,
+                        "sellerId": "69891af9e65ed518afe26bce",
+                        "buyerId": "69891af9e65ed518afe26bce",
+                        "transactionType": "craftItem",
+                        "item": {
+                            "_id": "6a4618ab81b4c98aa42bd9a4",
+                            "code": "gun",
+                            "skills": {
+                                "attack": 54,
+                                "criticalChance": 6
+                            },
+                            "state": 100,
+                            "maxState": 100,
+                            "quantity": 1,
+                            "lastAcquisitionAt": "2026-07-02T07:52:11.512Z"
+                        },
+                        "createdAt": "2026-07-02T07:52:11.515Z",
+                        "updatedAt": "2026-07-02T07:52:11.515Z",
+                        "__v": 0
+                    },
+                    {
+                        "_id": "6a4618a74b56b78145299663",
+                        "itemCode": "scraps",
+                        "quantity": 486,
+                        "sellerId": "69de5f17be9308e166007440",
+                        "buyerId": "69de5f17be9308e166007440",
+                        "transactionType": "craftItem",
+                        "item": {
+                            "_id": "6a4618a74b56b7814529965d",
+                            "code": "tank",
+                            "skills": {
+                                "attack": 153,
+                                "criticalChance": 29
+                            },
+                            "state": 100,
+                            "maxState": 100,
+                            "quantity": 1,
+                            "lastAcquisitionAt": "2026-07-02T07:52:07.621Z"
+                        },
+                        "createdAt": "2026-07-02T07:52:07.625Z",
+                        "updatedAt": "2026-07-02T07:52:07.625Z",
+                        "__v": 0
+                    },
+                    {
+                        "_id": "6a46189d81b4c98aa42bcf88",
+                        "itemCode": "scraps",
+                        "quantity": 6,
+                        "sellerId": "699d4a61334c07324739c56a",
+                        "buyerId": "699d4a61334c07324739c56a",
+                        "transactionType": "craftItem",
+                        "item": {
+                            "_id": "6a46189d81b4c98aa42bcf81",
+                            "type": "equipment",
+                            "code": "pants1",
+                            "skills": {
+                                "armor": 5
+                            },
+                            "state": 100,
+                            "maxState": 100,
+                            "quantity": 1,
+                            "lastAcquisitionAt": "2026-07-02T07:51:57.600Z"
+                        },
+                        "createdAt": "2026-07-02T07:51:57.605Z",
+                        "updatedAt": "2026-07-02T07:51:57.605Z",
+                        "__v": 0
+                    },
+                    {
+                        "_id": "6a46189a38f1aa64789feed9",
+                        "itemCode": "scraps",
+                        "quantity": 6,
+                        "sellerId": "69248e63c6bbe2053f9d8f83",
+                        "buyerId": "69248e63c6bbe2053f9d8f83",
+                        "transactionType": "craftItem",
+                        "item": {
+                            "_id": "6a46189a38f1aa64789feed2",
+                            "type": "equipment",
+                            "code": "helmet1",
+                            "skills": {
+                                "criticalDamages": 8
+                            },
+                            "state": 100,
+                            "maxState": 100,
+                            "quantity": 1,
+                            "lastAcquisitionAt": "2026-07-02T07:51:54.251Z"
+                        },
+                        "createdAt": "2026-07-02T07:51:54.255Z",
+                        "updatedAt": "2026-07-02T07:51:54.255Z",
+                        "__v": 0
+                    },
+                    {
+                        "_id": "6a461895735d144305d280d4",
+                        "itemCode": "scraps",
+                        "quantity": 54,
+                        "sellerId": "69ea0e620f5ff8138cb47251",
+                        "buyerId": "69ea0e620f5ff8138cb47251",
+                        "transactionType": "craftItem",
+                        "item": {
+                            "_id": "6a461895735d144305d280cd",
+                            "type": "equipment",
+                            "code": "helmet3",
+                            "skills": {
+                                "criticalDamages": 34
+                            },
+                            "state": 100,
+                            "maxState": 100,
+                            "quantity": 1,
+                            "lastAcquisitionAt": "2026-07-02T07:51:49.347Z"
+                        },
+                        "createdAt": "2026-07-02T07:51:49.350Z",
+                        "updatedAt": "2026-07-02T07:51:49.350Z",
+                        "__v": 0
+                    }
+                ],
+                "nextCursor": "Thu Jul 02 2026 07:51:49 GMT+0000 (Coordinated Universal Time)|6a461895735d144305d280d4"
+            }
+        }
+    }
+]
+[
+    {
+        "result": {
+            "data": {
+                "items": [
+                    {
+                        "_id": "6a4618ba4707a311291c8741",
+                        "itemCode": "scraps",
+                        "quantity": 18,
+                        "sellerId": "687ce9f9122d0439d6a1d36c",
+                        "buyerId": "687ce9f9122d0439d6a1d36c",
+                        "transactionType": "dismantleItem",
+                        "item": {
+                            "_id": "6a46187a36c72bbffd4704e1",
+                            "type": "equipment",
+                            "code": "gloves2",
+                            "skills": {
+                                "precision": 7
+                            },
+                            "state": 100,
+                            "maxState": 100,
+                            "quantity": 1,
+                            "lastAcquisitionAt": "2026-07-02T07:51:22.743Z"
+                        },
+                        "createdAt": "2026-07-02T07:52:26.614Z",
+                        "updatedAt": "2026-07-02T07:52:26.614Z",
+                        "__v": 0
+                    },
+                    {
+                        "_id": "6a4618b8bb5e49cb2f9192fd",
+                        "itemCode": "scraps",
+                        "quantity": 18,
+                        "sellerId": "687ce9f9122d0439d6a1d36c",
+                        "buyerId": "687ce9f9122d0439d6a1d36c",
+                        "transactionType": "dismantleItem",
+                        "item": {
+                            "_id": "6a46187908a191e56c18508f",
+                            "type": "equipment",
+                            "code": "chest2",
+                            "skills": {
+                                "armor": 8
+                            },
+                            "state": 100,
+                            "maxState": 100,
+                            "quantity": 1,
+                            "lastAcquisitionAt": "2026-07-02T07:51:21.097Z"
+                        },
+                        "createdAt": "2026-07-02T07:52:24.510Z",
+                        "updatedAt": "2026-07-02T07:52:24.510Z",
+                        "__v": 0
+                    },
+                    {
+                        "_id": "6a4618b5bb5e49cb2f918f51",
+                        "itemCode": "scraps",
+                        "quantity": 18,
+                        "sellerId": "69fc35db3f4d0fbf89f78fd8",
+                        "buyerId": "69fc35db3f4d0fbf89f78fd8",
+                        "transactionType": "dismantleItem",
+                        "item": {
+                            "_id": "6a42ab8da7a21601b4ed03a6",
+                            "code": "rifle",
+                            "skills": {
+                                "attack": 90,
+                                "criticalChance": 15
+                            },
+                            "state": 0,
+                            "maxState": 100,
+                            "quantity": 1,
+                            "lastAcquisitionAt": "2026-06-29T17:29:49.802Z"
+                        },
+                        "createdAt": "2026-07-02T07:52:21.360Z",
+                        "updatedAt": "2026-07-02T07:52:21.360Z",
+                        "__v": 0
+                    },
+                    {
+                        "_id": "6a4618b438f1aa6478a000e3",
+                        "itemCode": "scraps",
+                        "quantity": 18,
+                        "sellerId": "687ce9f9122d0439d6a1d36c",
+                        "buyerId": "687ce9f9122d0439d6a1d36c",
+                        "transactionType": "dismantleItem",
+                        "item": {
+                            "_id": "6a46187c0a61625df078c9d2",
+                            "code": "gun",
+                            "skills": {
+                                "attack": 51,
+                                "criticalChance": 9
+                            },
+                            "state": 100,
+                            "maxState": 100,
+                            "quantity": 1,
+                            "lastAcquisitionAt": "2026-07-02T07:51:24.474Z"
+                        },
+                        "createdAt": "2026-07-02T07:52:20.723Z",
+                        "updatedAt": "2026-07-02T07:52:20.723Z",
+                        "__v": 0
+                    },
+                    {
+                        "_id": "6a4618b236c72bbffd472495",
+                        "itemCode": "scraps",
+                        "quantity": 6,
+                        "sellerId": "685ba0e5e00bfb5018fbb470",
+                        "buyerId": "685ba0e5e00bfb5018fbb470",
+                        "transactionType": "dismantleItem",
+                        "item": {
+                            "_id": "6a449f6b755fe0278a995fc2",
+                            "code": "knife",
+                            "skills": {
+                                "attack": 35,
+                                "criticalChance": 4
+                            },
+                            "state": 100,
+                            "maxState": 100,
+                            "quantity": 1,
+                            "lastAcquisitionAt": "2026-07-01T05:02:35.868Z"
+                        },
+                        "createdAt": "2026-07-02T07:52:18.038Z",
+                        "updatedAt": "2026-07-02T07:52:18.038Z",
+                        "__v": 0
+                    }
+                ],
+                "nextCursor": "Thu Jul 02 2026 07:52:18 GMT+0000 (Coordinated Universal Time)|6a4618b236c72bbffd472495"
+            }
+        }
+    }
+]
+[
+    {
+        "result": {
+            "data": {
+                "items": [
+                    {
+                        "_id": "6a46183189ebb656f70c0e1b",
+                        "itemCode": "gun",
+                        "quantity": 1,
+                        "buyerId": "69975a84896745b3e1b791b9",
+                        "transactionType": "battleLoot",
+                        "item": {
+                            "_id": "6a45b2c6bb5e49cb2f78300f",
+                            "code": "gun",
+                            "skills": {
+                                "attack": 52,
+                                "criticalChance": 9
+                            },
+                            "state": 100,
+                            "maxState": 100,
+                            "quantity": 1,
+                            "lastAcquisitionAt": "2026-07-02T00:37:26.794Z"
+                        },
+                        "createdAt": "2026-07-02T07:50:09.020Z",
+                        "updatedAt": "2026-07-02T07:50:09.020Z",
+                        "__v": 0
+                    },
+                    {
+                        "_id": "6a46183189ebb656f70c0e18",
+                        "itemCode": "boots2",
+                        "quantity": 1,
+                        "buyerId": "6974f623da02614bfce15f91",
+                        "transactionType": "battleLoot",
+                        "item": {
+                            "_id": "6a45826ec7089bd9c2e2eddd",
+                            "type": "equipment",
+                            "code": "boots2",
+                            "skills": {
+                                "dodge": 10
+                            },
+                            "state": 100,
+                            "maxState": 100,
+                            "quantity": 1
+                        },
+                        "createdAt": "2026-07-02T07:50:09.019Z",
+                        "updatedAt": "2026-07-02T07:50:09.019Z",
+                        "__v": 0
+                    },
+                    {
+                        "_id": "6a46183189ebb656f70c0e14",
+                        "itemCode": "pants3",
+                        "quantity": 1,
+                        "buyerId": "68905839bc2748428c5bb294",
+                        "transactionType": "battleLoot",
+                        "item": {
+                            "_id": "6a45f1a97d8ccc777c7dadcc",
+                            "type": "equipment",
+                            "code": "pants3",
+                            "skills": {
+                                "armor": 13
+                            },
+                            "state": 100,
+                            "maxState": 100,
+                            "quantity": 1
+                        },
+                        "createdAt": "2026-07-02T07:50:09.019Z",
+                        "updatedAt": "2026-07-02T07:50:09.019Z",
+                        "__v": 0
+                    },
+                    {
+                        "_id": "6a46183189ebb656f70c0e0f",
+                        "itemCode": "gloves3",
+                        "quantity": 1,
+                        "buyerId": "69972f7105bd7036ffa043e6",
+                        "transactionType": "battleLoot",
+                        "item": {
+                            "_id": "6a45baf5f8d872472b29d14e",
+                            "type": "equipment",
+                            "code": "gloves3",
+                            "skills": {
+                                "precision": 12
+                            },
+                            "state": 100,
+                            "maxState": 100,
+                            "quantity": 1
+                        },
+                        "createdAt": "2026-07-02T07:50:09.018Z",
+                        "updatedAt": "2026-07-02T07:50:09.018Z",
+                        "__v": 0
+                    },
+                    {
+                        "_id": "6a46183189ebb656f70c0e0c",
+                        "itemCode": "helmet2",
+                        "quantity": 1,
+                        "buyerId": "6988fd9b2fb0bdcb91e7ca19",
+                        "transactionType": "battleLoot",
+                        "item": {
+                            "_id": "6a45d1c1bb5e49cb2f7f00da",
+                            "type": "equipment",
+                            "code": "helmet2",
+                            "skills": {
+                                "criticalDamages": 21
+                            },
+                            "state": 100,
+                            "maxState": 100,
+                            "quantity": 1
+                        },
+                        "createdAt": "2026-07-02T07:50:09.018Z",
+                        "updatedAt": "2026-07-02T07:50:09.018Z",
+                        "__v": 0
+                    }
+                ],
+                "nextCursor": "Thu Jul 02 2026 07:50:09 GMT+0000 (Coordinated Universal Time)|6a46183189ebb656f70c0e0c"
+            }
+        }
+    }
+]
+[
+    {
+        "result": {
+            "data": {
+                "items": [
+                    {
+                        "_id": "6a4584babd513316e6c5809a",
+                        "money": 3000,
+                        "sellerCountryId": "6813b6d446e731854c7ac7b6",
+                        "buyerCountryId": "6813b6d446e731854c7ac7ba",
+                        "transactionType": "countryMoneyTransfer",
+                        "createdAt": "2026-07-01T21:20:58.473Z",
+                        "updatedAt": "2026-07-01T21:20:58.473Z",
+                        "__v": 0
+                    },
+                    {
+                        "_id": "6a4583632c9dcfce4cb69ca4",
+                        "money": 2000,
+                        "sellerCountryId": "6813b6d546e731854c7ac865",
+                        "buyerCountryId": "6813b6d446e731854c7ac7ba",
+                        "transactionType": "countryMoneyTransfer",
+                        "createdAt": "2026-07-01T21:15:15.878Z",
+                        "updatedAt": "2026-07-01T21:15:15.878Z",
+                        "__v": 0
+                    },
+                    {
+                        "_id": "6a457c0bfcfbe2eccd02e43f",
+                        "money": 1000,
+                        "sellerCountryId": "6813b6d446e731854c7ac805",
+                        "buyerCountryId": "6813b6d546e731854c7ac820",
+                        "transactionType": "countryMoneyTransfer",
+                        "createdAt": "2026-07-01T20:43:55.578Z",
+                        "updatedAt": "2026-07-01T20:43:55.578Z",
+                        "__v": 0
+                    },
+                    {
+                        "_id": "6a457b5d6f25c285aeabebb8",
+                        "money": 500,
+                        "sellerCountryId": "6813b6d546e731854c7ac84e",
+                        "buyerCountryId": "683ddd2c24b5a2e114af1600",
+                        "transactionType": "countryMoneyTransfer",
+                        "createdAt": "2026-07-01T20:41:01.587Z",
+                        "updatedAt": "2026-07-01T20:41:01.587Z",
+                        "__v": 0
+                    },
+                    {
+                        "_id": "6a4569e781b4c98aa4e00096",
+                        "money": 2000,
+                        "sellerCountryId": "683ddd2c24b5a2e114af1612",
+                        "buyerCountryId": "6813b6d446e731854c7ac7eb",
+                        "transactionType": "countryMoneyTransfer",
+                        "createdAt": "2026-07-01T19:26:31.790Z",
+                        "updatedAt": "2026-07-01T19:26:31.790Z",
+                        "__v": 0
+                    }
+                ],
+                "nextCursor": "Wed Jul 01 2026 19:26:31 GMT+0000 (Coordinated Universal Time)|6a4569e781b4c98aa4e00096"
+            }
+        }
+    }
+]
