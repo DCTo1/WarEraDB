@@ -45,9 +45,15 @@ RETURNS SMALLINT AS $$
 DECLARE
     v_id SMALLINT;
 BEGIN
-    SELECT id INTO v_id FROM transaction_types WHERE type = p_type;
+    IF p_type IS NULL THEN
+        RETURN NULL;
+    END IF;
+    INSERT INTO transaction_types (type)
+    VALUES (p_type)
+    ON CONFLICT (type) DO NOTHING
+    RETURNING id INTO v_id;
     IF v_id IS NULL THEN
-        RAISE EXCEPTION 'Unknown transaction type: %', p_type;
+        SELECT id INTO v_id FROM transaction_types WHERE type = p_type;
     END IF;
     RETURN v_id;
 END;
@@ -101,6 +107,7 @@ $$ LANGUAGE plpgsql;
 CREATE OR REPLACE FUNCTION insert_transaction(payload JSONB)
 RETURNS BIGINT AS $$
 DECLARE
+    v_transaction_id TEXT;
     v_created_at TIMESTAMPTZ;
     v_offer_created_at TIMESTAMPTZ;
     v_seller_id INT;
@@ -108,6 +115,7 @@ DECLARE
     v_secondary_seller_id INT;
     v_secondary_buyer_id INT;
     v_item_code_id SMALLINT;
+    v_result_item_code_id SMALLINT;
     v_transaction_type_id SMALLINT;
     v_money DOUBLE PRECISION;
     v_quantity DOUBLE PRECISION;
@@ -115,9 +123,11 @@ DECLARE
     v_secondary_skill SMALLINT;
     v_extra JSONB;
     v_item JSONB;
+    v_skill_code TEXT;
     v_new_id BIGINT;
 BEGIN
     -- 1. Extract basic fields
+    v_transaction_id := payload->>'_id';
     v_created_at := (payload->>'createdAt')::TIMESTAMPTZ;
     v_offer_created_at := (payload->>'offerCreatedAt')::TIMESTAMPTZ;
     v_money := (payload->>'money')::DOUBLE PRECISION;
@@ -143,20 +153,26 @@ BEGIN
         v_secondary_buyer_id := NULL;
     END IF;
 
-    -- 3. Item code and skills
+    -- 3. Item code, result item code, and skills
     v_item_code_id := get_item_code_id(payload->>'itemCode');
+    v_result_item_code_id := get_item_code_id(payload->>'resultItemCode');
+    
     v_item := payload->'item';
+    -- Use the result item code for skill classification when available
+    -- (openCase / craftItem / dismantleItem produce items whose code
+    --  differs from the outer itemCode, and the skills belong to the result)
+    v_skill_code := COALESCE(payload->>'resultItemCode', payload->>'itemCode');
     SELECT * INTO v_primary_skill, v_secondary_skill
-    FROM extract_skills(v_item, payload->>'itemCode');
+    FROM extract_skills(v_item, v_skill_code);
 
-    -- 4. Transaction type
+    -- 4. Transaction type (auto-inserts unknown types via get_transaction_type_id)
     v_transaction_type_id := get_transaction_type_id(payload->>'transactionType');
 
     -- 5. Build extra JSONB: remove all stored fields, then clean the nested 'item'
     v_extra := payload - ARRAY[
         '_id', '__v', 'updatedAt',
         'createdAt', 'offerCreatedAt',
-        'transactionType', 'itemCode',
+        'transactionType', 'itemCode', 'resultItemCode',
         'money', 'quantity',
         'sellerId', 'buyerId',
         'sellerMuId', 'sellerCountryId',
@@ -165,7 +181,6 @@ BEGIN
     
     -- If there is an 'item' key, clean it (keep only _id and lastAcquisitionAt)
     IF v_extra ? 'item' THEN
-        -- Remove unwanted keys from the nested object
         v_extra := jsonb_set(
             v_extra,
             '{item}',
@@ -184,6 +199,7 @@ BEGIN
 
     -- 6. Insert
     INSERT INTO transactions (
+        transaction_id,
         created_at,
         offer_created_at,
         seller_id,
@@ -191,6 +207,7 @@ BEGIN
         secondary_seller_id,
         secondary_buyer_id,
         item_code_id,
+        result_item_code_id,
         transaction_type_id,
         money,
         quantity,
@@ -198,6 +215,7 @@ BEGIN
         secondary_skill,
         extra
     ) VALUES (
+        v_transaction_id,
         v_created_at,
         v_offer_created_at,
         v_seller_id,
@@ -205,6 +223,7 @@ BEGIN
         v_secondary_seller_id,
         v_secondary_buyer_id,
         v_item_code_id,
+        v_result_item_code_id,
         v_transaction_type_id,
         v_money,
         v_quantity,

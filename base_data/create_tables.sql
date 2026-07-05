@@ -18,6 +18,12 @@ CREATE TABLE transaction_types (
 CREATE TABLE transactions (
     id BIGSERIAL,                  -- auto-incrementing PK
     
+    -- MongoDB _id (unique identifier from the source API).
+    -- Uniqueness enforced via a unique INDEX (not constraint) on the
+    -- hypertable, since TimescaleDB requires constraints to include
+    -- the partitioning column.
+    transaction_id TEXT NOT NULL,
+    
     -- Time columns
     created_at TIMESTAMPTZ NOT NULL, -- when the transaction was recorded
     offer_created_at TIMESTAMPTZ NULL,    -- when the offer was placed (from JSON payload)
@@ -28,6 +34,7 @@ CREATE TABLE transactions (
     secondary_seller_id INT NULL REFERENCES inventory_ids(id), -- when a MU or Country buys/sells, the user that made the action is seller/buyer
     secondary_buyer_id INT NULL REFERENCES inventory_ids(id),  -- but we also get the MU/Country ID
     item_code_id SMALLINT NULL REFERENCES item_codes(id),
+    result_item_code_id SMALLINT NULL REFERENCES item_codes(id), -- the actual item that was produced (openCase, craftItem, dismantleItem)
     transaction_type_id SMALLINT NOT NULL REFERENCES transaction_types(id),
     
     -- Other values
