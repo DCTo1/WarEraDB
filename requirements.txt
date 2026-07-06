@@ -1,0 +1,10 @@
+certifi==2026.6.17
+charset-normalizer==3.4.7
+dotenv==0.9.9
+greenlet==3.5.3
+idna==3.18
+python-dotenv==1.2.2
+requests==2.34.2
+SQLAlchemy==2.0.51
+typing_extensions==4.16.0
+urllib3==2.7.0
