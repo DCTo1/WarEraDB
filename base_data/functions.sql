@@ -60,6 +60,39 @@ END;
 $$ LANGUAGE plpgsql;
 
 -- =============================================
+-- 1.5. Item resolver (insert-or-get by MongoDB UUID)
+-- =============================================
+
+CREATE OR REPLACE FUNCTION get_item_id(
+    p_item_uuid TEXT,
+    p_item_code_id SMALLINT,
+    p_primary_skill SMALLINT,
+    p_secondary_skill SMALLINT,
+    p_last_acquisition_at TIMESTAMPTZ DEFAULT NULL
+) RETURNS BIGINT AS $$
+DECLARE
+    v_id BIGINT;
+BEGIN
+    IF p_item_uuid IS NULL THEN
+        RETURN NULL;
+    END IF;
+    INSERT INTO items (item_uuid, item_code_id, primary_skill, secondary_skill, last_acquisition_at)
+    VALUES (p_item_uuid, p_item_code_id, p_primary_skill, p_secondary_skill, p_last_acquisition_at)
+    ON CONFLICT (item_uuid) DO UPDATE SET
+        last_acquisition_at = CASE
+            WHEN EXCLUDED.last_acquisition_at IS NULL THEN items.last_acquisition_at
+            WHEN items.last_acquisition_at IS NULL THEN EXCLUDED.last_acquisition_at
+            ELSE GREATEST(items.last_acquisition_at, EXCLUDED.last_acquisition_at)
+        END
+    RETURNING id INTO v_id;
+    IF v_id IS NULL THEN
+        SELECT id INTO v_id FROM items WHERE item_uuid = p_item_uuid;
+    END IF;
+    RETURN v_id;
+END;
+$$ LANGUAGE plpgsql;
+
+-- =============================================
 -- 2. Skill extraction helper
 -- =============================================
 
@@ -115,7 +148,6 @@ DECLARE
     v_secondary_seller_id INT;
     v_secondary_buyer_id INT;
     v_item_code_id SMALLINT;
-    v_result_item_code_id SMALLINT;
     v_transaction_type_id SMALLINT;
     v_money DOUBLE PRECISION;
     v_quantity DOUBLE PRECISION;
@@ -124,7 +156,9 @@ DECLARE
     v_extra JSONB;
     v_item JSONB;
     v_skill_code TEXT;
-    v_new_id BIGINT;
+    v_item_id BIGINT;
+    v_item_uuid TEXT;
+    v_last_acquisition_at TIMESTAMPTZ;
 BEGIN
     -- 1. Extract basic fields
     v_transaction_id := payload->>'_id';
@@ -153,9 +187,9 @@ BEGIN
         v_secondary_buyer_id := NULL;
     END IF;
 
-    -- 3. Item code, result item code, and skills
+    -- 3. Item codes and item instance resolution
+    -- item_code_id stores what was traded / the case / the input material.
     v_item_code_id := get_item_code_id(payload->>'itemCode');
-    v_result_item_code_id := get_item_code_id(payload->>'resultItemCode');
     
     v_item := payload->'item';
     -- Use the result item code for skill classification when available
@@ -164,38 +198,23 @@ BEGIN
     v_skill_code := COALESCE(payload->>'resultItemCode', payload->>'itemCode');
     SELECT * INTO v_primary_skill, v_secondary_skill
     FROM extract_skills(v_item, v_skill_code);
+    
+    -- Resolve the item instance (create items row if first sighting)
+    v_item_uuid := v_item->>'_id';
+    v_last_acquisition_at := (v_item->>'lastAcquisitionAt')::TIMESTAMPTZ;
+    v_item_id := get_item_id(
+        v_item_uuid,
+        get_item_code_id(v_skill_code),
+        v_primary_skill,
+        v_secondary_skill,
+        v_last_acquisition_at
+    );
 
     -- 4. Transaction type (auto-inserts unknown types via get_transaction_type_id)
     v_transaction_type_id := get_transaction_type_id(payload->>'transactionType');
 
-    -- 5. Build extra JSONB: remove all stored fields, then clean the nested 'item'
-    v_extra := payload - ARRAY[
-        '_id', '__v', 'updatedAt',
-        'createdAt', 'offerCreatedAt',
-        'transactionType', 'itemCode', 'resultItemCode',
-        'money', 'quantity',
-        'sellerId', 'buyerId',
-        'sellerMuId', 'sellerCountryId',
-        'buyerMuId', 'buyerCountryId'
-    ];
-    
-    -- If there is an 'item' key, clean it (keep only _id and lastAcquisitionAt)
-    IF v_extra ? 'item' THEN
-        v_extra := jsonb_set(
-            v_extra,
-            '{item}',
-            (v_extra->'item') - ARRAY['state', 'maxState', 'quantity', 'type', 'code', 'skills']
-        );
-        -- If after cleaning the item is empty, remove the key entirely
-        IF v_extra->'item' = '{}'::JSONB OR v_extra->'item' IS NULL THEN
-            v_extra := v_extra - 'item';
-        END IF;
-    END IF;
-
-    -- If extra is empty or only nulls, set to NULL
-    IF v_extra = '{}'::JSONB OR v_extra IS NULL THEN
-        v_extra := NULL;
-    END IF;
+    -- 5. extra was removed — always NULL.
+    v_extra := NULL;
 
     -- 6. Insert (skip silently if the transaction_id already exists)
     INSERT INTO transactions (
@@ -207,12 +226,10 @@ BEGIN
         secondary_seller_id,
         secondary_buyer_id,
         item_code_id,
-        result_item_code_id,
+        item_id,
         transaction_type_id,
         money,
         quantity,
-        primary_skill,
-        secondary_skill,
         extra
     ) VALUES (
         v_transaction_id,
@@ -223,18 +240,19 @@ BEGIN
         v_secondary_seller_id,
         v_secondary_buyer_id,
         v_item_code_id,
-        v_result_item_code_id,
+        v_item_id,
         v_transaction_type_id,
         v_money,
         v_quantity,
-        v_primary_skill,
-        v_secondary_skill,
         v_extra
     )
-    ON CONFLICT (transaction_id, created_at) DO NOTHING
-    RETURNING id INTO v_new_id;
+    ON CONFLICT (transaction_id, created_at) DO NOTHING;
 
-    RETURN v_new_id;
+    IF FOUND THEN
+        RETURN 1;
+    ELSE
+        RETURN NULL;
+    END IF;
 END;
 $$ LANGUAGE plpgsql;
 

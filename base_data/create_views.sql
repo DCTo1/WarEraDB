@@ -8,7 +8,6 @@
 
 CREATE OR REPLACE VIEW transaction_details AS
 SELECT
-    t.id,
     t.transaction_id,
     t.created_at,
     t.offer_created_at,
@@ -19,25 +18,25 @@ SELECT
     t.secondary_seller_id,
     t.secondary_buyer_id,
 
-    -- Item codes resolved from the lookup table
+    -- Item code (what was traded / the case / the input material)
     ic.code  AS item_code,
-    rc.code  AS result_item_code,
+
+    -- Resolved item instance details (code + skills from items table)
+    itm.code  AS item_instance_code,
+    i.primary_skill,
+    i.secondary_skill,
+    i.first_seen_at,
+    i.last_acquisition_at,
 
     -- Transaction type
     tt.type  AS transaction_type,
 
     -- Numeric payload
     t.money,
-    t.quantity,
-
-    -- Skill breakdown
-    t.primary_skill,
-    t.secondary_skill,
-
-    -- Catch-all
-    t.extra
+    t.quantity
 
 FROM transactions t
-LEFT JOIN item_codes        ic  ON t.item_code_id        = ic.id
-LEFT JOIN item_codes        rc  ON t.result_item_code_id = rc.id
+LEFT JOIN item_codes        ic  ON t.item_code_id = ic.id
+LEFT JOIN items             i   ON t.item_id      = i.id
+LEFT JOIN item_codes        itm ON i.item_code_id = itm.id
 JOIN   transaction_types    tt  ON t.transaction_type_id = tt.id;

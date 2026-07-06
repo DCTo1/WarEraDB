@@ -1,5 +1,5 @@
 {
-    "description": "Maps every key in each transaction type to its database destination. null means the key is stripped/ignored by insert_transaction(). Keys with a '→' prefix are added by prepare_transaction() before the DB sees them.",
+    "description": "Maps every key in each transaction type to its database destination. null means the key is stripped before reaching the DB. Keys with a '→' prefix are added by prepare_transaction() in utils.py. Item sub-keys now route to the items table; see legend for details.",
     "transaction_types": {
         "applicationFee": {
             "_id": "transaction_id",
@@ -42,16 +42,16 @@
             "buyerId": "buyer_id",
             "transactionType": "transaction_type_id",
             "updatedAt": null,
-            "item": "extra.item (cleaned — only _id, lastAcquisitionAt kept)",
-            "item._id": "extra.item._id",
-            "item.lastAcquisitionAt": "extra.item.lastAcquisitionAt",
-            "item.code": "→ resultItemCode → result_item_code_id",
+            "item": "→ resolved into items table; item_id stored on transaction row",
+            "item._id": "items.item_uuid",
+            "item.code": "→ resultItemCode → items.item_code_id",
+            "item.skills": "items.primary_skill / items.secondary_skill",
+            "item.lastAcquisitionAt": "items.last_acquisition_at",
             "item.type": null,
-            "item.skills": "primary_skill / secondary_skill",
             "item.state": null,
             "item.maxState": null,
             "item.quantity": null,
-            "→ resultItemCode": "result_item_code_id"
+            "→ resultItemCode": "items.item_code_id (via get_item_id)"
         },
         "wage": {
             "_id": "transaction_id",
@@ -98,16 +98,16 @@
             "buyerId": "buyer_id",
             "transactionType": "transaction_type_id",
             "updatedAt": null,
-            "item": "extra.item (cleaned — only _id, lastAcquisitionAt kept)",
-            "item._id": "extra.item._id",
-            "item.lastAcquisitionAt": "extra.item.lastAcquisitionAt",
-            "item.code": "→ resultItemCode → result_item_code_id",
+            "item": "→ resolved into items table; item_id stored on transaction row",
+            "item._id": "items.item_uuid",
+            "item.code": "→ resultItemCode → items.item_code_id",
+            "item.skills": "items.primary_skill / items.secondary_skill",
+            "item.lastAcquisitionAt": "items.last_acquisition_at",
             "item.type": null,
-            "item.skills": "primary_skill / secondary_skill",
             "item.state": null,
             "item.maxState": null,
             "item.quantity": null,
-            "→ resultItemCode": "result_item_code_id"
+            "→ resultItemCode": "items.item_code_id (via get_item_id)"
         },
         "craftItem": {
             "_id": "transaction_id",
@@ -119,16 +119,16 @@
             "buyerId": "buyer_id",
             "transactionType": "transaction_type_id",
             "updatedAt": null,
-            "item": "extra.item (cleaned — only _id, lastAcquisitionAt kept)",
-            "item._id": "extra.item._id",
-            "item.lastAcquisitionAt": "extra.item.lastAcquisitionAt",
-            "item.code": "→ resultItemCode → result_item_code_id",
+            "item": "→ resolved into items table; item_id stored on transaction row",
+            "item._id": "items.item_uuid",
+            "item.code": "→ resultItemCode → items.item_code_id",
+            "item.skills": "items.primary_skill / items.secondary_skill",
+            "item.lastAcquisitionAt": "items.last_acquisition_at",
             "item.type": null,
-            "item.skills": "primary_skill / secondary_skill",
             "item.state": null,
             "item.maxState": null,
             "item.quantity": null,
-            "→ resultItemCode": "result_item_code_id"
+            "→ resultItemCode": "items.item_code_id (via get_item_id)"
         },
         "dismantleItem": {
             "_id": "transaction_id",
@@ -140,16 +140,16 @@
             "buyerId": "buyer_id",
             "transactionType": "transaction_type_id",
             "updatedAt": null,
-            "item": "extra.item (cleaned — only _id, lastAcquisitionAt kept)",
-            "item._id": "extra.item._id",
-            "item.lastAcquisitionAt": "extra.item.lastAcquisitionAt",
-            "item.code": "→ resultItemCode → result_item_code_id",
+            "item": "→ resolved into items table; item_id stored on transaction row",
+            "item._id": "items.item_uuid",
+            "item.code": "→ resultItemCode → items.item_code_id",
+            "item.skills": "items.primary_skill / items.secondary_skill",
+            "item.lastAcquisitionAt": "items.last_acquisition_at",
             "item.type": null,
-            "item.skills": "primary_skill / secondary_skill",
             "item.state": null,
             "item.maxState": null,
             "item.quantity": null,
-            "→ resultItemCode": "result_item_code_id"
+            "→ resultItemCode": "items.item_code_id (via get_item_id)"
         },
         "battleLoot": {
             "_id": "transaction_id",
@@ -160,16 +160,16 @@
             "buyerId": "buyer_id",
             "transactionType": "transaction_type_id",
             "updatedAt": null,
-            "item": "extra.item (cleaned — only _id, lastAcquisitionAt kept)",
-            "item._id": "extra.item._id",
-            "item.lastAcquisitionAt": "extra.item.lastAcquisitionAt",
-            "item.code": "→ resultItemCode → result_item_code_id",
+            "item": "→ resolved into items table; item_id stored on transaction row",
+            "item._id": "items.item_uuid",
+            "item.code": "→ resultItemCode → items.item_code_id",
+            "item.skills": "items.primary_skill / items.secondary_skill",
+            "item.lastAcquisitionAt": "items.last_acquisition_at",
             "item.type": null,
-            "item.skills": "primary_skill / secondary_skill",
             "item.state": null,
             "item.maxState": null,
             "item.quantity": null,
-            "→ resultItemCode": "result_item_code_id"
+            "→ resultItemCode": "items.item_code_id (via get_item_id)"
         },
         "countryMoneyTransfer": {
             "_id": "transaction_id",
@@ -184,9 +184,9 @@
         }
     },
     "legend": {
-        "null": "Key is stripped from the JSON before it reaches the DB (dropped in the - ARRAY[...] step of insert_transaction).",
-        "extra.item.*": "These sub-keys survive the cleaning step inside extra.item; all others (state, maxState, quantity, type, code, skills) are deleted.",
-        "→ resultItemCode": "Added at runtime by prepare_transaction() in utils.py. Not present in the raw API response.",
-        "primary_skill / secondary_skill": "Extracted from item.skills by extract_skills() using the item code returned by COALESCE(resultItemCode, itemCode)."
+        "null": "Key is stripped from the payload before it reaches any table.",
+        "item.* → items": "The item sub-object is resolved into the items table: item._id → items.item_uuid, item.code (via resultItemCode) → items.item_code_id, item.skills → items.primary_skill / secondary_skill, item.lastAcquisitionAt → items.last_acquisition_at. The FK transactions.item_id links the row to the items table.",
+        "→ resultItemCode": "Added at runtime by prepare_transaction() in utils.py when item.code differs from itemCode. Used for skill classification and items.item_code_id. Not present in the raw API response.",
+        "item_code_id vs items.item_code_id": "transactions.item_code_id stores what was traded / the case opened / the input material. items.item_code_id stores the actual item's code (which may differ, e.g., openCase: itemCode='case1', items.item_code_id='knife')."
     }
 }
