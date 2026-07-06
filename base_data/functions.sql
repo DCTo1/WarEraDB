@@ -197,7 +197,7 @@ BEGIN
         v_extra := NULL;
     END IF;
 
-    -- 6. Insert
+    -- 6. Insert (skip silently if the transaction_id already exists)
     INSERT INTO transactions (
         transaction_id,
         created_at,
@@ -231,6 +231,7 @@ BEGIN
         v_secondary_skill,
         v_extra
     )
+    ON CONFLICT (transaction_id, created_at) DO NOTHING
     RETURNING id INTO v_new_id;
 
     RETURN v_new_id;

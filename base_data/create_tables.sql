@@ -19,9 +19,9 @@ CREATE TABLE transactions (
     id BIGSERIAL,                  -- auto-incrementing PK
     
     -- MongoDB _id (unique identifier from the source API).
-    -- Uniqueness enforced via a unique INDEX (not constraint) on the
-    -- hypertable, since TimescaleDB requires constraints to include
-    -- the partitioning column.
+    -- Uniqueness enforced via a unique composite INDEX
+    -- (transaction_id, created_at) because TimescaleDB requires
+    -- unique indexes to include the partitioning column.
     transaction_id TEXT NOT NULL,
     
     -- Time columns
