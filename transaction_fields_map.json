@@ -21,6 +21,8 @@
             "offerCreatedAt": "offer_created_at",
             "quantity": "quantity",
             "sellerId": "seller_id",
+            "sellerMuId": "secondary_seller_id",
+            "sellerCountryId": "secondary_seller_id",
             "buyerId": "buyer_id",
             "buyerMuId": "secondary_buyer_id",
             "buyerCountryId": "secondary_buyer_id",
