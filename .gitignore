@@ -1,1 +1,3 @@
-We're no strangers to love.
+.venv/
+__pycache__/
+extra/
