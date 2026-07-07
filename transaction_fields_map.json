@@ -1,5 +1,5 @@
 {
-    "description": "Maps every key in each transaction type to its database destination. null means the key is stripped before reaching the DB. Keys with a '→' prefix are added by prepare_transaction() in utils.py. Item sub-keys now route to the items table; see legend for details.",
+    "description": "Maps every key in each transaction type to its database destination. null means the key is stripped before reaching the DB. Keys with a '→' prefix are added by prepare_transaction() in utils.py. Item sub-keys now route to the items table; see legend for details. As of migration 04, _id fields are stored as UUID (12-byte ObjectID + 4 zero bytes padding).",
     "transaction_types": {
         "applicationFee": {
             "_id": "transaction_id",
@@ -185,7 +185,7 @@
     },
     "legend": {
         "null": "Key is stripped from the payload before it reaches any table.",
-        "item.* → items": "The item sub-object is resolved into the items table: item._id → items.item_uuid, item.code (via resultItemCode) → items.item_code_id, item.skills → items.primary_skill / secondary_skill, item.lastAcquisitionAt → items.last_acquisition_at. The FK transactions.item_id links the row to the items table.",
+        "item.* → items": "The item sub-object is resolved into the items table: item._id → items.item_uuid (UUID), item.code (via resultItemCode) → items.item_code_id, item.skills → items.primary_skill / secondary_skill, item.lastAcquisitionAt → items.last_acquisition_at. The FK transactions.item_id links the row to the items table.",
         "→ resultItemCode": "Added at runtime by prepare_transaction() in utils.py when item.code differs from itemCode. Used for skill classification and items.item_code_id. Not present in the raw API response.",
         "item_code_id vs items.item_code_id": "transactions.item_code_id stores what was traded / the case opened / the input material. items.item_code_id stores the actual item's code (which may differ, e.g., openCase: itemCode='case1', items.item_code_id='knife')."
     }

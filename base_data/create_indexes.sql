@@ -2,9 +2,9 @@
 --  Performance indexes (adjust as needed)
 -- =============================================
 
--- Unique index on MongoDB _id (TimescaleDB requires the partitioning
--- column to be included, so we create a composite unique index.
--- Since MongoDB _id values are globally unique, the pair is unique).
+-- Unique index on transaction UUID (converted from MongoDB _id hex).
+-- TimescaleDB requires the partitioning column to be included, so we
+-- create a composite unique index on (transaction_id, created_at).
 CREATE UNIQUE INDEX IF NOT EXISTS idx_transactions_transaction_id ON transactions (transaction_id, created_at);
 
 CREATE INDEX IF NOT EXISTS idx_transactions_created_at ON transactions (created_at DESC);

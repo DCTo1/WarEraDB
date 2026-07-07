@@ -1,7 +1,7 @@
 -- 1. Lookup tables (small, heavily cached)
 CREATE TABLE inventory_ids (
     id SERIAL PRIMARY KEY,
-    external_id TEXT UNIQUE NOT NULL -- MongoDB UUIDs (e.g., '681cf480...')
+    external_id UUID UNIQUE NOT NULL -- MongoDB ObjectID encoded as UUID (12 bytes + 4 zero bytes)
 );
 
 CREATE TABLE item_codes (
@@ -17,7 +17,7 @@ CREATE TABLE transaction_types (
 -- 1.5. Items table (normalized item data with skills)
 CREATE TABLE items (
     id BIGSERIAL PRIMARY KEY,
-    item_uuid TEXT UNIQUE NOT NULL,          -- MongoDB _id from the item (extra.item._id)
+    item_uuid UUID UNIQUE NOT NULL,           -- MongoDB _id from the item, encoded as UUID
     item_code_id SMALLINT NOT NULL REFERENCES item_codes(id), -- the actual item code
     primary_skill SMALLINT NULL,
     secondary_skill SMALLINT NULL,
@@ -36,7 +36,7 @@ CREATE TABLE transactions (
     -- Uniqueness enforced via a unique composite INDEX
     -- (transaction_id, created_at) because TimescaleDB requires
     -- unique indexes to include the partitioning column.
-    transaction_id TEXT NOT NULL,
+    transaction_id UUID NOT NULL,
     
     -- Time columns
     created_at TIMESTAMPTZ NOT NULL, -- when the transaction was recorded

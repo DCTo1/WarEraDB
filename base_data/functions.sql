@@ -1,4 +1,27 @@
 -- =============================================
+-- 0. Conversion helpers (TEXT ObjectID ↔ UUID)
+-- =============================================
+
+CREATE OR REPLACE FUNCTION objectid_to_uuid(hex TEXT) RETURNS UUID AS $$
+BEGIN
+    IF hex IS NULL THEN
+        RETURN NULL;
+    END IF;
+    RETURN (hex || '00000000')::UUID;
+END;
+$$ LANGUAGE plpgsql IMMUTABLE;
+
+CREATE OR REPLACE FUNCTION uuid_to_objectid(u UUID) RETURNS TEXT AS $$
+BEGIN
+    IF u IS NULL THEN
+        RETURN NULL;
+    END IF;
+    RETURN LOWER(LEFT(REPLACE(u::TEXT, '-', ''), 24));
+END;
+$$ LANGUAGE plpgsql IMMUTABLE;
+
+
+-- =============================================
 -- 1. Helper functions for ID resolution
 -- =============================================
 
@@ -11,11 +34,11 @@ BEGIN
         RETURN NULL;
     END IF;
     INSERT INTO inventory_ids (external_id)
-    VALUES (p_external_id)
+    VALUES (objectid_to_uuid(p_external_id))
     ON CONFLICT (external_id) DO NOTHING
     RETURNING id INTO v_id;
     IF v_id IS NULL THEN
-        SELECT id INTO v_id FROM inventory_ids WHERE external_id = p_external_id;
+        SELECT id INTO v_id FROM inventory_ids WHERE external_id = objectid_to_uuid(p_external_id);
     END IF;
     RETURN v_id;
 END;
@@ -77,7 +100,7 @@ BEGIN
         RETURN NULL;
     END IF;
     INSERT INTO items (item_uuid, item_code_id, primary_skill, secondary_skill, last_acquisition_at)
-    VALUES (p_item_uuid, p_item_code_id, p_primary_skill, p_secondary_skill, p_last_acquisition_at)
+    VALUES (objectid_to_uuid(p_item_uuid), p_item_code_id, p_primary_skill, p_secondary_skill, p_last_acquisition_at)
     ON CONFLICT (item_uuid) DO UPDATE SET
         last_acquisition_at = CASE
             WHEN EXCLUDED.last_acquisition_at IS NULL THEN items.last_acquisition_at
@@ -86,7 +109,7 @@ BEGIN
         END
     RETURNING id INTO v_id;
     IF v_id IS NULL THEN
-        SELECT id INTO v_id FROM items WHERE item_uuid = p_item_uuid;
+        SELECT id INTO v_id FROM items WHERE item_uuid = objectid_to_uuid(p_item_uuid);
     END IF;
     RETURN v_id;
 END;
@@ -140,7 +163,7 @@ $$ LANGUAGE plpgsql;
 CREATE OR REPLACE FUNCTION insert_transaction(payload JSONB)
 RETURNS BIGINT AS $$
 DECLARE
-    v_transaction_id TEXT;
+    v_transaction_id UUID;
     v_created_at TIMESTAMPTZ;
     v_offer_created_at TIMESTAMPTZ;
     v_seller_id INT;
@@ -153,15 +176,14 @@ DECLARE
     v_quantity DOUBLE PRECISION;
     v_primary_skill SMALLINT;
     v_secondary_skill SMALLINT;
-    v_extra JSONB;
     v_item JSONB;
     v_skill_code TEXT;
     v_item_id BIGINT;
     v_item_uuid TEXT;
     v_last_acquisition_at TIMESTAMPTZ;
 BEGIN
-    -- 1. Extract basic fields
-    v_transaction_id := payload->>'_id';
+    -- 1. Extract basic fields and convert ObjectID hex to UUID
+    v_transaction_id := objectid_to_uuid(payload->>'_id');
     v_created_at := (payload->>'createdAt')::TIMESTAMPTZ;
     v_offer_created_at := (payload->>'offerCreatedAt')::TIMESTAMPTZ;
     v_money := (payload->>'money')::DOUBLE PRECISION;
@@ -213,10 +235,7 @@ BEGIN
     -- 4. Transaction type (auto-inserts unknown types via get_transaction_type_id)
     v_transaction_type_id := get_transaction_type_id(payload->>'transactionType');
 
-    -- 5. extra was removed — always NULL.
-    v_extra := NULL;
-
-    -- 6. Insert (skip silently if the transaction_id already exists)
+    -- 5. Insert (skip silently if the transaction_id already exists)
     INSERT INTO transactions (
         transaction_id,
         created_at,
@@ -229,8 +248,7 @@ BEGIN
         item_id,
         transaction_type_id,
         money,
-        quantity,
-        extra
+        quantity
     ) VALUES (
         v_transaction_id,
         v_created_at,
@@ -243,8 +261,7 @@ BEGIN
         v_item_id,
         v_transaction_type_id,
         v_money,
-        v_quantity,
-        v_extra
+        v_quantity
     )
     ON CONFLICT (transaction_id, created_at) DO NOTHING;
 
