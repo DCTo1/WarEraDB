@@ -24,3 +24,25 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_transactions_transaction_id
 --       ON transactions (buyer_id);
 --   CREATE INDEX CONCURRENTLY idx_transactions_type_id
 --       ON transactions (transaction_type_id);
+
+-- =============================================================================
+--  Battle indexes (Phase 1 of the battle expansion)
+--
+--  UNIQUE indexes are declared inline in create_tables.sql (required for the
+--  ON CONFLICT in insert_battle()/insert_round()). The indexes below are for
+--  querying and should be created AFTER the bulk load from
+--  extra/battles_cache/ finishes.
+-- =============================================================================
+
+--   CREATE INDEX CONCURRENTLY idx_battles_created_at ON battles (created_at DESC);
+--   CREATE INDEX CONCURRENTLY idx_battles_ended_at   ON battles (ended_at);
+--   CREATE INDEX CONCURRENTLY idx_battles_country    ON battles (attacker_country_id, defender_country_id);
+--   CREATE INDEX CONCURRENTLY idx_battles_type       ON battles (type_id);
+--   CREATE INDEX CONCURRENTLY idx_battles_war        ON battles (war_id);
+--   CREATE INDEX CONCURRENTLY idx_battles_tournament ON battles (tournament_id);
+
+--   CREATE INDEX CONCURRENTLY idx_rounds_battle   ON rounds (battle_id);
+--   CREATE INDEX CONCURRENTLY idx_rounds_created  ON rounds (created_at DESC);
+--   CREATE INDEX CONCURRENTLY idx_rounds_winner   ON rounds (won_by_country_id);
+
+--   CREATE INDEX CONCURRENTLY idx_battle_bounties_effective ON battle_bounties (bounty_effective_at);
