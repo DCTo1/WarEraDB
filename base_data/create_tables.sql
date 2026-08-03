@@ -223,3 +223,62 @@ CREATE TABLE countries (
     code                  TEXT NOT NULL UNIQUE,       -- 2-letter, stable across renames
     specialized_item      TEXT NULL
 );
+
+-- =============================================================================
+-- 7. Battle ranking entries (ranking data + item loot — Phase 2 of battle
+-- expansion; see extra/battle_loot_db_plan.md)
+--
+-- Two tables: battle-level and round-level rankings. One row per
+-- (battle/round, side, entity type, entity) with damage/points/money merged
+-- into a single row (nullable — a user may appear in only some dataTypes).
+-- Loot items are referenced via items(id) (upserted through get_item_id());
+-- loot is duplicated per side exactly as the API returns it (both-sides
+-- users carry the same item on attacker/defender/merged rows).
+-- No rank columns (derived via RANK() OVER at query time), no updated_at
+-- (entries are immutable once written at battle end).
+-- Source: battleRanking.getRanking (27 battle combos + 27 per round:
+-- 3 dataTypes × 3 types × 3 sides; round rankings queried with roundId ONLY).
+-- =============================================================================
+
+CREATE TABLE battle_ranking_entries (
+    -- 8-byte aligned
+    damage         BIGINT NULL,        -- always integer today; bigint for growth (max 91M today)
+    money          DOUBLE PRECISION NULL,  -- always fractional
+    loot_item_id   BIGINT NULL REFERENCES items(id),  -- NULL = no loot / battle active
+    created_at     TIMESTAMPTZ NOT NULL,   -- ranking entry createdAt (hypertable partition col)
+
+    -- 4-byte aligned
+    battle_id      INT NOT NULL REFERENCES battles(id),   -- serial PK, not the UUID
+    entity_id      INT NOT NULL REFERENCES inventory_ids(id),  -- user/country/mu id (same map)
+    points         INT NULL,           -- normal int, not smallint (countries grow)
+
+    -- 2-byte aligned
+    side           SMALLINT NOT NULL,  -- 1 = attacker, 2 = defender, 3 = merged
+    entity_type    SMALLINT NOT NULL,  -- 1 = user, 2 = country, 3 = mu — NOT merged (historical)
+
+    PRIMARY KEY (battle_id, side, entity_type, entity_id)
+);
+
+CREATE TABLE round_ranking_entries (
+    -- 8-byte aligned
+    damage         BIGINT NULL,
+    money          DOUBLE PRECISION NULL,
+    loot_item_id   BIGINT NULL REFERENCES items(id),
+    created_at     TIMESTAMPTZ NOT NULL,
+
+    -- 4-byte aligned
+    battle_id      INT NOT NULL REFERENCES battles(id),
+    entity_id      INT NOT NULL REFERENCES inventory_ids(id),
+    points         INT NULL,
+
+    -- 2-byte aligned
+    round_number   SMALLINT NOT NULL,  -- 1-3, unique per battle (rounds UNIQUE(battle_id, number))
+    side           SMALLINT NOT NULL,
+    entity_type    SMALLINT NOT NULL,
+
+    PRIMARY KEY (battle_id, round_number, side, entity_type, entity_id)
+);
+
+-- Per-battle lookups / battles-to-entries navigation
+CREATE INDEX idx_battle_ranking_entries_battle ON battle_ranking_entries (battle_id);
+CREATE INDEX idx_round_ranking_entries_battle ON round_ranking_entries (battle_id);
