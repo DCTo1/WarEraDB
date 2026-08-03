@@ -104,12 +104,13 @@ CREATE TABLE battles (
     defender_damages        DOUBLE PRECISION NOT NULL,
 
     -- 4-byte aligned
-    battle_id                UUID NOT NULL UNIQUE,   -- MongoDB _id
-    war_id                   UUID NULL,              -- NULL on tournament/revolution battles
-    tournament_id            UUID NULL,              -- 'tournament' key = tournament id, NOT a bool
+    id                       SERIAL PRIMARY KEY,    -- surrogate int PK (migration 05); referenced by ranking entries / rounds
+    battle_id                UUID NOT NULL UNIQUE,  -- MongoDB _id (API key, kept alongside the int PK)
+    war_id                   UUID NULL,             -- NULL on tournament/revolution battles
+    tournament_id            UUID NULL,             -- 'tournament' key = tournament id, NOT a bool
     attacker_country_id      INT NULL REFERENCES inventory_ids(id),  -- NULL on tournament battles; countries trade, so they live in inventory_ids
-    attacker_region          UUID NULL,              -- raw ObjectID UUID: regions never trade → no inventory_ids row (no *_id suffix = not a FK)
-    attacker_tournament_team UUID NULL,              -- raw ObjectID UUID: temporary tournament teams never trade
+    attacker_region          UUID NULL,             -- raw ObjectID UUID: regions never trade → no inventory_ids row (no *_id suffix = not a FK)
+    attacker_tournament_team UUID NULL,             -- raw ObjectID UUID: temporary tournament teams never trade
     attacker_hit_count       INT NOT NULL,
     defender_country_id      INT NULL REFERENCES inventory_ids(id),  -- NULL on tournament battles
     defender_region          UUID NULL,
@@ -139,6 +140,7 @@ CREATE TABLE rounds (
     defender_points          DOUBLE PRECISION NOT NULL,
 
     -- 4-byte aligned
+    id                       SERIAL PRIMARY KEY,  -- surrogate int PK (migration 05); referenced by ranking entries
     round_id                 UUID NOT NULL UNIQUE,   -- MongoDB _id
     battle_id                UUID NOT NULL REFERENCES battles(battle_id),
     -- round wonBy = side string 'attacker'/'defender' since 2026-01 (country
@@ -159,6 +161,10 @@ CREATE TABLE rounds (
     -- variable
     live                     JSONB NULL    -- { ticksCount, actualTickPoints, nextTickAt }
 );
+
+-- round number is unique within a battle (data verified 33,220/33,220
+-- distinct); anchors round_number references from round ranking entries
+ALTER TABLE rounds ADD CONSTRAINT rounds_battle_number UNIQUE (battle_id, number);
 
 CREATE TABLE battle_bounties (
     -- 8-byte aligned
