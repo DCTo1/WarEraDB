@@ -9,9 +9,9 @@ and stores them in PostgreSQL with TimescaleDB hypertables.
 
 | Data | Rows |
 |---|---|
-| Battles (war / resistance / tournament / revolution) | ~15,638 |
-| Rounds | ~33,185 |
-| Bounty sides (attacker/defender bounty pools) | ~9,615 |
+| Battles (war / resistance / tournament / revolution) | ~15,643 |
+| Rounds | ~33,196 |
+| Bounty sides (attacker/defender bounty pools) | ~9,622 |
 | Countries (current-state snapshot) | 180 |
 | Transactions (seeded from examples; full 70M+ scrape pending) | ~700 |
 
