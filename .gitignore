@@ -1,3 +1,5 @@
 .venv/
 __pycache__/
 extra/
+Python/__pycache__
+Python/battles_state.json
