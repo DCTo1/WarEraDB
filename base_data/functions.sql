@@ -590,7 +590,7 @@ $$ LANGUAGE plpgsql;
 -- merged nullable; loot_item_id -> items(id); loot duplicated per side as the
 -- API returns it. entity ids resolve through get_inventory_id() by the caller
 -- (users/mus are mostly absent from inventory_ids until first seen).
--- See extra/battle_loot_db_plan.md.
+-- See extra/deprecated/battle_loot_db_plan.md.
 -- =============================================================================
 
 CREATE OR REPLACE FUNCTION insert_battle_ranking_entry(
