@@ -75,7 +75,7 @@ SELECT create_hypertable(
 -- 5. Battle tables (Phase 1 of the battle expansion)
 --
 -- Schema verified across 2025-05 → 2026-08 (15,791 battles + 33,170 rounds in
--- extra/battles_cache/). Design notes in extra/battle_db_expansion_plan.md:
+-- extra/battles_cache/). Design notes in extra/deprecated/battle_db_expansion_plan.md:
 --   - no is_active column: ended_at IS NULL == active
 --   - no won_by / badges_processed / stats / rounds_to_win: derived or dropped
 --   - isResistance / isTournament covered by battle_types
@@ -226,7 +226,7 @@ CREATE TABLE countries (
 
 -- =============================================================================
 -- 7. Battle ranking entries (ranking data + item loot — Phase 2 of battle
--- expansion; see extra/battle_loot_db_plan.md)
+-- expansion; see extra/deprecated/battle_loot_db_plan.md)
 --
 -- Two tables: battle-level and round-level rankings. One row per
 -- (battle/round, side, entity type, entity) with damage/points/money merged

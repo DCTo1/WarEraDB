@@ -48,7 +48,7 @@ JOIN   transaction_types    tt  ON t.transaction_type_id = tt.id;
 -- Resolve FK columns to readable ObjectID strings and join the per-side
 -- bounty rows. Derived fields (wonBy, roundsToWin, isActive) are NOT stored
 -- and NOT exposed: wonBy = side with higher won_rounds_count, active ⇔
--- ended_at IS NULL (see extra/battle_db_expansion_plan.md).
+-- ended_at IS NULL (see extra/deprecated/battle_db_expansion_plan.md).
 -- =============================================
 
 CREATE OR REPLACE VIEW battle_details AS
