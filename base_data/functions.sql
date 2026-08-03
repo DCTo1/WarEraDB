@@ -582,3 +582,70 @@ BEGIN
     RETURN v_country_id;
 END;
 $$ LANGUAGE plpgsql;
+
+-- =============================================================================
+-- 7. Battle ranking entries (Phase 2 — rankings + loot)
+--
+-- One row per (battle/round, side, entity type, entity); damage/points/money
+-- merged nullable; loot_item_id -> items(id); loot duplicated per side as the
+-- API returns it. entity ids resolve through get_inventory_id() by the caller
+-- (users/mus are mostly absent from inventory_ids until first seen).
+-- See extra/battle_loot_db_plan.md.
+-- =============================================================================
+
+CREATE OR REPLACE FUNCTION insert_battle_ranking_entry(
+    p_battle_hex TEXT,
+    p_side SMALLINT,
+    p_entity_type SMALLINT,
+    p_entity_id INT,
+    p_damage BIGINT,
+    p_points INT,
+    p_money DOUBLE PRECISION,
+    p_loot_item_id BIGINT,
+    p_created_at TIMESTAMPTZ
+) RETURNS VOID AS $$
+BEGIN
+    INSERT INTO battle_ranking_entries (
+        battle_id, side, entity_type, entity_id,
+        damage, points, money, loot_item_id, created_at
+    )
+    SELECT b.id, p_side, p_entity_type, p_entity_id,
+           p_damage, p_points, p_money, p_loot_item_id, p_created_at
+    FROM battles b WHERE b.battle_id = objectid_to_uuid(p_battle_hex)
+    ON CONFLICT (battle_id, side, entity_type, entity_id) DO UPDATE SET
+        damage = EXCLUDED.damage,
+        points = EXCLUDED.points,
+        money = EXCLUDED.money,
+        loot_item_id = EXCLUDED.loot_item_id,
+        created_at = EXCLUDED.created_at;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION insert_round_ranking_entry(
+    p_battle_hex TEXT,
+    p_round_number SMALLINT,
+    p_side SMALLINT,
+    p_entity_type SMALLINT,
+    p_entity_id INT,
+    p_damage BIGINT,
+    p_points INT,
+    p_money DOUBLE PRECISION,
+    p_loot_item_id BIGINT,
+    p_created_at TIMESTAMPTZ
+) RETURNS VOID AS $$
+BEGIN
+    INSERT INTO round_ranking_entries (
+        battle_id, round_number, side, entity_type, entity_id,
+        damage, points, money, loot_item_id, created_at
+    )
+    SELECT b.id, p_round_number, p_side, p_entity_type, p_entity_id,
+           p_damage, p_points, p_money, p_loot_item_id, p_created_at
+    FROM battles b WHERE b.battle_id = objectid_to_uuid(p_battle_hex)
+    ON CONFLICT (battle_id, round_number, side, entity_type, entity_id) DO UPDATE SET
+        damage = EXCLUDED.damage,
+        points = EXCLUDED.points,
+        money = EXCLUDED.money,
+        loot_item_id = EXCLUDED.loot_item_id,
+        created_at = EXCLUDED.created_at;
+END;
+$$ LANGUAGE plpgsql;
