@@ -5,8 +5,12 @@ Fetches all battles newer than the last saved timestamp from the WarEra API
 (battle.getBattles, newest-first, upper-bounded cursor) and inserts them into
 the DB via insert_battle()/insert_round(). Also refreshes active battles
 (battles.ended_at IS NULL) via battle.getById on a cadence, so their new
-rounds and live-round stats stay current. Saves the new last timestamp for
-the next run.
+rounds and live-round stats stay current — re-fetching ALL rounds of active
+battles (rounds fetched mid-round hold partial damage and would otherwise
+never be refreshed once they end). Every run also backfills battles missing
+rounds and repairs battle-level damages from round sums (the API often
+reports damages: 0 at battle level). Saves the new last timestamp for the
+next run.
 
 Usage
 -----
@@ -239,6 +243,39 @@ def db_round_ids_for(db: str, battle_ids: list[str]) -> set[str]:
         print(f"  DB error: {proc.stderr[:500]}", file=sys.stderr)
         sys.exit(2)
     return set(proc.stdout.splitlines())
+
+
+def db_battle_ids_without_rounds(db: str, limit: int = 1000) -> list[str]:
+    """Hex ObjectIDs of battles with no stored rounds (backfill targets)."""
+    proc = psql(db, (
+        "SELECT uuid_to_objectid(battle_id) FROM battles b\n"
+        "WHERE NOT EXISTS (SELECT 1 FROM rounds r WHERE r.battle_id = b.battle_id)\n"
+        f"LIMIT {limit};\n"))
+    if proc.returncode != 0:
+        print(f"  DB error: {proc.stderr[:500]}", file=sys.stderr)
+        sys.exit(2)
+    return [ln for ln in proc.stdout.splitlines() if ln.strip()]
+
+
+def repair_zero_damages(db: str) -> int:
+    """Battles whose stored battle-level damages are 0 but whose rounds carry
+    real damage → set from round sums. The API reports damages: 0 at battle
+    level both for old battles (schema evolution) and for current-era battles
+    even while damage accrues in rounds — the rounds are the source of truth.
+    Runs after the round refresh so fresh round sums are used. Returns the
+    number of rows fixed."""
+    proc = psql(db, (
+        "UPDATE battles b SET attacker_damages = r.att, defender_damages = r.def\n"
+        "FROM (SELECT battle_id, COALESCE(SUM(attacker_damages), 0) AS att,\n"
+        "      COALESCE(SUM(defender_damages), 0) AS def FROM rounds GROUP BY battle_id) r\n"
+        "WHERE b.battle_id = r.battle_id\n"
+        "  AND b.attacker_damages = 0 AND b.defender_damages = 0\n"
+        "  AND (r.att > 0 OR r.def > 0)\n"
+        "RETURNING 1;\n"))
+    if proc.returncode != 0:
+        print(f"  ✗ damage repair failed: {proc.stderr[:500]}", file=sys.stderr)
+        return 0
+    return len([ln for ln in proc.stdout.splitlines() if ln.strip()])
 
 
 def insert_docs(db: str, docs: list[dict], batch_size: int) -> None:
@@ -605,6 +642,8 @@ def main():
                    help=f"Batched API calls per request (server hard cap: {MAX_BATCH})")
     p.add_argument("--index", default=INDEX_FILE, help="Battles timestamp index file (json)")
     p.add_argument("--no-active", action="store_true", help="Skip refreshing rounds of active battles")
+    p.add_argument("--force-active", action="store_true",
+                   help="Refresh active battles' rounds every run (default: on --active-interval cadence)")
     p.add_argument("--active-interval", type=int, default=30,
                    help="Minute cadence for the active-battle round refresh (default 30; 0 = every run)")
     args = p.parse_args()
@@ -622,64 +661,88 @@ def main():
     since_ms, active_walked_at = read_state(args.state)
     if not since_ms:
         since_ms = db_max_created_at_ms(args.db)
-    active_due = not args.no_active and (now_ms - active_walked_at >= args.active_interval * 60_000)
+    active_due = not args.no_active and (args.force_active
+                                         or now_ms - active_walked_at >= args.active_interval * 60_000)
 
+    session = make_session()
     if since_ms >= until_ms:
         print("Already up to date.", flush=True)
-        return 0
-
-    def iso(ms: int) -> str:
-        return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%S") + "Z"
-
-    print(f"window: {iso(since_ms)} → {iso(until_ms)}", flush=True)
-    session = make_session()
-
-    index_ms = load_index(args.index)
-    if not index_ms:
-        index_ms, index_src = build_index(args.db, args.index)
-        print(f"  index: built from {index_src} ({len(index_ms)} entries)", flush=True)
-    docs = {b["_id"]: b for b in fetch_battles(session, since_ms, until_ms, index_ms)}
-    if active_due:
-        active_ids = db_active_battle_ids(args.db)
-        print(f"  active battles: refreshing {len(active_ids)} from DB", flush=True)
-        for doc in fetch_active_docs(session, active_ids, max_batch):
-            docs.setdefault(doc["_id"], doc)
-    elif args.no_active:
-        print("  active battles: skipped (--no-active)", flush=True)
     else:
-        print(f"  active battles: skipped (last refresh {iso(active_walked_at)})", flush=True)
-    print(f"battles: {len(docs)} new or refreshed", flush=True)
+        def iso(ms: int) -> str:
+            return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%S") + "Z"
 
-    if docs:
-        existing = db_round_ids_for(args.db, list(docs))
-        # rounds missing from the DB; the live round of each battle is carried
-        # by the doc itself (getBattles embeds the full round doc — use it
-        # directly; getById embeds only the id string — fetch it)
-        round_ids = {rid for doc in docs.values() for rid in (doc.get("rounds") or [])} - existing
-        live_docs: list[dict] = []
-        for doc in docs.values():
-            cr = doc.get("currentRound")
-            if isinstance(cr, dict) and cr.get("_id"):
-                live_docs.append(cr)
-                round_ids.discard(cr["_id"])
-            elif isinstance(cr, str) and cr:
-                round_ids.add(cr)
-        rounds = fetch_rounds(session, sorted(round_ids), max_batch) if round_ids else []
-        rounds += [minimize_round(cr) for cr in live_docs]
-        print(f"rounds: {len(round_ids) + len(live_docs)} to fetch, {len(rounds)} fetched", flush=True)
+        print(f"window: {iso(since_ms)} → {iso(until_ms)}", flush=True)
 
-        payload = [{k: v for k, v in doc.items() if k != "currentRound"} for doc in docs.values()] + rounds
-        insert_docs(args.db, payload, args.batch_size)
-        last_ms = max(to_unix_ms(doc["createdAt"]) for doc in docs.values())
-        save_state(args.state, last_ms, now_ms if active_due else active_walked_at)
-        print(f"state saved: next run starts at {iso(last_ms)} ({last_ms})", flush=True)
-        new_index_ms = db_battle_index_ms(args.db)
-        if new_index_ms != index_ms:
-            write_index(args.index, new_index_ms, len(new_index_ms) * INDEX_STEP)
-            print(f"index updated: {len(index_ms)} → {len(new_index_ms)} entries "
-                  f"(oldest {iso(new_index_ms[0])})", flush=True)
+        index_ms = load_index(args.index)
+        if not index_ms:
+            index_ms, index_src = build_index(args.db, args.index)
+            print(f"  index: built from {index_src} ({len(index_ms)} entries)", flush=True)
+        docs = {b["_id"]: b for b in fetch_battles(session, since_ms, until_ms, index_ms)}
+        active_ids: list[str] = []
+        if active_due:
+            active_ids = db_active_battle_ids(args.db)
+            print(f"  active battles: refreshing {len(active_ids)} from DB", flush=True)
+            for doc in fetch_active_docs(session, active_ids, max_batch):
+                docs.setdefault(doc["_id"], doc)
+        elif args.no_active:
+            print("  active battles: skipped (--no-active)", flush=True)
         else:
-            print(f"index unchanged: {len(new_index_ms)} entries", flush=True)
+            print(f"  active battles: skipped (last refresh {iso(active_walked_at)})", flush=True)
+        print(f"battles: {len(docs)} new or refreshed", flush=True)
+
+        if docs:
+            existing = db_round_ids_for(args.db, list(docs))
+            # rounds missing from the DB; the live round of each battle is carried
+            # by the doc itself (getBattles embeds the full round doc — use it
+            # directly; getById embeds only the id string — fetch it)
+            round_ids = {rid for doc in docs.values() for rid in (doc.get("rounds") or [])} - existing
+            if active_ids:
+                # active battles: re-fetch ALL their rounds, not just the
+                # missing ones — a round fetched mid-round holds partial
+                # damage and would never be refreshed again after it ends
+                # (it stops being currentRound, so only the current round
+                # would ever be re-fetched)
+                round_ids |= {rid for doc in docs.values() if doc["_id"] in active_ids
+                              for rid in (doc.get("rounds") or [])}
+            live_docs: list[dict] = []
+            for doc in docs.values():
+                cr = doc.get("currentRound")
+                if isinstance(cr, dict) and cr.get("_id"):
+                    live_docs.append(cr)
+                    round_ids.discard(cr["_id"])
+                elif isinstance(cr, str) and cr:
+                    round_ids.add(cr)
+            rounds = fetch_rounds(session, sorted(round_ids), max_batch) if round_ids else []
+            rounds += [minimize_round(cr) for cr in live_docs]
+            print(f"rounds: {len(round_ids) + len(live_docs)} to fetch, {len(rounds)} fetched", flush=True)
+
+            payload = [{k: v for k, v in doc.items() if k != "currentRound"} for doc in docs.values()] + rounds
+            insert_docs(args.db, payload, args.batch_size)
+            last_ms = max(to_unix_ms(doc["createdAt"]) for doc in docs.values())
+            save_state(args.state, last_ms, now_ms if active_due else active_walked_at)
+            print(f"state saved: next run starts at {iso(last_ms)} ({last_ms})", flush=True)
+            new_index_ms = db_battle_index_ms(args.db)
+            if new_index_ms != index_ms:
+                write_index(args.index, new_index_ms, len(new_index_ms) * INDEX_STEP)
+                print(f"index updated: {len(index_ms)} → {len(new_index_ms)} entries "
+                      f"(oldest {iso(new_index_ms[0])})", flush=True)
+            else:
+                print(f"index unchanged: {len(new_index_ms)} entries", flush=True)
+
+    # Rounds safety net + damage consistency, even when nothing new arrived:
+    bf_missing = db_battle_ids_without_rounds(args.db)
+    if bf_missing:
+        print(f"rounds backfill: {len(bf_missing)} battles without stored rounds", flush=True)
+        bf_docs = {d["_id"]: d for d in fetch_active_docs(session, bf_missing, max_batch)}
+        bf_existing = db_round_ids_for(args.db, list(bf_docs))
+        bf_round_ids = {rid for doc in bf_docs.values() for rid in (doc.get("rounds") or [])} - bf_existing
+        bf_rounds = fetch_rounds(session, sorted(bf_round_ids), max_batch) if bf_round_ids else []
+        bf_payload = [{k: v for k, v in d.items() if k != "currentRound"} for d in bf_docs.values()] + bf_rounds
+        insert_docs(args.db, bf_payload, args.batch_size)
+        print(f"rounds backfill: stored rounds for {len(bf_docs)} battles ({len(bf_rounds)} rounds)", flush=True)
+    fixed = repair_zero_damages(args.db)
+    if fixed:
+        print(f"damage repair: {fixed} battles now carry round-sum damages", flush=True)
 
     print("Done.", flush=True)
     return 0
