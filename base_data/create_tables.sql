@@ -368,13 +368,14 @@ CREATE TABLE endpoints_used (
 -- =============================================================================
 
 CREATE TABLE users (
-    id            SERIAL PRIMARY KEY,                       -- 4B int PK
-    user_id       UUID NOT NULL UNIQUE REFERENCES inventory_ids(external_id),
-    user_damages  BIGINT NOT NULL DEFAULT 0,                -- Σ merged battle-level damage (rankings)
-    user_wealth   DOUBLE PRECISION NULL,                    -- getUserLite rankings.userWealth.value
-    user_bounty   DOUBLE PRECISION NOT NULL DEFAULT 0,      -- Σ merged battle-level money (rankings)
-    mu_id         INT NULL REFERENCES inventory_ids(id),    -- user's MU (getUserLite mu)
-    total_xp      INTEGER NULL,                             -- getUserLite leveling.totalXp
-    military_rank SMALLINT NULL,                            -- getUserLite militaryRank (numeric)
-    username      TEXT NULL                                 -- getUserLite username
+    id              SERIAL PRIMARY KEY,                       -- 4B int PK
+    user_id         UUID NOT NULL UNIQUE REFERENCES inventory_ids(external_id),
+    user_damages    BIGINT NOT NULL DEFAULT 0,                -- Σ merged battle-level damage (rankings)
+    user_wealth     DOUBLE PRECISION NULL,                    -- getUserLite rankings.userWealth.value
+    user_bounty     DOUBLE PRECISION NOT NULL DEFAULT 0,      -- Σ merged battle-level money (rankings)
+    mu_id           INT NULL REFERENCES inventory_ids(id),    -- user's MU (getUserLite mu)
+    total_xp        INTEGER NULL,                             -- getUserLite leveling.totalXp
+    military_rank   SMALLINT NULL,                            -- getUserLite militaryRank (numeric)
+    username        TEXT NULL,                                -- getUserLite username
+    lite_checked_at TIMESTAMPTZ NULL                          -- last successful getUserLite fetch
 );

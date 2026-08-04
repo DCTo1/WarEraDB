@@ -12,7 +12,9 @@ Flow:
   1. fetch 4 snapshots (4 requests) -> union of ~18.7K active users
   2. getUserLite for all of them (50/batch) -> username + military_rank
   3. one upsert per user: get_inventory_id() for the user (FK) and MU, then
-     INSERT ... ON CONFLICT DO UPDATE (re-runs refresh everything)
+     INSERT ... ON CONFLICT DO UPDATE (re-runs refresh everything);
+     users getUserLite succeeded for get lite_checked_at = NOW() so the
+     viewer's incremental backfill (update_users_lite.py) doesn't re-pick them
 
 Semantics (decided with user): user_damages/user_bounty are OVERWRITTEN
 with the exact API values where snapshots have them; users outside the
@@ -131,6 +133,10 @@ def main():
         ins_cols = ["user_id"]
         ins_vals = [f"objectid_to_uuid('{h}')"]
         upd_sets = []
+        if h in lite:  # getUserLite succeeded — mark as checked
+            ins_cols.append("lite_checked_at")
+            ins_vals.append("NOW()")
+            upd_sets.append("lite_checked_at = EXCLUDED.lite_checked_at")
         for col, v in (("user_damages", dmg_sql), ("user_bounty", bounty_sql),
                        ("user_wealth", wealth_sql), ("total_xp", xp_sql),
                        ("mu_id", mu_sql), ("username", name_sql),

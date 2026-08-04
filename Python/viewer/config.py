@@ -17,6 +17,7 @@ REPO = os.path.join(ROOT, "..")                                # repo root
 UPDATE_SCRIPT = os.path.join(REPO, "Python", "update_battles.py")
 LIVE_SCRIPT = os.path.join(REPO, "Python", "update_live.py")
 RANKING_SCRIPT = os.path.join(REPO, "Python", "insert_ranking_sample.py")
+USER_LITE_SCRIPT = os.path.join(REPO, "Python", "update_users_lite.py")
 
 HEX_RE = re.compile(r"^[0-9a-f]{24}$")
 BATTLE_TYPES = ("war", "resistance", "tournament", "revolution")
@@ -32,6 +33,7 @@ DEFAULT_PORT = 8765
 class Settings:
     db: str = os.environ.get("BATTLE_DB", "tsdb")
     ranking_latest: int = 1000
+    user_lite_limit: int = 100
 
 
 settings = Settings()

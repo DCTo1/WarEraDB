@@ -14,7 +14,7 @@ import sys
 import threading
 import time
 
-from .config import LIVE_SCRIPT, MAX_UPDATE_LINES, RANKING_SCRIPT, UPDATE_INTERVAL, UPDATE_SCRIPT, settings
+from .config import LIVE_SCRIPT, MAX_UPDATE_LINES, RANKING_SCRIPT, UPDATE_INTERVAL, UPDATE_SCRIPT, USER_LITE_SCRIPT, settings
 from .ui import esc, layout
 
 # State of the background updater. Guarded by UPDATE_LOCK.
@@ -39,6 +39,7 @@ def _run_updater() -> None:
     insert_ranking_sample.py."""
     db = settings.db
     env = dict(os.environ, BATTLE_DB=db)
+    rc2 = 0  # ranking step rc (0 = skipped when --ranking 0 disables it)
     try:
         rc = _tee_output(subprocess.Popen(
             [sys.executable, UPDATE_SCRIPT, "--db", db, "--force-active"],
@@ -64,6 +65,16 @@ def _run_updater() -> None:
                 text=True, bufsize=1, env=env))
             with UPDATE_LOCK:
                 UPDATE_STATE["rc"] = rc if rc != 0 else (rc3 if rc3 != 0 else rc2)
+        if settings.user_lite_limit:
+            with UPDATE_LOCK:
+                UPDATE_STATE["output"].append(
+                    f"\n=== user lite: update_users_lite.py --limit {settings.user_lite_limit} ===")
+            rc4 = _tee_output(subprocess.Popen(
+                [sys.executable, USER_LITE_SCRIPT, "--limit", str(settings.user_lite_limit)],
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, bufsize=1, env=env))
+            with UPDATE_LOCK:
+                UPDATE_STATE["rc"] = (rc if rc != 0 else (rc3 if rc3 != 0 else (rc2 if rc2 != 0 else rc4)))
     except Exception as exc:
         with UPDATE_LOCK:
             UPDATE_STATE["rc"] = -1
