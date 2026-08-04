@@ -42,93 +42,56 @@ Exit codes: 0 success, 1 API/auth failure, 2 DB failure.
 import argparse
 import json
 import os
-import subprocess
 import sys
 import time
 
 import requests
-from requests.adapters import HTTPAdapter
 
 import endpoint_log
-from insert_ranking_sample import esc, loot_sql, value_sql
+from api import batched_fetch, make_session
+from db import (
+    active_battle_hexes,
+    esc,
+    exec_many,
+    flush_endpoint_log,
+    loot_sql,
+    query,
+    value_sql,
+)
+from utils import (
+    BASE_DIR,
+    ENTITY,
+    MAX_BATCH,
+    PAGE_LIMIT,
+    SIDE,
+    read_json,
+    write_json,
+)
 
-API_URL = "https://api2.warera.io/trpc"
-KEY_FILE = os.path.expanduser("~/.config/warera/api_key.txt")
-STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "live_state.json")
+STATE_FILE = os.path.join(BASE_DIR, "live_state.json")
 
-MAX_BATCH = 50          # server-enforced tRPC batch cap (verified 2026-08-02)
-PAGE_LIMIT = 100        # battleRanking limit cap (verified 2026-08-03)
 FLUSH = 20000
 FUTURE_CURSOR = "2099-01-01T00:00:00Z"
 RANKING_INTERVAL = 300  # seconds between per-entity ranking syncs (default)
 
-SIDE = {"attacker": 1, "defender": 2}
-ENTITY = {"user": 1, "country": 2, "mu": 3}
 DATA_TYPES = ("damage", "points")
-
-DB = "tsdb"
-
-
-def psql(sql: str) -> subprocess.CompletedProcess:
-    # Flush queued endpoint usages in the same call (no extra round trips)
-    return subprocess.run(
-        ["docker", "exec", "-i", "timescaledb", "psql", "-U", "postgres", "-d", DB,
-         "-v", "ON_ERROR_STOP=1", "-q", "-t", "-A"],
-        input=endpoint_log.drain_sql() + sql, capture_output=True, text=True)
-
-
-def session() -> requests.Session:
-    s = requests.Session()
-    s.headers.update({"Content-Type": "application/json",
-                      "x-api-key": open(KEY_FILE).read().strip()})
-    s.mount("https://", HTTPAdapter(pool_connections=16, pool_maxsize=16))
-    return s
-
-
-def batched_call(s: requests.Session, endpoint: str, bodies: list[dict],
-                 retries: int = 5) -> list:
-    """One POST with up to MAX_BATCH tRPC calls; responses aligned to bodies.
-    Logs one endpoint usage per call."""
-    for _ in bodies:
-        endpoint_log.log(endpoint)
-    url = f"{API_URL}/{','.join([endpoint] * len(bodies))}?batch=1"
-    last = None
-    for attempt in range(retries):
-        try:
-            resp = s.post(url, json={str(i): b for i, b in enumerate(bodies)}, timeout=90)
-            if resp.status_code == 413:
-                time.sleep(3)
-                last = "413"
-                continue
-            resp.raise_for_status()
-            return resp.json()
-        except Exception as e:
-            last = f"{type(e).__name__}: {str(e)[:80]}"
-            time.sleep(1 + attempt)
-    raise RuntimeError(f"API unreachable after {retries} attempts ({last})")
 
 
 def fetch_live_battles(s: requests.Session) -> list[dict]:
     """ALL active battles in one request."""
-    out = batched_call(s, "battle.getBattles",
-                       [{"isActive": True, "limit": 100, "cursor": FUTURE_CURSOR}])
+    out = batched_fetch(s, "battle.getBattles",
+                        [{"isActive": True, "limit": 100, "cursor": FUTURE_CURSOR}])
     if "error" in out[0]:
         raise RuntimeError(f"getBattles: {out[0]['error']}")
     return out[0]["result"]["data"]["items"]
 
 
-def db_active_hexes() -> list[str]:
-    proc = psql("SELECT uuid_to_objectid(battle_id) FROM battles WHERE ended_at IS NULL;\n")
-    if proc.returncode != 0:
-        raise RuntimeError(f"DB error: {proc.stderr[:500]}")
-    return [l for l in proc.stdout.splitlines() if l]
-
-
 def reconcile_and_mark_ended(s: requests.Session, live: list[dict],
-                             db_active: list[str]) -> tuple[list[tuple[str, str]], list[dict]]:
+                             db_active: list[str], dbname: str) -> tuple[list[tuple[str, str]], list[dict]]:
     """DB-active battles missing from the API's active list → getById check.
 
-    Returns (marked_ended, upserted_docs) — one psql call batches all updates.
+    Returns (marked_ended, upserted_docs) — one DB transaction batches all
+    updates.
     """
     live_hexes = {b["_id"] for b in live}
     missing = [h for h in db_active if h not in live_hexes]
@@ -137,7 +100,7 @@ def reconcile_and_mark_ended(s: requests.Session, live: list[dict],
     marked, docs = [], []
     for i in range(0, len(missing), MAX_BATCH):
         chunk = missing[i:i + MAX_BATCH]
-        results = batched_call(s, "battle.getById", [{"battleId": h} for h in chunk])
+        results = batched_fetch(s, "battle.getById", [{"battleId": h} for h in chunk])
         for h, res in zip(chunk, results):
             if "error" in res:
                 print(f"  getById {h} failed: {res['error']}", file=sys.stderr)
@@ -156,33 +119,25 @@ def reconcile_and_mark_ended(s: requests.Session, live: list[dict],
     # ancient zombie battles' rows (June-10 API-regen timestamps) are skipped
     # — acceptable, their ended_at still gets set.
     if marked:
-        sql = "BEGIN;\n"
-        for h, ts in marked:
-            sql += (f"UPDATE battles SET ended_at = '{esc(ts)}'::TIMESTAMPTZ "
-                    f"WHERE battle_id = objectid_to_uuid('{h}');\n"
-                    f"DELETE FROM battle_ranking_entries "
-                    f"WHERE battle_id = (SELECT id FROM battles WHERE battle_id = objectid_to_uuid('{h}'))"
-                    f"  AND created_at > now() - interval '7 days';\n")
-        sql += "COMMIT;\n"
-        proc = psql(sql)
-        if proc.returncode != 0:
-            raise RuntimeError(f"DB error marking ended: {proc.stderr[:500]}")
+        stmts = [f"UPDATE battles SET ended_at = '{esc(ts)}'::TIMESTAMPTZ "
+                 f"WHERE battle_id = objectid_to_uuid('{h}');"
+                 for h, ts in marked]
+        stmts += [f"DELETE FROM battle_ranking_entries "
+                  f"WHERE battle_id = (SELECT id FROM battles WHERE battle_id = objectid_to_uuid('{h}'))"
+                  f"  AND created_at > now() - interval '7 days';"
+                  for h, _ in marked]
+        exec_many(stmts, dbname)
         for h, ts in marked:
             print(f"  ended + rows cleared: {h} (ended_at={ts})", flush=True)
     return marked, docs
 
 
-def insert_battle_docs(s: requests.Session, docs: list[dict]) -> None:
+def insert_battle_docs(dbname: str, docs: list[dict]) -> None:
     if not docs:
         return
-    sql = "BEGIN;\n"
-    for doc in docs:
-        raw = json.dumps(doc, ensure_ascii=False, separators=(",", ":"))
-        sql += f"SELECT insert_battle($JSON${raw}$JSON$);\n"
-    sql += "COMMIT;\n"
-    proc = psql(sql)
-    if proc.returncode != 0:
-        raise RuntimeError(f"DB error inserting battle docs: {proc.stderr[:500]}")
+    stmts = [f"SELECT insert_battle($JSON${json.dumps(doc, ensure_ascii=False, separators=(",", ":"))}$JSON$);"
+             for doc in docs]
+    exec_many(stmts, dbname)
 
 
 def ranking_stmt(battle_hex: str, side: str, typ: str, ent: str,
@@ -202,7 +157,7 @@ class EndpointDown(RuntimeError):
     """The ranking endpoint is failing wholesale (not a per-combo issue)."""
 
 
-def fetch_live_rankings(s: requests.Session, battles: list[dict]) -> tuple[int, int]:
+def fetch_live_rankings(s: requests.Session, battles: list[dict], dbname: str) -> tuple[int, int]:
     """Per-entity battle rankings for live battles (partial, growing).
 
     Battles whose DB ended_at is already set are skipped: they ended between
@@ -216,12 +171,11 @@ def fetch_live_rankings(s: requests.Session, battles: list[dict]) -> tuple[int, 
     hexes = [b["_id"] for b in battles]
     if not hexes:
         return 0, 0
-    proc = psql(
+    rows = query(
         "SELECT uuid_to_objectid(battle_id) FROM battles WHERE ended_at IS NOT NULL"
-        f" AND battle_id IN ({','.join(f'objectid_to_uuid(\'{h}\')' for h in hexes)});\n")
-    if proc.returncode != 0:
-        raise RuntimeError(f"DB error: {proc.stderr[:500]}")
-    ended = set(proc.stdout.splitlines())
+        f" AND battle_id IN ({','.join(f'objectid_to_uuid(\'{h}\')' for h in hexes)});",
+        dbname)
+    ended = {r[0] for r in rows}
     if ended:
         print(f"  ranking walk: skipping {len(ended)} battles already ended "
               f"(live-list race)", flush=True)
@@ -234,13 +188,11 @@ def fetch_live_rankings(s: requests.Session, battles: list[dict]) -> tuple[int, 
     entries_n = 0
     requests_n = 0
 
-    def flush():
+    def flush() -> None:
         nonlocal stmts, buf_n
         if not stmts:
             return
-        proc = psql("BEGIN;\n" + "".join(stmts) + "COMMIT;\n")
-        if proc.returncode != 0:
-            raise RuntimeError(f"DB error in ranking upserts: {proc.stderr[:500]}")
+        exec_many(stmts, dbname)
         stmts = []
         buf_n = 0
 
@@ -253,12 +205,12 @@ def fetch_live_rankings(s: requests.Session, battles: list[dict]) -> tuple[int, 
         skip the bad ones (caught by the next cycle). Returns (responses
         aligned to body keys, failed_count)."""
         try:
-            return batched_call(s, "battleRanking.getRanking",
-                                list(bodies.values()), retries=2), 0
+            return batched_fetch(s, "battleRanking.getRanking",
+                                 list(bodies.values()), retries=2), 0
         except RuntimeError as exc:
             try:
                 probe = next(iter(bodies.values()))
-                batched_call(s, "battleRanking.getRanking", [probe], retries=1)
+                batched_fetch(s, "battleRanking.getRanking", [probe], retries=1)
             except RuntimeError:
                 raise EndpointDown(exc)
             print(f"  batch failed ({exc}) — retrying individually", file=sys.stderr)
@@ -266,7 +218,7 @@ def fetch_live_rankings(s: requests.Session, battles: list[dict]) -> tuple[int, 
             failed = 0
             for p in bodies.values():
                 try:
-                    out.append(batched_call(s, "battleRanking.getRanking", [p], retries=1)[0])
+                    out.append(batched_fetch(s, "battleRanking.getRanking", [p], retries=1)[0])
                 except RuntimeError as e2:
                     failed += 1
                     out.append({"error": {"message": str(e2)}})
@@ -358,23 +310,7 @@ def fetch_live_rankings(s: requests.Session, battles: list[dict]) -> tuple[int, 
     return requests_n, entries_n
 
 
-def read_state() -> dict:
-    try:
-        with open(STATE_FILE) as f:
-            return json.load(f)
-    except (OSError, json.JSONDecodeError):
-        return {}
-
-
-def write_state(state: dict) -> None:
-    tmp = STATE_FILE + ".tmp"
-    with open(tmp, "w") as f:
-        json.dump(state, f)
-    os.replace(tmp, STATE_FILE)
-
-
-def main():
-    global DB
+def main() -> int:
     p = argparse.ArgumentParser(description="Live battle sync (website 15s cycle or standalone).")
     p.add_argument("--db", default=os.environ.get("BATTLE_DB", "tsdb"))
     p.add_argument("--skip-rankings", action="store_true",
@@ -382,43 +318,58 @@ def main():
     p.add_argument("--ranking-interval", type=int, default=RANKING_INTERVAL,
                    help=f"Minimum seconds between per-entity ranking syncs (default {RANKING_INTERVAL})")
     args = p.parse_args()
-    DB = args.db
+    dbname = args.db
 
-    s = session()
+    s = make_session(pool_size=16)
     try:
         live = fetch_live_battles(s)
     except RuntimeError as exc:
         print(f"API failure: {exc}", file=sys.stderr)
-        psql(endpoint_log.drain_sql())
+        _flush_safe(dbname)
         return 1
     print(f"live battles from API: {len(live)}", flush=True)
 
     try:
-        db_active = db_active_hexes()
+        _sync(s, live, args, dbname)
     except RuntimeError as exc:
-        print(f"DB failure: {exc}", file=sys.stderr)
-        psql(endpoint_log.drain_sql())
-        return 2
+        if str(exc).startswith("DB error"):
+            print(f"DB failure: {exc}", file=sys.stderr)
+            _flush_safe(dbname)
+            return 2
+        raise
+    _flush_safe(dbname)
+    return 0
 
-    marked, extra_docs = reconcile_and_mark_ended(s, live, db_active)
+
+def _sync(s: requests.Session, live: list[dict], args, dbname: str) -> None:
+    """Reconciliation + battle-doc refresh + (throttled) live rankings."""
+    db_active = active_battle_hexes(dbname)
+
+    marked, extra_docs = reconcile_and_mark_ended(s, live, db_active, dbname)
     if marked:
         print(f"  reconciliation: {len(marked)} battles marked ended", flush=True)
 
-    insert_battle_docs(s, live + extra_docs)
+    insert_battle_docs(dbname, live + extra_docs)
     print(f"battles: refreshed {len(live) + len(extra_docs)} docs", flush=True)
 
     if not args.skip_rankings and live:
-        state = read_state()
+        state = read_json(STATE_FILE, {})
         last = state.get("last_ranking_at", 0)
         if time.time() - last >= args.ranking_interval:
-            reqs, entries = fetch_live_rankings(s, live)
+            reqs, entries = fetch_live_rankings(s, live, dbname)
             print(f"rankings: {entries} live entries in {reqs} requests", flush=True)
-            write_state({**state, "last_ranking_at": int(time.time())})
+            write_json(STATE_FILE, {**state, "last_ranking_at": int(time.time())})
         else:
             print(f"rankings: skipped (last sync {time.time() - last:.0f}s ago, "
                   f"interval {args.ranking_interval}s)", flush=True)
-    psql(endpoint_log.drain_sql())
-    return 0
+
+
+def _flush_safe(dbname: str) -> None:
+    """Flush queued endpoint usages; never let telemetry take a run down."""
+    try:
+        flush_endpoint_log(dbname)
+    except RuntimeError:
+        pass
 
 
 if __name__ == "__main__":

@@ -61,6 +61,10 @@ done
 # Populate the countries table (feeds country names into the battle/bounty views)
 .venv/bin/python Python/update_countries.py
 
+# Users table (API lifetime stats + username/MU detail from ranking snapshots
+# + user.getUserLite; re-running refreshes)
+.venv/bin/python Python/update_users.py
+
 # Battle rankings (damage/points/money + loot) — battleRanking.getRanking.
 # Attacker/defender rankings exist for ALL battles since 2025-05; the API's
 # merged side exists only for battles ending after 2026-03-29T~17:00Z (and the
@@ -70,6 +74,14 @@ done
 # deleted. Modes:
 #   --latest N / --first N / --battles N / --range A B / --verify / --estimate
 .venv/bin/python Python/insert_ranking_sample.py --latest 1000
+
+# Live battle sync (active battles + reconciliation) — runs automatically on
+# the web viewer's 15 s cycle; standalone use: add --skip-rankings to skip
+# the per-entity live rankings
+.venv/bin/python Python/update_live.py
+
+# Seed the endpoint registry (idempotent; new endpoints auto-register anyway)
+.venv/bin/python Python/seed_endpoints.py
 ```
 
 ### Authentication
@@ -83,13 +95,44 @@ from the `WARERA_API_KEY` environment variable, falling back to
 
 ```bash
 .venv/bin/pip install -r requirements.txt
-.venv/bin/pyright Python/ extra/     # static type check (Pylance uses the same rules)
+.venv/bin/pyright Python/ extra/     # static type check (Pylance uses the same rules;
+                                     # pyrightconfig.json points it at the venv)
 ```
+
+### Database connection for the scripts
+
+The Python scripts connect over TCP via SQLAlchemy (see `Python/db.py`).
+Defaults: `postgresql+psycopg://postgres:postgres@localhost:5432/{db}`
+(the README quick-start container publishes 5432 and sets
+`POSTGRES_PASSWORD=postgres`). Override the whole URL with the
+`WARERA_DB_URL` env var — use `{db}` as a slot for the database name
+(`BATTLE_DB` env / `--db` flag, default `tsdb`):
+
+```bash
+WARERA_DB_URL='postgresql+psycopg://postgres:postgres@localhost:5433/{db}' \
+  .venv/bin/python Python/update_countries.py
+```
+
+### Web viewer (optional)
+
+Local read-only web viewer + auto-updater (battles/rounds/countries, live
+battle sync, rankings, users, bounties — every 15 s):
+
+```bash
+# WARERA_DB_URL must be set in the viewer's environment: the auto-updater
+# spawns the pipeline scripts, which connect over TCP (see below)
+WARERA_DB_URL='postgresql+psycopg://postgres:postgres@localhost:5432/{db}' \
+  .venv/bin/python extra/db_web.py        # → http://127.0.0.1:8765
+```
+
+The viewer itself reads the DB via `docker exec psql`; only the scripts it
+spawns use SQLAlchemy.
 
 ### Testing on a scratch DB
 
-All three loaders accept a `BATTLE_DB` env var (or `--db` flag) to target a
-throwaway database instead of `tsdb`.
+All pipeline scripts accept a `BATTLE_DB` env var (or `--db` flag) to target
+a throwaway database instead of `tsdb` — apply `base_data/` to it first and
+remember the `WARERA_DB_URL` override applies there too.
 
 ## Database schema
 
@@ -166,5 +209,6 @@ ORDER BY r.rank LIMIT 20;
 | Path | Purpose |
 |---|---|
 | `base_data/` | Schema DDL (`create_tables.sql`), PL/pgSQL functions (`functions.sql`), indexes, views |
-| `Python/` | Battle tooling: incremental updater / backfill (`update_battles.py`), live battle sync + reconciliation (`update_live.py`), countries snapshot (`update_countries.py`), ranking fetcher (`insert_ranking_sample.py`), users table filler (`update_users.py`), transaction transform helper (`utils.py`) |
+| `Python/` | Battle tooling: shared modules (`api.py` WarEra API client, `db.py` SQLAlchemy DB access + SQL helpers, `utils.py` time/state/constants + `prepare_transaction()`, `endpoint_log.py`) + the CLI scripts (`update_battles.py`, `update_live.py`, `update_countries.py`, `insert_ranking_sample.py`, `update_users.py`, `seed_endpoints.py`) |
+| `extra/deprecated/` | Pre-rework versions of the Python scripts (kept for recovery; not used) |
 | `data/battle_timestamps.json` | Battle timestamp index for batched pagination (oldest-first, append-only) |

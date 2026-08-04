@@ -24,19 +24,16 @@ Usage:
 """
 
 import argparse
-import json
 import os
-import subprocess
+import sys
 import time
 
 import requests
-from requests.adapters import HTTPAdapter
 
 import endpoint_log
-
-API_URL = "https://api2.warera.io/trpc"
-KEY_FILE = os.path.expanduser("~/.config/warera/api_key.txt")
-DB = os.environ.get("BATTLE_DB", "tsdb")
+from api import batched_fetch, fetch_data, make_session
+from db import esc, exec_many, flush_endpoint_log
+from utils import MAX_BATCH
 
 SLEEP = 0.1
 BATCH_CAP = 50
@@ -45,54 +42,12 @@ FLUSH = 5000
 SNAPSHOT_TYPES = ("userDamages", "userBounty", "userWealth", "userLevel")
 
 
-def psql(sql):
-    r = subprocess.run(
-        ["docker", "exec", "-i", "timescaledb", "psql", "-U", "postgres", "-d", DB,
-         "-v", "ON_ERROR_STOP=1", "-q", "-t", "-A"],
-        input=endpoint_log.drain_sql() + sql, capture_output=True, text=True)
-    if r.returncode != 0:
-        raise RuntimeError(f"psql failed: {r.stderr[-800:]}")
-    return r.stdout
-
-
-def session():
-    s = requests.Session()
-    s.headers.update({"Content-Type": "application/json",
-                      "x-api-key": open(KEY_FILE).read().strip()})
-    s.mount("https://", HTTPAdapter(pool_connections=8, pool_maxsize=8))
-    return s
-
-
-def batch_get(s, body):
-    n = len(body)
-    for _ in body:
-        endpoint_log.log("user.getUserLite")
-    url = API_URL + "/" + ",".join(["user.getUserLite"] * n) + "?batch=1"
-    last = None
-    for attempt in range(8):
-        try:
-            resp = s.post(url, json=body, timeout=90)
-            if resp.status_code == 413:
-                time.sleep(5)
-                last = "413"
-                continue
-            resp.raise_for_status()
-            return resp.json()
-        except Exception as e:
-            last = f"{type(e).__name__}: {str(e)[:80]}"
-            time.sleep(2 * (attempt + 1) + 2)
-    raise RuntimeError(f"API unreachable after 8 attempts ({last})")
-
-
-def fetch_snapshots(s):
+def fetch_snapshots(s: requests.Session) -> dict:
     """{hex: {"damages": v|None, "bounty": v|None, "wealth": v|None, "xp": v|None, "mu": hex|None}}"""
     out = {}
     for typ in SNAPSHOT_TYPES:
         endpoint_log.log("ranking.getRanking")
-        r = s.post(API_URL + "/ranking.getRanking?batch=1",
-                   json={"0": {"rankingType": typ}}, timeout=120)
-        r.raise_for_status()
-        d = r.json()[0]["result"]["data"]
+        d = fetch_data(s, "ranking.getRanking", {"rankingType": typ}, timeout=120)
         key = {"userDamages": "damages", "userBounty": "bounty",
                "userWealth": "wealth", "userLevel": "xp"}[typ]
         for it in d.get("items", []):
@@ -107,14 +62,13 @@ def fetch_snapshots(s):
     return out
 
 
-def fetch_lite(s, hexs):
+def fetch_lite(s: requests.Session, hexs: list[str]) -> dict:
     """{hex: (username, military_rank)} — NULLs when the user is gone."""
     out = {}
     missing = 0
     for off in range(0, len(hexs), BATCH_CAP):
         chunk = hexs[off:off + BATCH_CAP]
-        body = {str(i): {"userId": h} for i, h in enumerate(chunk)}
-        data = batch_get(s, body)
+        data = batched_fetch(s, "user.getUserLite", [{"userId": h} for h in chunk])
         for i, h in enumerate(chunk):
             if "error" in data[i]:
                 missing += 1
@@ -128,21 +82,23 @@ def fetch_lite(s, hexs):
 
 
 def val_sql(v, cast):
+    """SQL literal with cast, or None when the value is missing — missing
+    values are OMITTED from the INSERT/UPDATE so re-runs never NULL out
+    columns the snapshots don't cover."""
     if v is None:
         return None
     return f"{v}::{cast}"
 
 
-def esc(v):
-    return str(v).replace("'", "''")
-
-
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--batch", type=int, default=BATCH_CAP)
+    ap.add_argument("--db", default=os.environ.get("BATTLE_DB", "tsdb"),
+                    help="Target database (default: tsdb)")
     args = ap.parse_args()
+    dbname = args.db
 
-    s = session()
+    s = make_session(pool_size=8)
     t0 = time.time()
     print("fetching snapshots...")
     snaps = fetch_snapshots(s)
@@ -152,12 +108,11 @@ def main():
 
     stmts = []
     n_stmts = 0
-    n_insert = n_update = 0
 
     def flush():
         nonlocal stmts, n_stmts
         if stmts:
-            psql("BEGIN;\n" + "\n".join(stmts) + "\nCOMMIT;")
+            exec_many(stmts, dbname)
             n_stmts += len(stmts)
             stmts.clear()
 
@@ -193,6 +148,7 @@ def main():
             flush()
     flush()
     el = time.time() - t0
+    flush_endpoint_log(dbname)
     print(f"done in {el:.0f}s: {n_stmts} upserts")
 
 
