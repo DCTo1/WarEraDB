@@ -54,9 +54,10 @@ Notes
       index are covered by the cursor-less page (+catch-up walk if >100).
     - The active-battle refresh runs on a cadence: --active-interval minutes
       (default 30). It is DB-driven (one battle.getById per active battle,
-      also batched) — the API's isActive pagination is unusable for this: it
-      enumerates the FULL battle history server-side (~1 active per 100
-      pages).
+      also batched). (2026-08-03: the API's isActive pagination IS usable —
+      battle.getBattles {isActive: true, cursor: <far-future>} returns ALL
+      active battles in one request; update_live.py uses it for reconciliation,
+      this script keeps the getById cadence for rounds.)
     - insert_battle()/insert_round() upsert: new rows are inserted, and
       re-fetched active battles/live rounds have their mutable stats
       (ended_at, damages, hit counts, points, ...) refreshed.
@@ -516,8 +517,9 @@ def db_active_battle_ids(db: str) -> list[str]:
 def fetch_active_docs(session: requests.Session, battle_ids: list[str], batch_size: int = MAX_BATCH) -> list[dict]:
     """Refresh active battles via battle.getById, batched (≤ batch_size per request).
 
-    Returns full docs (minus currentRound) — much cheaper than the isActive
-    pagination walk, which enumerates ALL of history server-side.
+    Returns full docs (minus currentRound). getById is also how live battles
+    keep their rounds current; the full active-battle LIST is obtained from
+    battle.getBattles {isActive: true} in one request (see update_live.py).
     """
     docs: list[dict] = []
     failed = 0

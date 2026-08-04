@@ -12,7 +12,9 @@ Speed:
   - stmts buffered and flushed at FLUSH per psql call; one state save per
     battle; per-battle rate stats written for --estimate
 
-Derivation (per battle, gated on ended_at >= MERGED_CUTOFF):
+Derivation (per battle; MERGED_CUTOFF gate kept only because the API's own
+merged side starts there — for pre-cutoff battles merged is DERIVED the same
+way, full backfill done 2026-08-03 in SQL):
   - round merged rows from round side rows (sum damage/points/money,
     max loot, min created_at)
   - battle merged rows from battle side rows (created_at = battle ended_at)
@@ -165,7 +167,8 @@ def entry_stmt(battle, num, side, typ, ent, dmg, pts, mon, loot, created, round_
 
 def derivation_stmts(battle):
     """Merged rows (round + battle) from side rows. Gates on MERGED_CUTOFF to
-    match API availability (no merged side before the roll-out)."""
+    match API availability (no merged side before the roll-out); pre-cutoff
+    battles were backfilled 2026-08-03 with the same SQL (no gate)."""
     uuid = f"objectid_to_uuid('{esc(battle)}')"
     return [
         f"""INSERT INTO round_ranking_entries
