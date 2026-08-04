@@ -6,6 +6,11 @@ battles, rounds, battle bounties, per-battle rankings with item loot, countries 
 star-schema (MongoDB ObjectIDs → integer IDs), and stores them in PostgreSQL with
 TimescaleDB hypertables.
 
+> Transactions: the API currently serves only ~3 days of transaction history
+> (verified 2026-08-04), so the 70M-row transaction scrape is blocked until the
+> API exposes older data. The transaction pipeline (schema, functions, examples)
+> is ready and seeded.
+
 **What's in the DB today** *(rough counts — they grow with every incremental update run)*
 
 | Data | Rows |
@@ -14,11 +19,12 @@ TimescaleDB hypertables.
 | Rounds | ~33K |
 | Bounty sides (attacker/defender bounty pools) | ~10K |
 | Countries (current-state snapshot) | 180 |
-| Battle ranking entries (damage/points/money + loot, per side) | ~16M |
-| Round ranking entries | ~20M |
+| Battle ranking entries (damage/points/money + loot, per side; merged = exceptions only) | ~10M |
+| Round ranking entries | ~12.7M |
 | Loot items (upserted from ranking loot) | ~1.4M |
 | Inventory ids (users, countries, MUs — global ObjectID → int map) | ~100K |
-| Transactions (seeded from examples; full 70M+ scrape pending) | ~700 |
+| Users (API lifetime stats + username/level/MU detail) | ~100K |
+| Transactions (seeded from examples; scrape blocked on the 3-day API window) | ~700 |
 
 ## Quick start
 
@@ -37,6 +43,8 @@ docker run -d --name timescaledb \
 Apply the SQL files in order (any psql client works — `psql -h localhost -U postgres -d tsdb`):
 
 ```bash
+# create_indexes.sql holds OPTIONAL query indexes, all commented out by
+# default — uncomment the ones you need before this loop (or skip the file).
 for f in create_tables functions item_codes create_indexes create_views; do
   docker exec -i timescaledb psql -U postgres -d tsdb -v ON_ERROR_STOP=1 \
     -f - < base_data/$f.sql
@@ -54,7 +62,12 @@ done
 .venv/bin/python Python/update_countries.py
 
 # Battle rankings (damage/points/money + loot) — battleRanking.getRanking.
-# Rankings exist only for battles ending after 2026-03-29T~17:00Z. Modes:
+# Attacker/defender rankings exist for ALL battles since 2025-05; the API's
+# merged side exists only for battles ending after 2026-03-29T~17:00Z (and the
+# API regenerated all historical ranking docs on 2026-06-10, so pre-June-10
+# battles' rows carry that createdAt). Only the non-derivable merged
+# "exceptions" are stored (side=3); merged rows equal to the side sums are
+# deleted. Modes:
 #   --latest N / --first N / --battles N / --range A B / --verify / --estimate
 .venv/bin/python Python/insert_ranking_sample.py --latest 1000
 ```
@@ -87,8 +100,8 @@ throwaway database instead of `tsdb`.
 | `rounds` | Round results per battle | `id SERIAL PK`, `round_id UUID`, `battle_id`, `number`, points/damages/hits, `won_by_country_id`, UNIQUE `(battle_id, number)` |
 | `battle_bounties` | Per-side bounty pool (row exists only when a side has a bounty) | `battle_id`, `side` (1/2), `money_pool`, `money_per_1k_damages`, `bounty_effective_at`, `bounty_is_national` |
 | `countries` | Current-state country snapshot (no history) | `country_id` (= `inventory_ids.id`), `name`, `code`, population, development, taxes |
-| `battle_ranking_entries` | Battle-level rankings (rankings exist only for battles ending after 2026-03-29) | `battle_id` (int FK), `side` (attacker/defender/merged), `entity_type` (user/country/mu), `entity_id` (FK `inventory_ids`), `damage`, `points`, `money`, `loot_item_id` (FK `items`), `created_at` |
-| `round_ranking_entries` | Round-level rankings | same + `round_number`; PK `(battle_id, round_number, side, entity_type, entity_id)` |
+| `battle_ranking_entries` | Battle-level rankings (attacker/defender since 2025-05, merged since 2026-03-29) | `battle_id` (int FK), `side` (1=attacker, 2=defender, **3=merged — exceptions only**, the API-official values that differ from the side sums), `entity_type` (1=user, 2=country, 3=mu), `entity_id` (FK `inventory_ids`), `damage`, `points`, `money`, `loot_item_id` (FK `items`), `created_at` |
+| `round_ranking_entries` | Round-level rankings | same + `round_number`; PK `(created_at, battle_id, round_number, side, entity_type, entity_id)` (hypertable partition col in the unique index); side=3 = exceptions only |
 
 Naming convention: `*_id` columns are INT FKs into `inventory_ids`; bare UUID
 columns (regions, tournament teams) are raw API ObjectIDs — those entities
@@ -146,5 +159,5 @@ ORDER BY r.rank LIMIT 20;
 | Path | Purpose |
 |---|---|
 | `base_data/` | Schema DDL (`create_tables.sql`), PL/pgSQL functions (`functions.sql`), indexes, views |
-| `Python/` | Battle tooling: incremental updater / backfill (`update_battles.py`), countries snapshot (`update_countries.py`), ranking fetcher (`insert_ranking_sample.py`), transaction transform helper (`utils.py`) |
+| `Python/` | Battle tooling: incremental updater / backfill (`update_battles.py`), live battle sync + reconciliation (`update_live.py`), countries snapshot (`update_countries.py`), ranking fetcher (`insert_ranking_sample.py`), users table filler (`update_users.py`), transaction transform helper (`utils.py`) |
 | `data/battle_timestamps.json` | Battle timestamp index for batched pagination (oldest-first, append-only) |

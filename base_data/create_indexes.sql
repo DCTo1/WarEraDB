@@ -1,48 +1,78 @@
 -- =============================================================================
---  Indexes for the transactions hypertable
+-- WarEraDB optional query indexes
 --
---  During the initial 70M-row bulk load, only the UNIQUE index is needed
---  (it supports ON CONFLICT in insert_transaction()).  All other indexes
---  are created AFTER the bulk load is complete to avoid index-maintenance
---  overhead on every INSERT.
+-- NOTHING here is required: the unique indexes needed for the upsert
+-- ON CONFLICT targets live in create_tables.sql, and every query works
+-- without these (they only speed up specific lookups). Uncomment the ones
+-- you actually use — e.g. skip idx_battles_war if you never filter by war.
 --
---  Run this file after the bulk load finishes, or run individual CREATE
---  INDEX commands as needed once query patterns are known.
+-- Each index costs write amplification on INSERT/UPDATE, so keep the set
+-- as small as your queries need.
 -- =============================================================================
 
--- Unique index — REQUIRED during bulk insert for ON CONFLICT.
--- TimescaleDB requires the partitioning column in unique indexes.
-CREATE UNIQUE INDEX IF NOT EXISTS idx_transactions_transaction_id
-    ON transactions (transaction_id, created_at);
-
--- Post-load indexes (create after bulk insert is done):
---   CREATE INDEX CONCURRENTLY idx_transactions_created_at
---       ON transactions (created_at DESC);
---   CREATE INDEX CONCURRENTLY idx_transactions_seller_id
---       ON transactions (seller_id);
---   CREATE INDEX CONCURRENTLY idx_transactions_buyer_id
---       ON transactions (buyer_id);
---   CREATE INDEX CONCURRENTLY idx_transactions_type_id
---       ON transactions (transaction_type_id);
+-- Items
+-- Covering index for skill/code queries (which items of a code exist, and
+-- with which skills).
+-- CREATE INDEX IF NOT EXISTS idx_items_code_skills
+--     ON items(item_code_id, primary_skill, secondary_skill);
 
 -- =============================================================================
---  Battle indexes (Phase 1 of the battle expansion)
+--  Battles
 --
---  UNIQUE indexes are declared inline in create_tables.sql (required for the
---  ON CONFLICT in insert_battle()/insert_round()). The indexes below are for
---  querying and should be created AFTER the bulk load from
---  extra/battles_cache/ finishes.
+--  (the battles/rounds UNIQUE + PK constraints are inline in create_tables.sql)
 -- =============================================================================
 
---   CREATE INDEX CONCURRENTLY idx_battles_created_at ON battles (created_at DESC);
---   CREATE INDEX CONCURRENTLY idx_battles_ended_at   ON battles (ended_at);
---   CREATE INDEX CONCURRENTLY idx_battles_country    ON battles (attacker_country_id, defender_country_id);
---   CREATE INDEX CONCURRENTLY idx_battles_type       ON battles (type_id);
---   CREATE INDEX CONCURRENTLY idx_battles_war        ON battles (war_id);
---   CREATE INDEX CONCURRENTLY idx_battles_tournament ON battles (tournament_id);
+-- Battle list pages ordered newest-first (db_web battles tab)
+-- CREATE INDEX IF NOT EXISTS idx_battles_created_at ON battles (created_at DESC);
 
---   CREATE INDEX CONCURRENTLY idx_rounds_battle   ON rounds (battle_id);
---   CREATE INDEX CONCURRENTLY idx_rounds_created  ON rounds (created_at DESC);
---   CREATE INDEX CONCURRENTLY idx_rounds_winner   ON rounds (won_by_country_id);
+-- Filters on finished/active battles (ended_at IS NULL)
+-- CREATE INDEX IF NOT EXISTS idx_battles_ended_at ON battles (ended_at);
 
---   CREATE INDEX CONCURRENTLY idx_battle_bounties_effective ON battle_bounties (bounty_effective_at);
+-- Country filter (attacker/defender) — db_web country filter, battle views
+-- CREATE INDEX IF NOT EXISTS idx_battles_country
+--     ON battles (attacker_country_id, defender_country_id);
+
+-- Battle type filter (war / resistance / tournament / revolution)
+-- CREATE INDEX IF NOT EXISTS idx_battles_type ON battles (type_id);
+
+-- Wars history / per-war breakdowns
+-- CREATE INDEX IF NOT EXISTS idx_battles_war ON battles (war_id);
+
+-- Tournament stage pages
+-- CREATE INDEX IF NOT EXISTS idx_battles_tournament ON battles (tournament_id);
+
+-- Rounds of a battle (round_details / per-battle round pages)
+-- CREATE INDEX IF NOT EXISTS idx_rounds_battle ON rounds (battle_id);
+
+-- Newest rounds first
+-- CREATE INDEX IF NOT EXISTS idx_rounds_created ON rounds (created_at DESC);
+
+-- Winner lookups (which battles a country won)
+-- CREATE INDEX IF NOT EXISTS idx_rounds_winner ON rounds (won_by_country_id);
+
+-- Bounty effective-at lookups
+-- CREATE INDEX IF NOT EXISTS idx_battle_bounties_effective
+--     ON battle_bounties (bounty_effective_at);
+
+-- =============================================================================
+--  Ranking entries
+--
+--  The unique keys (created_at, battle_id, ...) are the ON CONFLICT targets
+--  and live in create_tables.sql. On compressed chunks indexes are dropped,
+--  so these only exist on uncompressed (recent) chunks; queries over old
+--  data rely on the compress_orderby (battle_id, created_at) segment
+--  skipping instead.
+-- =============================================================================
+
+-- Per-entity history (db_web /user pages: an entity's top battles). Useful
+-- only while data is recent — compressed chunks ignore it.
+-- CREATE INDEX IF NOT EXISTS idx_battle_ranking_entity
+--     ON battle_ranking_entries (entity_id, side, entity_type);
+
+-- Per-battle lookups for the ranking pipeline's cleanup joins
+-- (single-battle DELETEs). The hypertable unique key starts with
+-- created_at, so battle_id is not covered by it.
+-- CREATE INDEX IF NOT EXISTS idx_battle_ranking_battle
+--     ON battle_ranking_entries (battle_id);
+-- CREATE INDEX IF NOT EXISTS idx_round_ranking_battle
+--     ON round_ranking_entries (battle_id);
