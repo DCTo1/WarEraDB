@@ -8,16 +8,15 @@ Merged rows are therefore FETCHED (official API values, incl. the money that
 drifts ~0.5% of rows vs the side sums), then a per-battle cleanup deletes the
 merged rows that EQUAL the derivable sums (sum/max of the sides) — the
 battle_ranking_entries/round_ranking_entries side=3 sets only keep the
-"exceptions": official values NOT reproducible from the sides (262 battle +
-1,473 round rows as of 2026-08-03). Deriving all merged rows in SQL was
-dropped 2026-08-03 (redundant data: -48% ranking rows, -44% dump size).
+"exceptions": official values NOT reproducible from the sides. Deriving all
+merged rows in SQL was dropped 2026-08-03 (redundant data).
 
 Speed:
   - cross-battle batching: a global queue of (battle, combo) pages, 50 per
     request, instead of per-battle lockstep walks
   - rounds read from the DB in ONE batched query (never per-battle psql)
-  - stmts buffered and flushed at FLUSH per psql call; one state save per
-    battle; per-battle rate stats written for --estimate
+  - stmts buffered and flushed at FLUSH per DB transaction; one state save
+    per battle; per-battle rate stats written for --estimate
 
 Usage:
   BATTLE_DB=tsdb python3 Python/insert_ranking_sample.py --battles 100 --seed 7
@@ -28,23 +27,34 @@ Usage:
 
 import argparse
 import concurrent.futures
-import json
 import os
 import random
-import subprocess
+import sys
 import time
 
 import requests
-from requests.adapters import HTTPAdapter
 
 import endpoint_log
+from api import batched_fetch, make_session
+from db import (
+    esc,
+    exec_many,
+    flush_endpoint_log,
+    loot_sql,
+    query,
+    value_sql,
+)
+from utils import (
+    BASE_DIR,
+    ENTITY,
+    MAX_BATCH,
+    SIDE,
+    read_json,
+    write_json,
+)
 
-API_URL = "https://api2.warera.io/trpc"
-KEY_FILE = os.path.expanduser("~/.config/warera/api_key.txt")
-DB = os.environ.get("BATTLE_DB", "tsdb")
-FIXTURES_DIR = "/tmp/opencode/ranking_tests/battles"
-STATE_FILE = os.path.join(os.path.dirname(__file__), "ranking_sample_state.json")
-RATE_FILE = os.path.join(os.path.dirname(__file__), "ranking_sample_rate.json")
+STATE_FILE = os.path.join(BASE_DIR, "ranking_sample_state.json")
+RATE_FILE = os.path.join(BASE_DIR, "ranking_sample_rate.json")
 MERGED_CUTOFF = "2026-03-29T18:25:00Z"
 
 SLEEP = 0.1
@@ -52,81 +62,15 @@ BATCH_CAP = 50
 WORKERS = 16
 FLUSH = 20000
 
-SIDE = {"attacker": 1, "defender": 2, "merged": 3}
-ENTITY = {"user": 1, "country": 2, "mu": 3}
 DATATYPES = ("damage", "points", "money")
 TYPES = ("user", "country", "mu")
 SIDES = ("attacker", "defender")
 
-REQUESTS = 0
 
-
-def psql(sql):
-    r = subprocess.run(
-        ["docker", "exec", "-i", "timescaledb", "psql", "-U", "postgres", "-d", DB,
-         "-v", "ON_ERROR_STOP=1", "-q", "-t", "-A"],
-        input=endpoint_log.drain_sql() + sql, capture_output=True, text=True)
-    if r.returncode != 0:
-        raise RuntimeError(f"psql failed: {r.stderr[-800:]}")
-    return r.stdout
-
-
-def session():
-    s = requests.Session()
-    s.headers.update({"Content-Type": "application/json",
-                      "x-api-key": open(KEY_FILE).read().strip()})
-    s.mount("https://", HTTPAdapter(pool_connections=32, pool_maxsize=32))
-    return s
-
-
-def batch_get(s, body):
-    """body: {"0": params, ...} → [{"result": {"data": ...}}, ...]
-    tRPC batch: endpoint repeated in the URL per call, ?batch=1. Responses
-    are aligned POSITIONALLY to the body keys (must be contiguous 0..n-1).
-    Logs one endpoint usage per call (always battleRanking.getRanking)."""
-    global REQUESTS
-    REQUESTS += 1
-    n = len(body)
-    for _ in body:
-        endpoint_log.log("battleRanking.getRanking")
-    url = (API_URL + "/"
-           + ",".join(["battleRanking.getRanking"] * n) + "?batch=1")
-    last = None
-    for attempt in range(8):
-        try:
-            resp = s.post(url, json=body, timeout=90)
-            if resp.status_code == 413:
-                time.sleep(5)
-                last = "413"
-                continue
-            resp.raise_for_status()
-            return resp.json()
-        except Exception as e:
-            last = f"{type(e).__name__}: {str(e)[:80]}"
-            time.sleep(2 * (attempt + 1) + 2)
-    raise RuntimeError(f"API unreachable after 8 attempts ({last})")
-
-
-def esc(v):
-    return str(v).replace("'", "''")
-
-
-def loot_sql(loot):
-    if not loot:
-        return "NULL::bigint"
-    skills = loot.get("skills") or {}
-    primary = skills.get("attack") or next(iter(skills.values()), None)
-    secondary = skills.get("criticalChance")
-    la = loot.get("lastAcquisitionAt")
-    la_sql = "NULL" if not la else f"'{esc(la)}'::TIMESTAMPTZ"
-    return (f"get_item_id('{esc(loot['_id'])}', get_item_code_id('{esc(loot['code'])}'), "
-            f"{primary or 'NULL'}::smallint, {secondary or 'NULL'}::smallint, {la_sql})")
-
-
-def value_sql(v, cast):
-    if v is None:
-        return f"NULL::{cast}"
-    return f"{str(v)}::{cast}"
+def batch_get(s: requests.Session, body: dict, requests_counter: list[int]) -> list:
+    """One batched battleRanking.getRanking request (body = {"0": params, ...})."""
+    requests_counter[0] += 1
+    return batched_fetch(s, "battleRanking.getRanking", list(body.values()), retries=8)
 
 
 def merge_combos(combos):
@@ -178,8 +122,7 @@ def cleanup_stmts(battle):
       - delete battle/round merged (side=3) rows that EQUAL the derivable
         sums (sum damage/points/money, max loot of the cleaned sides). Kept
         side=3 rows are the API-fetched official values that differ from the
-        sides — the "exceptions" set (262 battle + 1,473 round rows as of
-        2026-08-03).
+        sides — the "exceptions" set.
     """
     # NOTE (2026-08-04): every DELETE below carries
     #   AND created_at > now() - interval '7 days'
@@ -265,32 +208,27 @@ def finish(battle, items):
     return blk, slots
 
 
-def battle_rounds(battles):
+def battle_rounds(battles, dbname):
     """(rid, num) per battle — ONE query for all battles."""
     out = {b: [] for b in battles}
-    rows = psql(f"""
+    rows = query(f"""
         SELECT uuid_to_objectid(b.battle_id), uuid_to_objectid(r.round_id), r.number
         FROM rounds r JOIN battles b ON b.battle_id = r.battle_id
         WHERE b.battle_id IN ({",".join(f"objectid_to_uuid('{b}')" for b in battles)})
         ORDER BY r.number;
-    """).strip().splitlines()
-    for line in rows:
-        bid, rid, num = line.split("|")
+    """, dbname)
+    for bid, rid, num in rows:
         out[bid].append((rid, num))
     return out
 
 
-def battle_eras(battles):
+def battle_eras(battles, dbname):
     """battle hex → 'YYYY-MM' — ONE query for all battles."""
-    out = {}
-    rows = psql(f"""
+    rows = query(f"""
         SELECT uuid_to_objectid(battle_id), to_char(ended_at, 'YYYY-MM')
         FROM battles WHERE battle_id IN ({",".join(f"objectid_to_uuid('{b}')" for b in battles)});
-    """).strip().splitlines()
-    for line in rows:
-        bid, mon = line.split("|")
-        out[bid] = mon
-    return out
+    """, dbname)
+    return {bid: mon for bid, mon in rows}
 
 
 def needs_fetch_sql(refetch=False):
@@ -324,17 +262,16 @@ def needs_fetch_sql(refetch=False):
             "     OR m.max_c < b2.ended_at - interval '15 minutes')")
 
 
-def pick_battles(n, refetch=False):
-    rows = psql(f"""
+def pick_battles(n, refetch, dbname):
+    rows = query(f"""
         SELECT uuid_to_objectid(battle_id), to_char(ended_at, 'YYYY-MM')
         FROM battles b
         WHERE ended_at IS NOT NULL
           AND {needs_fetch_sql(refetch)}
         ORDER BY 2;
-    """).strip().splitlines()
+    """, dbname)
     buckets = {}
-    for line in rows:
-        bid, month = line.split("|")
+    for bid, month in rows:
         buckets.setdefault(month, []).append(bid)
     chosen = []
     for month in sorted(buckets):
@@ -343,31 +280,31 @@ def pick_battles(n, refetch=False):
     return chosen[:n]
 
 
-def pick_latest(n, refetch=False):
-    rows = psql(f"""
+def pick_latest(n, refetch, dbname):
+    rows = query(f"""
         SELECT uuid_to_objectid(battle_id) FROM battles b
         WHERE ended_at IS NOT NULL
           AND {needs_fetch_sql(refetch)}
         ORDER BY created_at DESC LIMIT {n};
-    """).strip().splitlines()
-    return [l for l in rows if l]
+    """, dbname)
+    return [r[0] for r in rows]
 
 
-def pick_first(n, refetch=False):
-    rows = psql(f"""
+def pick_first(n, refetch, dbname):
+    rows = query(f"""
         SELECT uuid_to_objectid(battle_id) FROM battles b
         WHERE ended_at IS NOT NULL
           AND {needs_fetch_sql(refetch)}
         ORDER BY created_at ASC LIMIT {n};
-    """).strip().splitlines()
-    return [l for l in rows if l]
+    """, dbname)
+    return [r[0] for r in rows]
 
 
-def pick_range(a, b, refetch=False):
+def pick_range(a, b, refetch, dbname):
     """Battle ordinals a..b by created_at ASC (1-based, inclusive), numbering
     the FULL battle list first (ordinals stable vs index file), then
     excluding already-scraped battles."""
-    rows = psql(f"""
+    rows = query(f"""
         SELECT uuid_to_objectid(b.battle_id) FROM battles b
         WHERE b.ended_at IS NOT NULL
           AND b.id IN (
@@ -377,29 +314,12 @@ def pick_range(a, b, refetch=False):
             ) t WHERE rn BETWEEN {a} AND {b}
           )
           AND {needs_fetch_sql(refetch)};
-    """).strip().splitlines()
-    return [l for l in rows if l]
+    """, dbname)
+    return [r[0] for r in rows]
 
 
-def load_done():
-    try:
-        return set(json.load(open(STATE_FILE)))
-    except (FileNotFoundError, json.JSONDecodeError):
-        return set()
-
-
-def save_done(done):
-    tmp = STATE_FILE + ".tmp"
-    json.dump(sorted(done), open(tmp, "w"))
-    os.replace(tmp, STATE_FILE)
-
-
-def save_rate(stats):
-    json.dump(stats, open(RATE_FILE, "w"))
-
-
-def verify():
-    out = psql("""
+def verify(dbname):
+    out = query("""
         SELECT 'rounds==battle damage (per side)', count(*) FILTER (WHERE r.d != b.d) diff, count(*) pairs
         FROM (SELECT battle_id, entity_type, entity_id, side, sum(damage) d
               FROM round_ranking_entries WHERE damage IS NOT NULL GROUP BY 1,2,3,4) r
@@ -459,23 +379,21 @@ def verify():
         JOIN (SELECT battle_id, max(round_number) n FROM round_ranking_entries GROUP BY 1) stored
         ON lastr.id = stored.battle_id
         WHERE stored.battle_id IN (SELECT DISTINCT battle_id FROM battle_ranking_entries);
-    """).strip().splitlines()
+    """, dbname)
     print(f"{'check':32} {'diff':>8} {'pairs':>10}")
-    for line in out:
-        label, diff, pairs = line.split("|")
+    for label, diff, pairs in out:
         print(f"{label:32} {diff:>8} {pairs:>10}")
 
 
-def estimate():
+def estimate(dbname):
     """Extrapolate the full backfill: per-era slots/battle measured on stored
     (era-stratified) battles × battle counts per era, timed at the last run's
     measured rate. Stored pages are sides 1,2 only — what the fetch does."""
-    try:
-        rate = json.load(open(RATE_FILE))
-    except (FileNotFoundError, json.JSONDecodeError):
+    rate = read_json(RATE_FILE, None)
+    if not rate:
         print("no rate data; run a fetch first")
         return
-    rows = psql("""
+    rows = query("""
         WITH era_pages AS (
           SELECT to_char(b.ended_at, 'YYYY-MM') mon,
                  count(DISTINCT b.id) fetched_battles,
@@ -498,15 +416,13 @@ def estimate():
         )
         SELECT a.mon, a.battles, e.fetched_battles, e.pages
         FROM all_era a LEFT JOIN era_pages e USING (mon) ORDER BY 1;
-    """).strip().splitlines()
+    """, dbname)
     total_pages = 0
     print(f"{'era':9} {'battles':>8} {'fetched':>8} {'slots/battle':>12} {'total slots':>12}")
-    for line in rows:
-        mon, nb, fb, pg = line.split("|")
-        fb = int(fb or 0)
-        pg = int(pg or 0)
+    for mon, nb, fb, pg in rows:
+        nb, fb, pg = int(nb), int(fb or 0), int(pg or 0)
         ppb = pg / fb if fb else 0
-        tot = round(ppb * int(nb))
+        tot = round(ppb * nb)
         total_pages += tot
         print(f"{mon:9} {nb:>8} {fb:>8} {ppb:>12.2f} {tot:>12}")
     reqs = (total_pages + BATCH_CAP - 1) // BATCH_CAP
@@ -527,37 +443,41 @@ def main():
     ap.add_argument("--seed", type=int, default=7)
     ap.add_argument("--refetch", action="store_true")
     ap.add_argument("--ids", default=None, help="file with battle hex ids")
+    ap.add_argument("--db", default=os.environ.get("BATTLE_DB", "tsdb"),
+                    help="Target database (default: tsdb)")
     ap.add_argument("--verify", action="store_true", help="run quality checks and exit")
     ap.add_argument("--estimate", action="store_true", help="extrapolate total fetch time")
     args = ap.parse_args()
+    dbname = args.db
     if args.verify:
-        verify()
+        verify(dbname)
         return
     if args.estimate:
-        estimate()
+        estimate(dbname)
         return
     if args.ids:
         battles = [l.strip() for l in open(args.ids).read().splitlines() if l.strip()]
     elif args.latest:
-        battles = pick_latest(args.latest, refetch=args.refetch)
+        battles = pick_latest(args.latest, refetch=args.refetch, dbname=dbname)
     elif args.first:
-        battles = pick_first(args.first, refetch=args.refetch)
+        battles = pick_first(args.first, refetch=args.refetch, dbname=dbname)
     elif args.range:
-        battles = pick_range(*args.range, refetch=args.refetch)
+        battles = pick_range(*args.range, refetch=args.refetch, dbname=dbname)
     elif args.battles:
         random.seed(args.seed)
-        battles = pick_battles(args.battles, refetch=args.refetch)
+        battles = pick_battles(args.battles, refetch=args.refetch, dbname=dbname)
     else:
         ap.error("need --battles N, --latest N, --ids, --verify or --estimate")
     if not args.refetch:
-        done = load_done()
+        done = set(read_json(STATE_FILE, []))
         battles = [b for b in battles if b not in done]
     print(f"picked {len(battles)} battles")
     if not battles:
         return
 
-    s = session()
-    rounds = battle_rounds(battles)
+    s = make_session(pool_size=32)
+    requests_counter = [0]
+    rounds = battle_rounds(battles, dbname)
     t0 = time.time()
     stmts = []
     buf_n = 0
@@ -566,14 +486,15 @@ def main():
         nonlocal buf_n
         if stmts:
             # GUC: the merged cleanup DELETEs on compressed chunks decompress
-            # rows (the 100k/DML default would abort on old battles)
-            psql("SET timescaledb.max_tuples_decompressed_per_dml_transaction = 0;\n"
-                 "BEGIN;\n" + "\n".join(stmts) + "\nCOMMIT;")
+            # rows (the 100k/DML default would abort on old battles); SET
+            # LOCAL keeps it scoped to this transaction
+            exec_many(stmts, dbname,
+                      pre="SET LOCAL timescaledb.max_tuples_decompressed_per_dml_transaction = 0")
             buf_n += len(stmts)
             stmts.clear()
 
-    done = set() if args.refetch else load_done()
-    era_of = battle_eras(battles)
+    done = set() if args.refetch else set(read_json(STATE_FILE, []))
+    era_of = battle_eras(battles, dbname)
     pending = []
     for battle in battles:
         post_cut = era_of.get(battle, "?") >= "2026-04"
@@ -615,7 +536,7 @@ def main():
                     p["cursor"] = cursors[c]
                 body[str(i)] = p
             bodies.append((work, body))
-        results = list(ex.map(lambda b: batch_get(s, b), [b for _, b in bodies]))
+        results = list(ex.map(lambda b: batch_get(s, b, requests_counter), [b for _, b in bodies]))
         for (work, _), data in zip(bodies, results):
             for i, c in enumerate(work):
                 if "error" in data[i]:
@@ -640,7 +561,7 @@ def main():
                     if len(stmts) >= FLUSH:
                         flush()
                     done.add(c[0])
-                    save_done(done)
+                    write_json(STATE_FILE, sorted(done))
                     n_done += 1
                     slots += bslots
                     era = era_of.get(c[0], "?")
@@ -650,16 +571,18 @@ def main():
                     if n_done % 25 == 0:
                         el = time.time() - t0
                         print(f"  {n_done}/{len(battles)} battles | {buf_n} entries | "
-                              f"{REQUESTS} req | {el:.0f}s | "
-                              f"{el/REQUESTS:.2f}s/req")
+                              f"{requests_counter[0]} req | {el:.0f}s | "
+                              f"{el/requests_counter[0]:.2f}s/req")
         time.sleep(SLEEP)
     flush()
     el = time.time() - t0
-    save_rate({"elapsed": el, "requests": REQUESTS, "pages": slots,
-               "battles": n_done, "pages_per_sec": slots / el,
-               "by_era": {k: v for k, v in by_era.items()}})
-    print(f"done in {el:.0f}s: {n_done} battles, {buf_n} entries, {REQUESTS} requests, "
-          f"{slots} slots ({el/REQUESTS:.2f}s/req, {slots/el:.2f} slots/s)")
+    write_json(RATE_FILE, {"elapsed": el, "requests": requests_counter[0],
+                           "pages": slots, "battles": n_done,
+                           "pages_per_sec": slots / el,
+                           "by_era": {k: v for k, v in by_era.items()}})
+    flush_endpoint_log(dbname)
+    print(f"done in {el:.0f}s: {n_done} battles, {buf_n} entries, {requests_counter[0]} requests, "
+          f"{slots} slots ({el/requests_counter[0]:.2f}s/req, {slots/el:.2f} slots/s)")
 
 
 if __name__ == "__main__":

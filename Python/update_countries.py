@@ -11,92 +11,62 @@ Usage
 -----
     python Python/update_countries.py                 # upsert all countries
     python Python/update_countries.py --batch-size 1000
+    python Python/update_countries.py --db scratch    # test db
 
 Prerequisites
 -------------
 - base_data/create_tables.sql + base_data/functions.sql applied (insert_country).
-- The timescaledb docker container is running.
+- The timescaledb instance is reachable (WARERA_DB_URL override or the
+  localhost:5432 default).
 
 Auth
 ----
     x-api-key API token on api2.warera.io, read from the WARERA_API_KEY env
     var, falling back to ~/.config/warera/api_key.txt (plain text, 0600).
     The token is never stored in this repo.
+
+Exit codes: 0 success, 1 API/auth failure, 2 DB failure.
 """
 
 import argparse
 import json
 import os
-import subprocess
 import sys
 
-import requests
-
 import endpoint_log
-
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-API_KEY_FILE = os.path.join(os.path.expanduser("~"), ".config", "warera", "api_key.txt")
-# API tokens (x-api-key) are only accepted on api2.warera.io (api4 rejects
-# them with 403 "API tokens are not allowed on this hostname")
-COUNTRIES_URL = "https://api2.warera.io/trpc/country.getAllCountries?batch=1"
-
-PSQL_CMD = [
-    "docker", "exec", "-i", "timescaledb",
-    "psql", "-U", "postgres", "-d", os.environ.get("BATTLE_DB", "tsdb"),
-    "-q", "-t", "-A", "-v", "ON_ERROR_STOP=1",
-]
+from api import fetch_data, make_session
+from db import exec_many, flush_endpoint_log
 
 
-def load_api_key() -> str:
-    key = os.environ.get("WARERA_API_KEY")
-    if key:
-        return key.strip()
-    try:
-        with open(API_KEY_FILE) as f:
-            key = f.read().strip()
-    except OSError as exc:
-        raise RuntimeError(
-            f"no API key: set WARERA_API_KEY or write it to {API_KEY_FILE} ({exc})"
-        ) from exc
-    if not key:
-        raise RuntimeError(f"API key file {API_KEY_FILE} is empty")
-    return key
-
-
-def upsert_countries(batch_size: int) -> int:
+def upsert_countries(dbname: str, batch_size: int) -> int:
     """Fetch country.getAllCountries live and upsert via insert_country()."""
     print("  fetching country.getAllCountries ...", flush=True)
-    s = requests.Session()
-    s.headers.update({"Content-Type": "application/json", "x-api-key": load_api_key()})
+    s = make_session()
     endpoint_log.log("country.getAllCountries")
-    r = s.post(COUNTRIES_URL, json={"0": {}}, timeout=30)
-    r.raise_for_status()
-    docs = r.json()[0]["result"]["data"]
+    docs = fetch_data(s, "country.getAllCountries", {}, timeout=30)
     total = 0
     for i in range(0, len(docs), batch_size):
-        buf = ["BEGIN;\n"]
-        for doc in docs[i:i + batch_size]:
-            raw = json.dumps(doc, ensure_ascii=False, separators=(",", ":"))
-            buf.append(f"SELECT insert_country($JSON${raw}$JSON$);\n")
-        buf.append("COMMIT;\n")
-        # flush queued endpoint usage in the same call
-        proc = subprocess.run(PSQL_CMD, input=endpoint_log.drain_sql() + "".join(buf),
-                              capture_output=True, text=True)
-        if proc.returncode != 0:
-            print(f"  DB error (rc={proc.returncode}): {proc.stderr[:500]}", file=sys.stderr)
-            sys.exit(2)
-        count = sum(1 for line in proc.stdout.splitlines() if line.strip().isdigit())
+        stmts = [f"SELECT insert_country($JSON${json.dumps(doc, ensure_ascii=False, separators=(",", ":"))}$JSON$);"
+                 for doc in docs[i:i + batch_size]]
+        count = exec_many(stmts, dbname)
         total += count
         print(f"  batch: {count} upserted (running total {total})", flush=True)
     print(f"  countries: {len(docs)} fetched, {total} upserted")
     return total
 
 
-def main():
+def main() -> int:
     p = argparse.ArgumentParser(description="Fetch + upsert countries into the DB.")
     p.add_argument("--batch-size", type=int, default=2000, help="Rows per transaction (default 2000)")
+    p.add_argument("--db", default=os.environ.get("BATTLE_DB", "tsdb"),
+                   help="Target database (default: tsdb)")
     args = p.parse_args()
-    upsert_countries(args.batch_size)
+    try:
+        upsert_countries(args.db, args.batch_size)
+    except RuntimeError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2 if str(exc).startswith("DB error") else 1
+    flush_endpoint_log(args.db)
     print("Done.")
     return 0
 

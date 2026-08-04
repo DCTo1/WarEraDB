@@ -35,3 +35,17 @@ def drain_sql() -> str:
     QUEUE.clear()
     return "".join(f"SELECT insert_endpoint_used('{n.replace(chr(39), chr(39) * 2)}');\n"
                    for n in names)
+
+
+def drain_statements() -> list[str]:
+    """One SQL statement per queued call (clears the queue).
+
+    Used by db.py, which executes each statement separately inside the same
+    transaction instead of piping one multi-statement string.
+    """
+    if not QUEUE:
+        return []
+    names = QUEUE[:]
+    QUEUE.clear()
+    return [f"SELECT insert_endpoint_used('{n.replace(chr(39), chr(39) * 2)}');"
+            for n in names]

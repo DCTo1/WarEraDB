@@ -1,7 +1,9 @@
 certifi==2026.6.17
 charset-normalizer==3.4.7
 idna==3.18
+psycopg[binary]==3.3.4
 requests==2.34.2
+SQLAlchemy==2.0.51
 urllib3==2.7.0
 
 # Dev tooling

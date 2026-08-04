@@ -20,6 +20,67 @@ Usage
     # → call insert_transaction(transformed) on the DB side
 """
 
+import json
+import os
+from datetime import datetime, timezone
+
+# Python/ directory — the root for the pipeline's shared modules and state
+# files. Scripts running from Python/new/ resolve the same paths, so state
+# files keep their stable location no matter where the script runs from.
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# Path to the WarEra API token (api.py reads it).
+API_KEY_FILE = os.path.join(os.path.expanduser("~"), ".config", "warera", "api_key.txt")
+
+# Server-enforced tRPC batch limit (verified 2026-08-02): 50 calls per
+# request. Larger batches return 413 {"message":"Batch size too large (max 50)"}.
+MAX_BATCH = 50
+# battleRanking / battle.getBattles page size cap (verified 2026-08-03).
+PAGE_LIMIT = 100
+
+# API side/entity string → smallint id maps shared by the ranking writers.
+SIDE = {"attacker": 1, "defender": 2, "merged": 3}
+ENTITY = {"user": 1, "country": 2, "mu": 3}
+
+
+def db_name() -> str:
+    """Target database: BATTLE_DB env var, default tsdb."""
+    return os.environ.get("BATTLE_DB", "tsdb")
+
+
+def to_unix_ms(iso_str: str) -> int:
+    """Parse the API's ISO-8601 timestamps ("2026-04-10T11:38:00.266Z") to ms."""
+    clean = iso_str.rstrip("Z")
+    if "." in clean:
+        dt = datetime.strptime(clean, "%Y-%m-%dT%H:%M:%S.%f")
+    else:
+        dt = datetime.strptime(clean, "%Y-%m-%dT%H:%M:%S")
+    return int(dt.replace(tzinfo=timezone.utc).timestamp() * 1000)
+
+
+def parse_until_ms(value: str) -> int:
+    """--until CLI values: ISO datetime string or raw Unix ms."""
+    if value.isdigit():
+        return int(value)
+    return to_unix_ms(value)
+
+
+def read_json(path: str, default):
+    """Load a JSON state file; return *default* when missing/unreadable."""
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return default
+
+
+def write_json(path: str, data) -> None:
+    """Atomically write a JSON state file (tmp + os.replace)."""
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f)
+    os.replace(tmp, path)
+
 
 def prepare_transaction(txn: dict) -> dict:
     """Add derived fields needed by the DB insertion function.
