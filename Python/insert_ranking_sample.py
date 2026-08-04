@@ -1,9 +1,16 @@
 """Backfill-style battle ranking fetcher: cross-battle tRPC batching.
 
-Per battle it fetches ONLY attacker/defender combos (18 battle-level:
-3 dataTypes × 2 sides × 3 types; 18 per round) — merged rows are DERIVED in
-SQL after the side rows are in (verified exact for damage/points; money
-drifts on ~0.5% of rows; merged loot is a subset of side loots, unambiguous).
+Per battle it fetches attacker/defender combos (18 battle-level: 3 dataTypes
+× 2 sides × 3 types; 18 per round) PLUS the API's merged combos for
+post-cutoff battles (9 more: 3 dataTypes × 3 types × merged side; the API has
+no merged side before MERGED_CUTOFF, so pre-cutoff battles skip them).
+Merged rows are therefore FETCHED (official API values, incl. the money that
+drifts ~0.5% of rows vs the side sums), then a per-battle cleanup deletes the
+merged rows that EQUAL the derivable sums (sum/max of the sides) — the
+battle_ranking_entries/round_ranking_entries side=3 sets only keep the
+"exceptions": official values NOT reproducible from the sides (262 battle +
+1,473 round rows as of 2026-08-03). Deriving all merged rows in SQL was
+dropped 2026-08-03 (redundant data: -48% ranking rows, -44% dump size).
 
 Speed:
   - cross-battle batching: a global queue of (battle, combo) pages, 50 per
@@ -11,13 +18,6 @@ Speed:
   - rounds read from the DB in ONE batched query (never per-battle psql)
   - stmts buffered and flushed at FLUSH per psql call; one state save per
     battle; per-battle rate stats written for --estimate
-
-Derivation (per battle; MERGED_CUTOFF gate kept only because the API's own
-merged side starts there — for pre-cutoff battles merged is DERIVED the same
-way, full backfill done 2026-08-03 in SQL):
-  - round merged rows from round side rows (sum damage/points/money,
-    max loot, min created_at)
-  - battle merged rows from battle side rows (created_at = battle ended_at)
 
 Usage:
   BATTLE_DB=tsdb python3 Python/insert_ranking_sample.py --battles 100 --seed 7
@@ -165,44 +165,81 @@ def entry_stmt(battle, num, side, typ, ent, dmg, pts, mon, loot, created, round_
     )
 
 
-def derivation_stmts(battle):
-    """Merged rows (round + battle) from side rows. Gates on MERGED_CUTOFF to
-    match API availability (no merged side before the roll-out); pre-cutoff
-    battles were backfilled 2026-08-03 with the same SQL (no gate)."""
+def cleanup_stmts(battle):
+    """Per-battle cleanup after the final fetch:
+      - delete stale LIVE-phase side rows (live sync wrote them mid-battle;
+        the final ranking no longer carries them — they double-count users
+        who showed on both sides)
+      - delete battle/round merged (side=3) rows that EQUAL the derivable
+        sums (sum damage/points/money, max loot of the cleaned sides). Kept
+        side=3 rows are the API-fetched official values that differ from the
+        sides — the "exceptions" set (262 battle + 1,473 round rows as of
+        2026-08-03).
+    """
+    # NOTE (2026-08-04): every DELETE below carries
+    #   AND created_at > now() - interval '7 days'
+    # so the planner prunes to the recent uncompressed chunks. WITHOUT it the
+    # DELETE scans (and DML on compressed chunks DECOMPRESSES) ALL chunks —
+    # measured: one 13-battle run emptied every compress_hyper table and grew
+    # the DB 956 MB → 3,872 MB. Rows that need cleanup are always recent
+    # (stale live rows are written while the battle is active; fetched merged
+    # rows carry the battle-end timestamp; pre-cutoff battles don't fetch
+    # merged at all), so the guard never hides a needed delete in the
+    # steady-state --latest path. Manual refetches of old battles skip the
+    # cleanup (their rows live in the June-10 API-regen chunks) — acceptable;
+    # recompress manually after such runs.
     uuid = f"objectid_to_uuid('{esc(battle)}')"
     return [
-        f"""INSERT INTO round_ranking_entries
-    (battle_id, round_number, side, entity_type, entity_id,
-     damage, points, money, loot_item_id, created_at)
-SELECT r.battle_id, r.round_number, 3, r.entity_type, r.entity_id,
-       sum(r.damage), sum(r.points), sum(r.money), max(r.loot_item_id), min(r.created_at)
-FROM round_ranking_entries r
-JOIN battles b ON b.id = r.battle_id
-WHERE b.battle_id = {uuid} AND r.side IN (1,2)
-  AND b.ended_at >= '{MERGED_CUTOFF}'
-GROUP BY r.battle_id, r.round_number, r.entity_type, r.entity_id
-ON CONFLICT (battle_id, round_number, side, entity_type, entity_id) DO UPDATE SET
-    damage = EXCLUDED.damage, points = EXCLUDED.points, money = EXCLUDED.money,
-    loot_item_id = EXCLUDED.loot_item_id, created_at = EXCLUDED.created_at;""",
-        f"""INSERT INTO battle_ranking_entries
-    (battle_id, side, entity_type, entity_id,
-     damage, points, money, loot_item_id, created_at)
-SELECT r.battle_id, 3, r.entity_type, r.entity_id,
-       sum(r.damage), sum(r.points), sum(r.money), max(r.loot_item_id), b.ended_at
-FROM battle_ranking_entries r
-JOIN battles b ON b.id = r.battle_id
-WHERE b.battle_id = {uuid} AND r.side IN (1,2)
-  AND b.ended_at >= '{MERGED_CUTOFF}'
-GROUP BY r.battle_id, r.entity_type, r.entity_id, b.ended_at
-ON CONFLICT (battle_id, side, entity_type, entity_id) DO UPDATE SET
-    damage = EXCLUDED.damage, points = EXCLUDED.points, money = EXCLUDED.money,
-    loot_item_id = EXCLUDED.loot_item_id, created_at = EXCLUDED.created_at;""",
+        # stale LIVE-phase side rows FIRST: the live sync wrote them mid-battle
+        # and the final ranking no longer carries them (users on both sides
+        # get their damage on each side live, on one side only in the final
+        # doc — the leftover would double-count). Final-doc rows have
+        # created_at within seconds of ended_at, live rows are older;
+        # 2-minute margin. Must run before the merged cleanup, which compares
+        # against the (then clean) side sums.
+        f"""DELETE FROM battle_ranking_entries
+WHERE battle_id = (SELECT id FROM battles WHERE battle_id = {uuid})
+  AND side IN (1,2) AND created_at < (SELECT ended_at FROM battles WHERE battle_id = {uuid}) - interval '2 minutes'
+  AND created_at > now() - interval '7 days';""",
+        f"""DELETE FROM round_ranking_entries r USING rounds rd
+WHERE r.battle_id = (SELECT id FROM battles WHERE battle_id = {uuid})
+  AND rd.battle_id = (SELECT battle_id FROM battles WHERE id = r.battle_id)
+  AND rd.number = r.round_number
+  AND r.side IN (1,2)
+  AND r.created_at < rd.ended_at - interval '2 minutes'
+  AND r.created_at > now() - interval '7 days';""",
+        f"""WITH s AS (
+    SELECT battle_id, entity_type, entity_id,
+           sum(damage) d, sum(points) p, sum(money) mo, max(loot_item_id) l
+    FROM battle_ranking_entries
+    WHERE side IN (1,2) AND battle_id = (SELECT id FROM battles WHERE battle_id = {uuid})
+    GROUP BY 1,2,3
+)
+DELETE FROM battle_ranking_entries r USING s
+WHERE r.side = 3 AND r.battle_id = s.battle_id
+  AND r.entity_type = s.entity_type AND r.entity_id = s.entity_id
+  AND r.damage IS NOT DISTINCT FROM s.d AND r.points IS NOT DISTINCT FROM s.p
+  AND r.money IS NOT DISTINCT FROM s.mo AND r.loot_item_id IS NOT DISTINCT FROM s.l
+  AND r.created_at > now() - interval '7 days';""",
+        f"""WITH s AS (
+    SELECT battle_id, round_number, entity_type, entity_id,
+           sum(damage) d, sum(points) p, sum(money) mo, max(loot_item_id) l
+    FROM round_ranking_entries
+    WHERE side IN (1,2) AND battle_id = (SELECT id FROM battles WHERE battle_id = {uuid})
+    GROUP BY 1,2,3,4
+)
+DELETE FROM round_ranking_entries r USING s
+WHERE r.side = 3 AND r.battle_id = s.battle_id AND r.round_number = s.round_number
+  AND r.entity_type = s.entity_type AND r.entity_id = s.entity_id
+  AND r.damage IS NOT DISTINCT FROM s.d AND r.points IS NOT DISTINCT FROM s.p
+  AND r.money IS NOT DISTINCT FROM s.mo AND r.loot_item_id IS NOT DISTINCT FROM s.l
+  AND r.created_at > now() - interval '7 days';""",
     ]
 
 
 def finish(battle, items):
-    """items: {combo: [ranking items]} for one battle → merged side stmts +
-    merged derivation stmts. Returns (entries, slots) for stats."""
+    """items: {combo: [ranking items]} for one battle → insert stmts (sides +
+    fetched merged) + merged cleanup stmts. Returns (entries, slots) for stats."""
     bcombos, rcombos = {}, {}
     slots = 0
     for (b, rid, num, dt, typ, side), its in items.items():
@@ -219,7 +256,7 @@ def finish(battle, items):
         for side, typ, ent, dmg, pts, mon, loot, created in merge_combos(combos):
             blk.append(entry_stmt(battle, int(num), side, typ, ent,
                                   dmg, pts, mon, loot, created, round_table=True))
-    blk.extend(derivation_stmts(battle))
+    blk.extend(cleanup_stmts(battle))
     return blk, slots
 
 
@@ -251,13 +288,43 @@ def battle_eras(battles):
     return out
 
 
+def needs_fetch_sql(refetch=False):
+    """Battles needing a ranking fetch.
+
+    A battle needs fetching when it has NO ranking rows, OR (when not
+    refetching) it is a leftover from the live sync:
+      - ended within the last 5 minutes → re-pick every run so the final
+        fetch lands AFTER the API's ranking doc settles (a fetch during the
+        settling window stores wrong values that nothing would ever correct)
+      - all its rows predate ended_at - 15 min → live-written partials whose
+        end-of-battle fetch never ran (reconciliation missed them)
+    Re-fetching is idempotent (ON CONFLICT upserts + derivation), so the
+    over-fetching in the settle window is harmless.
+
+    NOTE (2026-08-04): the checks are a SINGLE-PASS GROUP BY over the
+    hypertable (max(created_at) per battle), then a LEFT JOIN to battles —
+    NOT per-battle NOT EXISTS probes. The probes scan every compressed chunk
+    per battle (measured: pick_latest hung 5+ min on 15.6K battles × 66
+    chunks); the GROUP BY is ~50 ms on compressed columnar data.
+    """
+    if refetch:
+        return "TRUE"
+    return ("b.id IN ("
+            "  SELECT b2.id FROM battles b2"
+            "  LEFT JOIN (SELECT battle_id, max(created_at) max_c"
+            "             FROM battle_ranking_entries GROUP BY 1) m"
+            "  ON m.battle_id = b2.id"
+            "  WHERE m.battle_id IS NULL"
+            "     OR b2.ended_at > now() - interval '5 minutes'"
+            "     OR m.max_c < b2.ended_at - interval '15 minutes')")
+
+
 def pick_battles(n, refetch=False):
     rows = psql(f"""
         SELECT uuid_to_objectid(battle_id), to_char(ended_at, 'YYYY-MM')
         FROM battles b
         WHERE ended_at IS NOT NULL
-          AND (NOT EXISTS (SELECT 1 FROM battle_ranking_entries r
-                           WHERE r.battle_id = b.id) OR {'TRUE' if refetch else 'FALSE'})
+          AND {needs_fetch_sql(refetch)}
         ORDER BY 2;
     """).strip().splitlines()
     buckets = {}
@@ -275,8 +342,7 @@ def pick_latest(n, refetch=False):
     rows = psql(f"""
         SELECT uuid_to_objectid(battle_id) FROM battles b
         WHERE ended_at IS NOT NULL
-          AND (NOT EXISTS (SELECT 1 FROM battle_ranking_entries r
-                           WHERE r.battle_id = b.id) OR {'TRUE' if refetch else 'FALSE'})
+          AND {needs_fetch_sql(refetch)}
         ORDER BY created_at DESC LIMIT {n};
     """).strip().splitlines()
     return [l for l in rows if l]
@@ -286,8 +352,7 @@ def pick_first(n, refetch=False):
     rows = psql(f"""
         SELECT uuid_to_objectid(battle_id) FROM battles b
         WHERE ended_at IS NOT NULL
-          AND (NOT EXISTS (SELECT 1 FROM battle_ranking_entries r
-                           WHERE r.battle_id = b.id) OR {'TRUE' if refetch else 'FALSE'})
+          AND {needs_fetch_sql(refetch)}
         ORDER BY created_at ASC LIMIT {n};
     """).strip().splitlines()
     return [l for l in rows if l]
@@ -306,8 +371,7 @@ def pick_range(a, b, refetch=False):
               FROM battles WHERE ended_at IS NOT NULL
             ) t WHERE rn BETWEEN {a} AND {b}
           )
-          AND (NOT EXISTS (SELECT 1 FROM battle_ranking_entries r
-                           WHERE r.battle_id = b.id) OR {'TRUE' if refetch else 'FALSE'});
+          AND {needs_fetch_sql(refetch)};
     """).strip().splitlines()
     return [l for l in rows if l]
 
@@ -338,33 +402,51 @@ def verify():
               FROM battle_ranking_entries WHERE damage IS NOT NULL GROUP BY 1,2,3,4) b
         USING (battle_id, entity_type, entity_id, side)
         UNION ALL
-        SELECT 'merged==sides damage', count(*) FILTER (WHERE m.d != ad.d), count(*)
-        FROM (SELECT battle_id, entity_type, entity_id, sum(damage) d
-              FROM battle_ranking_entries WHERE side=3 AND damage IS NOT NULL GROUP BY 1,2,3) m
-        JOIN (SELECT battle_id, entity_type, entity_id, sum(damage) d
-              FROM battle_ranking_entries WHERE side IN (1,2) AND damage IS NOT NULL GROUP BY 1,2,3) ad
-        USING (battle_id, entity_type, entity_id)
+        SELECT 'merged orphans (no side rows)', count(*), 0
+        FROM (SELECT battle_id, entity_type, entity_id FROM battle_ranking_entries WHERE side=3
+              EXCEPT
+              SELECT battle_id, entity_type, entity_id FROM battle_ranking_entries WHERE side IN (1,2)) x
         UNION ALL
-        SELECT 'merged==sides points', count(*) FILTER (WHERE m.p != ad.p), count(*)
-        FROM (SELECT battle_id, entity_type, entity_id, sum(points) p
-              FROM battle_ranking_entries WHERE side=3 AND points IS NOT NULL GROUP BY 1,2,3) m
-        JOIN (SELECT battle_id, entity_type, entity_id, sum(points) p
-              FROM battle_ranking_entries WHERE side IN (1,2) AND points IS NOT NULL GROUP BY 1,2,3) ad
-        USING (battle_id, entity_type, entity_id)
+        SELECT 'round merged orphans (no side rows)', count(*), 0
+        FROM (SELECT battle_id, round_number, entity_type, entity_id FROM round_ranking_entries WHERE side=3
+              EXCEPT
+              SELECT battle_id, round_number, entity_type, entity_id FROM round_ranking_entries WHERE side IN (1,2)) x
         UNION ALL
-        SELECT 'merged==sides money', count(*) FILTER (WHERE m.m != ad.m), count(*)
-        FROM (SELECT battle_id, entity_type, entity_id, sum(money) m
-              FROM battle_ranking_entries WHERE side=3 AND money IS NOT NULL GROUP BY 1,2,3) m
-        JOIN (SELECT battle_id, entity_type, entity_id, sum(money) m
-              FROM battle_ranking_entries WHERE side IN (1,2) AND money IS NOT NULL GROUP BY 1,2,3) ad
-        USING (battle_id, entity_type, entity_id)
+        SELECT 'merged duplicate groups', count(*), 0
+        FROM (SELECT battle_id, entity_type, entity_id FROM battle_ranking_entries WHERE side=3
+              GROUP BY 1,2,3 HAVING count(*) > 1) x
         UNION ALL
-        SELECT 'merged loot covered by sides', count(*) FILTER (WHERE s.loot_item_id IS NULL), count(*)
-        FROM (SELECT DISTINCT battle_id, entity_type, entity_id, loot_item_id
-              FROM battle_ranking_entries WHERE side=3 AND loot_item_id IS NOT NULL) m
-        LEFT JOIN (SELECT DISTINCT battle_id, entity_type, entity_id, loot_item_id
-                   FROM battle_ranking_entries WHERE side IN (1,2) AND loot_item_id IS NOT NULL) s
-        USING (battle_id, entity_type, entity_id, loot_item_id)
+        SELECT 'round merged duplicate groups', count(*), 0
+        FROM (SELECT battle_id, round_number, entity_type, entity_id FROM round_ranking_entries WHERE side=3
+              GROUP BY 1,2,3,4 HAVING count(*) > 1) x
+        UNION ALL
+        -- merged rows that EQUAL the derivable sums are leftovers of the
+        -- per-battle cleanup — should be ~0 (only exceptions are kept)
+        SELECT 'merged == derivable (leftover)', count(*), 0
+        FROM battle_ranking_entries r JOIN (
+            SELECT battle_id, entity_type, entity_id,
+                   sum(damage) d, sum(points) p, sum(money) mo, max(loot_item_id) l
+            FROM battle_ranking_entries WHERE side IN (1,2) GROUP BY 1,2,3) s
+        USING (battle_id, entity_type, entity_id)
+        WHERE r.side = 3
+          AND r.damage IS NOT DISTINCT FROM s.d AND r.points IS NOT DISTINCT FROM s.p
+          AND r.money IS NOT DISTINCT FROM s.mo AND r.loot_item_id IS NOT DISTINCT FROM s.l
+        UNION ALL
+        SELECT 'round merged == derivable (leftover)', count(*), 0
+        FROM round_ranking_entries r JOIN (
+            SELECT battle_id, round_number, entity_type, entity_id,
+                   sum(damage) d, sum(points) p, sum(money) mo, max(loot_item_id) l
+            FROM round_ranking_entries WHERE side IN (1,2) GROUP BY 1,2,3,4) s
+        USING (battle_id, round_number, entity_type, entity_id)
+        WHERE r.side = 3
+          AND r.damage IS NOT DISTINCT FROM s.d AND r.points IS NOT DISTINCT FROM s.p
+          AND r.money IS NOT DISTINCT FROM s.mo AND r.loot_item_id IS NOT DISTINCT FROM s.l
+        UNION ALL
+        SELECT 'merged exceptions kept (battle)', count(*), 0
+        FROM battle_ranking_entries WHERE side=3
+        UNION ALL
+        SELECT 'merged exceptions kept (round)', count(*), 0
+        FROM round_ranking_entries WHERE side=3
         UNION ALL
         SELECT 'missing last round', count(*) FILTER (WHERE lastr.n > stored.n), count(*)
         FROM (SELECT b.id, max(r.number) n FROM rounds r JOIN battles b ON b.battle_id = r.battle_id
@@ -478,7 +560,10 @@ def main():
     def flush():
         nonlocal buf_n
         if stmts:
-            psql("BEGIN;\n" + "\n".join(stmts) + "\nCOMMIT;")
+            # GUC: the merged cleanup DELETEs on compressed chunks decompress
+            # rows (the 100k/DML default would abort on old battles)
+            psql("SET timescaledb.max_tuples_decompressed_per_dml_transaction = 0;\n"
+                 "BEGIN;\n" + "\n".join(stmts) + "\nCOMMIT;")
             buf_n += len(stmts)
             stmts.clear()
 
@@ -486,15 +571,20 @@ def main():
     era_of = battle_eras(battles)
     pending = []
     for battle in battles:
+        post_cut = era_of.get(battle, "?") >= "2026-04"
         for dt in DATATYPES:
             for typ in TYPES:
                 for side in SIDES:
                     pending.append((battle, None, None, dt, typ, side))
+                if post_cut:
+                    pending.append((battle, None, None, dt, typ, "merged"))
         for rid, num in rounds[battle]:
             for dt in DATATYPES:
                 for typ in TYPES:
                     for side in SIDES:
                         pending.append((battle, rid, num, dt, typ, side))
+                    if post_cut:
+                        pending.append((battle, rid, num, dt, typ, "merged"))
     left = {b: 0 for b in battles}
     for c in pending:
         left[c[0]] += 1

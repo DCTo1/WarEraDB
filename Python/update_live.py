@@ -143,13 +143,21 @@ def reconcile_and_mark_ended(s: requests.Session, live: list[dict],
             else:
                 docs.append(d)
         time.sleep(0.1)
+    # The DELETE below carries "created_at > now() - 7 days" so chunk pruning
+    # keeps the DML off compressed chunks: without it the delete scans and
+    # DECOMPRESSES every compressed chunk (measured 2026-08-04: DB 956 MB →
+    # 3,872 MB after one batch). Rows of a battle that ended recently are
+    # recent by construction (live sync wrote them while it was active);
+    # ancient zombie battles' rows (June-10 API-regen timestamps) are skipped
+    # — acceptable, their ended_at still gets set.
     if marked:
         sql = "BEGIN;\n"
         for h, ts in marked:
             sql += (f"UPDATE battles SET ended_at = '{esc(ts)}'::TIMESTAMPTZ "
                     f"WHERE battle_id = objectid_to_uuid('{h}');\n"
                     f"DELETE FROM battle_ranking_entries "
-                    f"WHERE battle_id = (SELECT id FROM battles WHERE battle_id = objectid_to_uuid('{h}'));\n")
+                    f"WHERE battle_id = (SELECT id FROM battles WHERE battle_id = objectid_to_uuid('{h}'))"
+                    f"  AND created_at > now() - interval '7 days';\n")
         sql += "COMMIT;\n"
         proc = psql(sql)
         if proc.returncode != 0:
@@ -192,8 +200,30 @@ class EndpointDown(RuntimeError):
 def fetch_live_rankings(s: requests.Session, battles: list[dict]) -> tuple[int, int]:
     """Per-entity battle rankings for live battles (partial, growing).
 
+    Battles whose DB ended_at is already set are skipped: they ended between
+    getBattles and this walk (or the crawl marked them), and writing their
+    rows here would leave them out of sync with the merged derivation (the
+    race behind the battle-15653-style stale merged rows). The reconciliation
+    / --latest re-pick handles them.
+
     Returns (requests, entries). Statements are buffered and flushed at FLUSH.
     """
+    hexes = [b["_id"] for b in battles]
+    if not hexes:
+        return 0, 0
+    proc = psql(
+        "SELECT uuid_to_objectid(battle_id) FROM battles WHERE ended_at IS NOT NULL"
+        f" AND battle_id IN ({','.join(f'objectid_to_uuid(\'{h}\')' for h in hexes)});\n")
+    if proc.returncode != 0:
+        raise RuntimeError(f"DB error: {proc.stderr[:500]}")
+    ended = set(proc.stdout.splitlines())
+    if ended:
+        print(f"  ranking walk: skipping {len(ended)} battles already ended "
+              f"(live-list race)", flush=True)
+        battles = [b for b in battles if b["_id"] not in ended]
+        hexes = [b["_id"] for b in battles]
+    if not hexes:
+        return 0, 0
     stmts: list[str] = []
     buf_n = 0
     entries_n = 0
