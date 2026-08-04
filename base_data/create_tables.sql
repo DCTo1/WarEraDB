@@ -1,3 +1,22 @@
+-- =============================================================================
+-- WarEraDB schema — clean-start DDL
+--
+-- 1. Lookup tables
+-- 2. Items (normalized instances with skills)
+-- 3. Transactions hypertable (1-day chunks)
+-- 4. Battle tables: battle_types, battles, rounds, battle_bounties
+-- 5. Countries (current-state detail keyed on inventory_ids)
+-- 6. Battle/round ranking hypertables (7-day chunks, compressed)
+-- 7. Users
+--
+-- Only the indexes REQUIRED at insert time live here (unique ON CONFLICT
+-- targets, plus the ranking hypertable unique keys). Optional query indexes
+-- are commented out in create_indexes.sql — enable what you need. Apply the
+-- files in README order:
+--   create_tables → functions → item_codes → create_indexes → create_views
+-- =============================================================================
+
+
 -- 1. Lookup tables (small, heavily cached)
 
 CREATE TABLE transaction_types (
@@ -16,7 +35,7 @@ CREATE TABLE inventory_ids (
 );
 
 
--- 2. Items table (normalized item instances with skills)
+-- 2. Items (normalized instances with skills)
 --
 -- Columns grouped by alignment: 8B → 4B → 2B
 
@@ -30,16 +49,14 @@ CREATE TABLE items (
     secondary_skill     SMALLINT NULL      -- criticalChance (NULL for non-weapons)
 );
 
-CREATE INDEX IF NOT EXISTS idx_items_code_skills ON items(item_code_id, primary_skill, secondary_skill);
-CREATE INDEX IF NOT EXISTS idx_items_uuid ON items(item_uuid);
 
-
--- 3. Main hypertable
+-- 3. Transactions hypertable
 --
--- Columns grouped by alignment: 8B → 4B → 2B
--- created_at is NOT first in the column list (TimescaleDB does not require it
--- to be first), but it IS the partitioning dimension.
--- The unique index on (transaction_id, created_at) is the effective primary key.
+-- Columns grouped by alignment: 8B → 4B → 2B.
+-- created_at is the partitioning dimension (TimescaleDB does not require it
+-- to be first). The unique index on (transaction_id, created_at) is the
+-- effective primary key — it is also the ON CONFLICT target of
+-- insert_transaction(), so it MUST exist before any insert.
 
 CREATE TABLE transactions (
     -- 8-byte aligned
@@ -61,28 +78,30 @@ CREATE TABLE transactions (
     transaction_type_id SMALLINT NOT NULL REFERENCES transaction_types(id)
 );
 
-
--- 4. Convert to TimescaleDB hypertable (partitions by time)
-
 SELECT create_hypertable(
     'transactions',
     'created_at',
     chunk_time_interval => INTERVAL '1 day'
 );
 
+-- TimescaleDB auto-creates an index on the partition column; it is redundant
+-- here (created_at lookups go through the unique index below).
+DROP INDEX IF EXISTS transactions_created_at_idx;
+
+CREATE UNIQUE INDEX idx_transactions_transaction_id
+    ON transactions (transaction_id, created_at);
+
 
 -- =============================================================================
--- 5. Battle tables (Phase 1 of the battle expansion)
+-- 4. Battle tables
 --
--- Schema verified across 2025-05 → 2026-08 (15,791 battles + 33,170 rounds in
--- extra/battles_cache/). Design notes in extra/deprecated/battle_db_expansion_plan.md:
+-- Design notes:
 --   - no is_active column: ended_at IS NULL == active
---   - no won_by / badges_processed / stats / rounds_to_win: derived or dropped
+--   - derived fields (wonBy, roundsToWin) are not stored — compute at query time
 --   - isResistance / isTournament covered by battle_types
 --   - money/bounty fields live in battle_bounties (per side)
 --   - tournament battles/rounds have tournamentTeam instead of country
---   - tournament roundsHistory inflation bug does NOT affect these tables
---     (rounds are stored per rounds[] id, not per roundsHistory entry)
+--   - rounds are stored per rounds[] id, not per roundsHistory entry
 -- Columns grouped by alignment: 8B → 4B → 2B.
 -- =============================================================================
 
@@ -104,7 +123,6 @@ CREATE TABLE battles (
     defender_damages        DOUBLE PRECISION NOT NULL,
 
     -- 4-byte aligned
-    id                       SERIAL PRIMARY KEY,    -- surrogate int PK (migration 05); referenced by ranking entries / rounds
     battle_id                UUID NOT NULL UNIQUE,  -- MongoDB _id (API key, kept alongside the int PK)
     war_id                   UUID NULL,             -- NULL on tournament/revolution battles
     tournament_id            UUID NULL,             -- 'tournament' key = tournament id, NOT a bool
@@ -125,7 +143,10 @@ CREATE TABLE battles (
     defender_won_rounds_count SMALLINT NOT NULL,
     revolution_processed     BOOLEAN NULL,
     is_system_resistance     BOOLEAN NULL,
-    is_big_battle            BOOLEAN NULL
+    is_big_battle            BOOLEAN NULL,
+
+    -- surrogate int PK; referenced by ranking entries / rounds
+    id                       SERIAL PRIMARY KEY
 );
 
 CREATE TABLE rounds (
@@ -140,7 +161,6 @@ CREATE TABLE rounds (
     defender_points          DOUBLE PRECISION NOT NULL,
 
     -- 4-byte aligned
-    id                       SERIAL PRIMARY KEY,  -- surrogate int PK (migration 05); referenced by ranking entries
     round_id                 UUID NOT NULL UNIQUE,   -- MongoDB _id
     battle_id                UUID NOT NULL REFERENCES battles(battle_id),
     -- round wonBy = side string 'attacker'/'defender' since 2026-01 (country
@@ -159,11 +179,14 @@ CREATE TABLE rounds (
     number                   SMALLINT NOT NULL,
 
     -- variable
-    live                     JSONB NULL    -- { ticksCount, actualTickPoints, nextTickAt }
+    live                     JSONB NULL,    -- { ticksCount, actualTickPoints, nextTickAt }
+
+    -- surrogate int PK; referenced by ranking entries
+    id                       SERIAL PRIMARY KEY
 );
 
--- round number is unique within a battle (data verified 33,220/33,220
--- distinct); anchors round_number references from round ranking entries
+-- round number is unique within a battle; anchors round_number references
+-- from round ranking entries
 ALTER TABLE rounds ADD CONSTRAINT rounds_battle_number UNIQUE (battle_id, number);
 
 CREATE TABLE battle_bounties (
@@ -184,7 +207,7 @@ CREATE TABLE battle_bounties (
 
 
 -- =============================================================================
--- 6. Countries (detail table — Phase 1.5 of the battle expansion)
+-- 5. Countries (current-state detail)
 --
 -- inventory_ids stays the global id map (every country/region/MU/user id);
 -- `countries` adds current-state detail keyed on the SAME id
@@ -195,12 +218,10 @@ CREATE TABLE battle_bounties (
 -- point-in-time snapshot refreshed on every load — no history kept (the
 -- fields only matter for current-day gameplay decisions). `name` can change
 -- (revolutions rename countries) — code is the stable 2-letter key.
--- Field reality (checked 2026-08-02, 180/180 countries):
---   currentPopulation  INT 238..12190 (always present)
---   core/average/currentDevelopment DOUBLE (always present)
---   taxes income/market/selfWork DOUBLE % (fractional: 22/2/45 of 180 countries)
---   productionPercent DOUBLE % 5..30 — fractional on 8/108; MISSING on 72 (no resources)
---   specializedItem TEXT ≤10 chars — MISSING on 27 countries
+-- Field reality: currentPopulation INT always present; core/average/current
+-- Development DOUBLE always present; income/market/selfWork taxes DOUBLE %
+-- (fractional on ~22/2/45 of 180 countries); productionPercent % — NULL on
+-- ~72 countries without strategic resources; specializedItem — NULL on ~27.
 -- =============================================================================
 
 CREATE TABLE countries (
@@ -216,7 +237,7 @@ CREATE TABLE countries (
     -- 4-byte aligned
     country_id            INT PRIMARY KEY REFERENCES inventory_ids(id),
     current_population    INT NOT NULL,
-    production_percent    DOUBLE PRECISION NULL,      -- % — fractional on 8/108 countries; NULL when no strategic resources
+    production_percent    DOUBLE PRECISION NULL,      -- % — NULL when no strategic resources
 
     -- text
     name                  TEXT NOT NULL,
@@ -224,11 +245,11 @@ CREATE TABLE countries (
     specialized_item      TEXT NULL
 );
 
+
 -- =============================================================================
--- 7. Battle ranking entries (ranking data + item loot — Phase 2 of battle
--- expansion; see extra/deprecated/battle_loot_db_plan.md)
+-- 6. Battle ranking entries (ranking data + item loot)
 --
--- Two tables: battle-level and round-level rankings. One row per
+-- Two hypertables: battle-level and round-level rankings. One row per
 -- (battle/round, side, entity type, entity) with damage/points/money merged
 -- into a single row (nullable — a user may appear in only some dataTypes).
 -- Loot items are referenced via items(id) (upserted through get_item_id());
@@ -238,11 +259,20 @@ CREATE TABLE countries (
 -- (entries are immutable once written at battle end).
 -- Source: battleRanking.getRanking (27 battle combos + 27 per round:
 -- 3 dataTypes × 3 types × 3 sides; round rankings queried with roundId ONLY).
+--
+-- Hypertables partitioned by created_at (7-day chunks) with native
+-- TimescaleDB compression: heap ~5-7x smaller; per-chunk indexes drop off
+-- compressed chunks (queries on old data use the segment metadata instead).
+-- The unique key MUST include the partition column → the upsert ON CONFLICT
+-- targets in insert_battle_ranking_entry / insert_round_ranking_entry match
+-- (created_at, battle_id, ...). Upserts and DELETEs work against compressed
+-- chunks; the compression policies below keep recent chunks uncompressed so
+-- the battle-end fetch can write final rows.
 -- =============================================================================
 
 CREATE TABLE battle_ranking_entries (
     -- 8-byte aligned
-    damage         BIGINT NULL,        -- always integer today; bigint for growth (max 91M today)
+    damage         BIGINT NULL,        -- API damage (integer values)
     money          DOUBLE PRECISION NULL,  -- always fractional
     loot_item_id   BIGINT NULL REFERENCES items(id),  -- NULL = no loot / battle active
     created_at     TIMESTAMPTZ NOT NULL,   -- ranking entry createdAt (hypertable partition col)
@@ -253,11 +283,21 @@ CREATE TABLE battle_ranking_entries (
     points         INT NULL,           -- normal int, not smallint (countries grow)
 
     -- 2-byte aligned
-    side           SMALLINT NOT NULL,  -- 1 = attacker, 2 = defender, 3 = merged
-    entity_type    SMALLINT NOT NULL,  -- 1 = user, 2 = country, 3 = mu — NOT merged (historical)
-
-    PRIMARY KEY (battle_id, side, entity_type, entity_id)
+    side           SMALLINT NOT NULL,  -- 1 = attacker, 2 = defender, 3 = merged (exceptions only)
+    entity_type    SMALLINT NOT NULL   -- 1 = user, 2 = country, 3 = mu
 );
+
+SELECT create_hypertable('battle_ranking_entries', 'created_at',
+                         chunk_time_interval => INTERVAL '7 days');
+-- TimescaleDB auto-creates an index on the partition column; redundant here
+-- (the unique key below starts with created_at).
+DROP INDEX IF EXISTS battle_ranking_entries_created_at_idx;
+ALTER TABLE battle_ranking_entries SET (
+    timescaledb.compress,
+    timescaledb.compress_segmentby = 'side, entity_type',
+    timescaledb.compress_orderby = 'battle_id, created_at');
+CREATE UNIQUE INDEX battle_ranking_entries_pkey
+    ON battle_ranking_entries (created_at, battle_id, side, entity_type, entity_id);
 
 CREATE TABLE round_ranking_entries (
     -- 8-byte aligned
@@ -274,11 +314,45 @@ CREATE TABLE round_ranking_entries (
     -- 2-byte aligned
     round_number   SMALLINT NOT NULL,  -- 1-3, unique per battle (rounds UNIQUE(battle_id, number))
     side           SMALLINT NOT NULL,
-    entity_type    SMALLINT NOT NULL,
-
-    PRIMARY KEY (battle_id, round_number, side, entity_type, entity_id)
+    entity_type    SMALLINT NOT NULL
 );
 
--- Per-battle lookups / battles-to-entries navigation
-CREATE INDEX idx_battle_ranking_entries_battle ON battle_ranking_entries (battle_id);
-CREATE INDEX idx_round_ranking_entries_battle ON round_ranking_entries (battle_id);
+SELECT create_hypertable('round_ranking_entries', 'created_at',
+                         chunk_time_interval => INTERVAL '7 days');
+-- See the battle table above: drop the redundant partition-column index.
+DROP INDEX IF EXISTS round_ranking_entries_created_at_idx;
+ALTER TABLE round_ranking_entries SET (
+    timescaledb.compress,
+    timescaledb.compress_segmentby = 'side, entity_type',
+    timescaledb.compress_orderby = 'battle_id, created_at');
+CREATE UNIQUE INDEX round_ranking_entries_pkey
+    ON round_ranking_entries (created_at, battle_id, round_number, side, entity_type, entity_id);
+
+-- Compress chunks older than 7 days (12 h schedule; recent chunks stay
+-- uncompressed for the live battle-end fetch)
+SELECT add_compression_policy('battle_ranking_entries', INTERVAL '7 days', if_not_exists => TRUE);
+SELECT add_compression_policy('round_ranking_entries', INTERVAL '7 days', if_not_exists => TRUE);
+
+
+-- =============================================================================
+-- 7. Users
+--
+-- One row per user (rankings entity_type=1 ∪ transaction roles ∪
+-- active-leaderboard users). user_damages/user_bounty = API lifetime stats
+-- where ranking.getRanking snapshots cover the user (update_users.py
+-- overwrites them), else derived Σ merged battle sums (initial-load backfill).
+-- created_at is NOT stored: derivable from the user ObjectID timestamp
+-- (which is the game restart 2025-05-01 for old users, NOT account creation).
+-- =============================================================================
+
+CREATE TABLE users (
+    id            SERIAL PRIMARY KEY,                       -- 4B int PK
+    user_id       UUID NOT NULL UNIQUE REFERENCES inventory_ids(external_id),
+    user_damages  BIGINT NOT NULL DEFAULT 0,                -- Σ merged battle-level damage (rankings)
+    user_wealth   DOUBLE PRECISION NULL,                    -- getUserLite rankings.userWealth.value
+    user_bounty   DOUBLE PRECISION NOT NULL DEFAULT 0,      -- Σ merged battle-level money (rankings)
+    mu_id         INT NULL REFERENCES inventory_ids(id),    -- user's MU (getUserLite mu)
+    total_xp      INTEGER NULL,                             -- getUserLite leveling.totalXp
+    military_rank SMALLINT NULL,                            -- getUserLite militaryRank (numeric)
+    username      TEXT NULL                                 -- getUserLite username
+);

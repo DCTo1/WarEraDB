@@ -100,7 +100,7 @@ END;
 $$ LANGUAGE plpgsql;
 
 -- =============================================
--- 1.5. Item resolver (insert-or-get by MongoDB UUID)
+-- 2. Item resolver (insert-or-get by MongoDB UUID)
 -- =============================================
 
 CREATE OR REPLACE FUNCTION get_item_id(
@@ -142,7 +142,7 @@ END;
 $$ LANGUAGE plpgsql;
 
 -- =============================================
--- 2. Skill extraction helper
+-- 3. Skill extraction helper
 -- =============================================
 
 CREATE OR REPLACE FUNCTION extract_skills(p_item JSONB, p_code TEXT)
@@ -183,7 +183,7 @@ END;
 $$ LANGUAGE plpgsql;
 
 -- =============================================
--- 3. Main insertion function
+-- 4. Main insertion function
 -- =============================================
 
 CREATE OR REPLACE FUNCTION insert_transaction(payload JSONB)
@@ -300,7 +300,7 @@ END;
 $$ LANGUAGE plpgsql;
 
 -- =============================================
--- 4. Ensure all transaction types exist (run once)
+-- 5. Seed the transaction types
 -- =============================================
 
 INSERT INTO transaction_types (type) VALUES
@@ -311,11 +311,10 @@ ON CONFLICT (type) DO NOTHING;
 
 
 -- =============================================
--- 4. Battle functions (Phase 1 of the battle expansion)
+-- 6. Battle functions
 --
--- Idempotent: ON CONFLICT DO NOTHING, safe to re-run on the cache files.
--- Payloads come from extra/battles_cache/ (battles.jsonl.gz = full battle
--- docs minus currentRound; rounds.jsonl.gz = minimized round docs).
+-- Idempotent: ON CONFLICT upserts, safe to re-run. Payloads come from the
+-- API via update_battles.py (one JSONB doc per battle / round).
 -- =============================================
 
 CREATE OR REPLACE FUNCTION get_battle_type_id(p_type TEXT)
@@ -452,9 +451,8 @@ BEGIN
     v_defender := payload->'defender';
 
     -- wonBy format changed 2025-12: old rounds carry the winning country id,
-    -- rounds since 2026-01 carry the side string 'attacker'/'defender'
-    -- (verified 20,258 side-string rounds, 0 mismatches vs attacker/defender
-    -- points). The winner is a country for war/resistance rounds, a team for
+    -- rounds since 2026-01 carry the side string 'attacker'/'defender'.
+    -- The winner is a country for war/resistance rounds, a team for
     -- tournament rounds.
     IF payload->>'wonBy' = 'attacker' THEN
         IF (v_attacker->>'tournamentTeam') IS NOT NULL THEN
@@ -501,8 +499,8 @@ BEGIN
         get_inventory_id(v_defender->>'country'),
         objectid_to_uuid(v_defender->>'tournamentTeam'),
         (v_defender->>'damages')::DOUBLE PRECISION,
-        -- API quirk: 443 rounds (2025-05 → 2026-07, war/tournament/resistance)
-        -- return defender.hitCount = null, always alongside damages=0/points=0
+        -- API quirk: some rounds return defender.hitCount = null, always
+        -- alongside damages=0/points=0
         COALESCE((v_defender->>'hitCount')::INTEGER, 0),
         (v_defender->>'points')::DOUBLE PRECISION
     )
@@ -529,7 +527,7 @@ $$ LANGUAGE plpgsql;
 
 
 -- =============================================
--- 5. Country functions (Phase 1.5 of the battle expansion)
+-- 7. Country functions
 --
 -- Upsert keyed on country_id (== inventory_ids.id); re-running refreshes the
 -- snapshot. payload = one doc from country.getAllCountries.
@@ -584,13 +582,12 @@ END;
 $$ LANGUAGE plpgsql;
 
 -- =============================================================================
--- 7. Battle ranking entries (Phase 2 — rankings + loot)
+-- 8. Battle ranking entries
 --
 -- One row per (battle/round, side, entity type, entity); damage/points/money
 -- merged nullable; loot_item_id -> items(id); loot duplicated per side as the
 -- API returns it. entity ids resolve through get_inventory_id() by the caller
 -- (users/mus are mostly absent from inventory_ids until first seen).
--- See extra/deprecated/battle_loot_db_plan.md.
 -- =============================================================================
 
 CREATE OR REPLACE FUNCTION insert_battle_ranking_entry(
@@ -612,7 +609,7 @@ BEGIN
     SELECT b.id, p_side, p_entity_type, p_entity_id,
            p_damage, p_points, p_money, p_loot_item_id, p_created_at
     FROM battles b WHERE b.battle_id = objectid_to_uuid(p_battle_hex)
-    ON CONFLICT (battle_id, side, entity_type, entity_id) DO UPDATE SET
+    ON CONFLICT (created_at, battle_id, side, entity_type, entity_id) DO UPDATE SET
         damage = EXCLUDED.damage,
         points = EXCLUDED.points,
         money = EXCLUDED.money,
@@ -641,7 +638,7 @@ BEGIN
     SELECT b.id, p_round_number, p_side, p_entity_type, p_entity_id,
            p_damage, p_points, p_money, p_loot_item_id, p_created_at
     FROM battles b WHERE b.battle_id = objectid_to_uuid(p_battle_hex)
-    ON CONFLICT (battle_id, round_number, side, entity_type, entity_id) DO UPDATE SET
+    ON CONFLICT (created_at, battle_id, round_number, side, entity_type, entity_id) DO UPDATE SET
         damage = EXCLUDED.damage,
         points = EXCLUDED.points,
         money = EXCLUDED.money,
