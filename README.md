@@ -122,11 +122,12 @@ battle sync, rankings, users, bounties — every 15 s):
 # WARERA_DB_URL must be set in the viewer's environment: the auto-updater
 # spawns the pipeline scripts, which connect over TCP (see below)
 WARERA_DB_URL='postgresql+psycopg://postgres:postgres@localhost:5432/{db}' \
-  .venv/bin/python extra/db_web.py        # → http://127.0.0.1:8765
+  .venv/bin/python Python/db_web.py        # → http://127.0.0.1:8765
 ```
 
-The viewer itself reads the DB via `docker exec psql`; only the scripts it
-spawns use SQLAlchemy.
+The viewer is a thin entry point into the `Python/viewer/` package
+(config/db/updater/ui/pages/server); its reads go through `Python/db.py`
+(SQLAlchemy over TCP), the same connection the spawned pipeline scripts use.
 
 ### Testing on a scratch DB
 
@@ -209,6 +210,5 @@ ORDER BY r.rank LIMIT 20;
 | Path | Purpose |
 |---|---|
 | `base_data/` | Schema DDL (`create_tables.sql`), PL/pgSQL functions (`functions.sql`), indexes, views |
-| `Python/` | Battle tooling: shared modules (`api.py` WarEra API client, `db.py` SQLAlchemy DB access + SQL helpers, `utils.py` time/state/constants + `prepare_transaction()`, `endpoint_log.py`) + the CLI scripts (`update_battles.py`, `update_live.py`, `update_countries.py`, `insert_ranking_sample.py`, `update_users.py`, `seed_endpoints.py`) |
-| `extra/deprecated/` | Pre-rework versions of the Python scripts (kept for recovery; not used) |
+| `Python/` | Battle tooling: shared modules (`api.py` WarEra API client, `db.py` SQLAlchemy DB access + SQL helpers, `utils.py` time/state/constants + `prepare_transaction()`, `endpoint_log.py`) + the CLI scripts (`update_battles.py`, `update_live.py`, `update_countries.py`, `insert_ranking_sample.py`, `update_users.py`, `seed_endpoints.py`) + the web viewer (`db_web.py` entry point and the `viewer/` package with its pages) |
 | `data/battle_timestamps.json` | Battle timestamp index for batched pagination (oldest-first, append-only) |

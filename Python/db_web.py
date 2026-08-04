@@ -1,0 +1,87 @@
+"""Local read-only web UI for the WarEra DB (entry point).
+
+Usage
+-----
+    .venv/bin/python Python/db_web.py                # http://127.0.0.1:8765
+    .venv/bin/python Python/db_web.py --port 9000
+    .venv/bin/python Python/db_web.py --db scratch   # other database
+    .venv/bin/python Python/db_web.py --ranking 0    # disable the ranking pass
+
+Pages
+-----
+    /            overview: counts, latest battles, biggest "hidden" bounty pools
+    /battles     battle list: Active / Finished / All tabs, country+type filters,
+                 paginated, rows show "attacker vs defender" instead of battle IDs
+    /battle?id=  battle detail (bounty side info + rounds + top players from
+                 battle_ranking_entries — live while the battle is active) + link
+                 to the app
+    /users       user list: sort by damage/bounty/wealth/XP/rank, username search,
+                 paginated (from the users table)
+    /user?name=  user detail: API lifetime stats + MU + battle history (top 50
+    /user?hex=   battles by damage from battle_ranking_entries, side A/D, LIVE tag)
+    /bounties    battles with bounties, filterable by country
+    /countries   bounty money per country (total vs ended-battles pools)
+    /stats       endpoint usage analytics (endpoints / endpoints_used tables)
+    /sql         read-only SQL console (SELECT/EXPLAIN only, capped at 1000 rows)
+    /update-status  log of the automatic updater runs
+    /timer       JSON {"running": bool, "seconds": n} — polled by the header timer
+
+The DB auto-updates every UPDATE_INTERVAL seconds (default 15) in a background
+thread: Python/update_battles.py brings battles/rounds/countries up to the
+current time, Python/update_live.py syncs the currently-active battles (live
+per-entity rankings, battle-doc refresh, and ends battles the server closed —
+rankings of live battles are fetched on a 5-minute cadence, see
+--ranking-interval), then Python/insert_ranking_sample.py --latest N fetches
+rankings for the newest N battles not yet in the ranking tables (N =
+--ranking, default 1000; 0 disables the ranking pass). The header timer shows
+the seconds until the next run and switches to "updating…" while a run is in
+progress.
+
+Stdlib only for the viewer itself (the spawned pipeline scripts use
+SQLAlchemy + requests, already in requirements.txt). All reads go through
+Python/db.py (SQLAlchemy over TCP: WARERA_DB_URL, database via BATTLE_DB /
+--db). Binds to 127.0.0.1; nothing leaves the machine. Read-only: the SQL
+console rejects anything that isn't SELECT/EXPLAIN/WITH/SHOW. The only write
+path is the automatic updater.
+
+Implementation: this file is a thin entry point — args, settings, scheduler
+thread, HTTP server. The actual logic lives in the viewer/ package
+(config, db, updater, ui, pages, server).
+"""
+
+import argparse
+import os
+import sys
+import threading
+
+from http.server import ThreadingHTTPServer
+
+from viewer import config, server, updater
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(description="Local web viewer for the WarEra DB.")
+    p.add_argument("--port", type=int, default=config.DEFAULT_PORT)
+    p.add_argument("--db", default=os.environ.get("BATTLE_DB", "tsdb"),
+                   help="database name (default tsdb, or BATTLE_DB env)")
+    p.add_argument("--ranking", type=int, default=config.settings.ranking_latest,
+                   help="newest battles to fetch rankings for after the battle "
+                        "update (default 1000, 0 disables the ranking pass)")
+    args = p.parse_args()
+
+    config.settings.db = args.db
+    config.settings.ranking_latest = args.ranking
+
+    threading.Thread(target=updater.scheduler_loop, daemon=True).start()
+    srv = ThreadingHTTPServer(("127.0.0.1", args.port), server.Handler)
+    print(f"WarEra DB viewer: http://127.0.0.1:{args.port}  "
+          f"(auto-updates every {config.UPDATE_INTERVAL}s, Ctrl+C to stop)")
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

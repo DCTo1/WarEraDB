@@ -9,6 +9,7 @@ from the README quick start is used, with the database name coming from the
 API
 ---
     query(sql) -> list[tuple]        # one SELECT; returns rows
+    query_dicts(sql) -> list[dict]   # one SELECT; rows as dicts (web viewer)
     scalar(sql)                      # first column of the first row
     exec_many(stmts, pre="") -> int  # run each statement in ONE transaction
     exec_sql(sql)                    # run one single statement
@@ -91,6 +92,14 @@ def scalar(sql: str, db: str | None = None):
     with engine(db).begin() as conn:
         _flush_endpoint_log(conn)
         return conn.exec_driver_sql(sql).scalar()
+
+
+@_as_db_error
+def query_dicts(sql: str, db: str | None = None) -> list[dict]:
+    """Run one SELECT, return the rows as dicts (used by the web viewer)."""
+    with engine(db).begin() as conn:
+        _flush_endpoint_log(conn)
+        return [dict(row) for row in conn.exec_driver_sql(sql).mappings()]
 
 
 @_as_db_error
