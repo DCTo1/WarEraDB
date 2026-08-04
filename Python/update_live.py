@@ -49,6 +49,7 @@ import time
 import requests
 from requests.adapters import HTTPAdapter
 
+import endpoint_log
 from insert_ranking_sample import esc, loot_sql, value_sql
 
 API_URL = "https://api2.warera.io/trpc"
@@ -69,10 +70,11 @@ DB = "tsdb"
 
 
 def psql(sql: str) -> subprocess.CompletedProcess:
+    # Flush queued endpoint usages in the same call (no extra round trips)
     return subprocess.run(
         ["docker", "exec", "-i", "timescaledb", "psql", "-U", "postgres", "-d", DB,
          "-v", "ON_ERROR_STOP=1", "-q", "-t", "-A"],
-        input=sql, capture_output=True, text=True)
+        input=endpoint_log.drain_sql() + sql, capture_output=True, text=True)
 
 
 def session() -> requests.Session:
@@ -85,7 +87,10 @@ def session() -> requests.Session:
 
 def batched_call(s: requests.Session, endpoint: str, bodies: list[dict],
                  retries: int = 5) -> list:
-    """One POST with up to MAX_BATCH tRPC calls; responses aligned to bodies."""
+    """One POST with up to MAX_BATCH tRPC calls; responses aligned to bodies.
+    Logs one endpoint usage per call."""
+    for _ in bodies:
+        endpoint_log.log(endpoint)
     url = f"{API_URL}/{','.join([endpoint] * len(bodies))}?batch=1"
     last = None
     for attempt in range(retries):
@@ -384,6 +389,7 @@ def main():
         live = fetch_live_battles(s)
     except RuntimeError as exc:
         print(f"API failure: {exc}", file=sys.stderr)
+        psql(endpoint_log.drain_sql())
         return 1
     print(f"live battles from API: {len(live)}", flush=True)
 
@@ -391,6 +397,7 @@ def main():
         db_active = db_active_hexes()
     except RuntimeError as exc:
         print(f"DB failure: {exc}", file=sys.stderr)
+        psql(endpoint_log.drain_sql())
         return 2
 
     marked, extra_docs = reconcile_and_mark_ended(s, live, db_active)
@@ -410,6 +417,7 @@ def main():
         else:
             print(f"rankings: skipped (last sync {time.time() - last:.0f}s ago, "
                   f"interval {args.ranking_interval}s)", flush=True)
+    psql(endpoint_log.drain_sql())
     return 0
 
 

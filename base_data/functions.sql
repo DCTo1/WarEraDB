@@ -646,3 +646,44 @@ BEGIN
         created_at = EXCLUDED.created_at;
 END;
 $$ LANGUAGE plpgsql;
+
+
+-- =============================================================================
+-- 9. Endpoint usage tracking
+--
+-- get_endpoint_id: SELECT-first upsert (new endpoints register themselves).
+-- insert_endpoint_used: records one API call (auto-registers the endpoint).
+-- =============================================================================
+
+CREATE OR REPLACE FUNCTION get_endpoint_id(p_name TEXT)
+RETURNS SMALLINT AS $$
+DECLARE
+    v_id SMALLINT;
+BEGIN
+    IF p_name IS NULL THEN
+        RETURN NULL;
+    END IF;
+    SELECT id INTO v_id FROM endpoints WHERE name = p_name;
+    IF v_id IS NOT NULL THEN
+        RETURN v_id;
+    END IF;
+    INSERT INTO endpoints (name)
+    VALUES (p_name)
+    ON CONFLICT (name) DO NOTHING
+    RETURNING id INTO v_id;
+    IF v_id IS NULL THEN
+        SELECT id INTO v_id FROM endpoints WHERE name = p_name;
+    END IF;
+    RETURN v_id;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION insert_endpoint_used(p_name TEXT)
+RETURNS VOID AS $$
+DECLARE
+    v_id SMALLINT;
+BEGIN
+    v_id := get_endpoint_id(p_name);
+    INSERT INTO endpoints_used (endpoint_id) VALUES (v_id);
+END;
+$$ LANGUAGE plpgsql;

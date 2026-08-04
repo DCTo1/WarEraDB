@@ -32,6 +32,8 @@ import sys
 
 import requests
 
+import endpoint_log
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 API_KEY_FILE = os.path.join(os.path.expanduser("~"), ".config", "warera", "api_key.txt")
 # API tokens (x-api-key) are only accepted on api2.warera.io (api4 rejects
@@ -66,6 +68,7 @@ def upsert_countries(batch_size: int) -> int:
     print("  fetching country.getAllCountries ...", flush=True)
     s = requests.Session()
     s.headers.update({"Content-Type": "application/json", "x-api-key": load_api_key()})
+    endpoint_log.log("country.getAllCountries")
     r = s.post(COUNTRIES_URL, json={"0": {}}, timeout=30)
     r.raise_for_status()
     docs = r.json()[0]["result"]["data"]
@@ -76,7 +79,9 @@ def upsert_countries(batch_size: int) -> int:
             raw = json.dumps(doc, ensure_ascii=False, separators=(",", ":"))
             buf.append(f"SELECT insert_country($JSON${raw}$JSON$);\n")
         buf.append("COMMIT;\n")
-        proc = subprocess.run(PSQL_CMD, input="".join(buf), capture_output=True, text=True)
+        # flush queued endpoint usage in the same call
+        proc = subprocess.run(PSQL_CMD, input=endpoint_log.drain_sql() + "".join(buf),
+                              capture_output=True, text=True)
         if proc.returncode != 0:
             print(f"  DB error (rc={proc.returncode}): {proc.stderr[:500]}", file=sys.stderr)
             sys.exit(2)

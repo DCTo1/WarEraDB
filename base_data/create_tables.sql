@@ -7,7 +7,8 @@
 -- 4. Battle tables: battle_types, battles, rounds, battle_bounties
 -- 5. Countries (current-state detail keyed on inventory_ids)
 -- 6. Battle/round ranking hypertables (7-day chunks, compressed)
--- 7. Users
+-- 7. Endpoint usage tracking
+-- 8. Users
 --
 -- Only the indexes REQUIRED at insert time live here (unique ON CONFLICT
 -- targets, plus the ranking hypertable unique keys). Optional query indexes
@@ -335,7 +336,28 @@ SELECT add_compression_policy('round_ranking_entries', INTERVAL '7 days', if_not
 
 
 -- =============================================================================
--- 7. Users
+-- 8. Endpoint usage tracking
+--
+-- `endpoints` is the registry of known API endpoints (seeded from
+-- extra/endpoints.json, auto-extended at runtime); `endpoints_used` is an
+-- append-only log — one row per API call the scripts make. Rows accumulate
+-- (bounded by how often the pipeline runs; ~200k/day at the 15s web cycle).
+-- =============================================================================
+
+CREATE TABLE endpoints (
+    id   SMALLSERIAL PRIMARY KEY,
+    name TEXT UNIQUE NOT NULL   -- 'country.getCountryById', 'battle.getBattles', ...
+);
+
+CREATE TABLE endpoints_used (
+    id          BIGSERIAL PRIMARY KEY,
+    endpoint_id SMALLINT NOT NULL REFERENCES endpoints(id),
+    date_used   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+
+-- =============================================================================
+-- 8. Users
 --
 -- One row per user (rankings entity_type=1 ∪ transaction roles ∪
 -- active-leaderboard users). user_damages/user_bounty = API lifetime stats
