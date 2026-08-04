@@ -66,6 +66,7 @@ Notes
 """
 
 import argparse
+import atexit
 import fcntl
 import json
 import os
@@ -77,6 +78,8 @@ from datetime import datetime, timezone
 
 import requests
 from requests.adapters import HTTPAdapter
+
+import endpoint_log
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 API_KEY_FILE = os.path.join(os.path.expanduser("~"), ".config", "warera", "api_key.txt")
@@ -177,11 +180,14 @@ def batched_fetch(session: requests.Session, endpoint: str, payloads: list[dict]
     URL: <trpc>/endpoint,endpoint,...,endpoint?batch=1 (endpoint repeated),
     body: {"0": payload0, "1": payload1, ...}. The response is a list aligned
     with the call order. The server caps batches at 50 calls (413 otherwise).
+    Logs one endpoint usage per call.
     """
     if not payloads:
         return []
     if len(payloads) > MAX_BATCH:
         raise RuntimeError(f"batch too large: {len(payloads)} > {MAX_BATCH}")
+    for _ in payloads:
+        endpoint_log.log(endpoint)
     url = f"{API_URL}/{','.join([endpoint] * len(payloads))}?batch=1"
     body = {str(i): p for i, p in enumerate(payloads)}
     last_err = None
@@ -220,7 +226,9 @@ def psql_cmd(db: str) -> list[str]:
 
 
 def psql(db: str, sql: str) -> subprocess.CompletedProcess:
-    return subprocess.run(psql_cmd(db), input=sql, capture_output=True, text=True)
+    # Flush queued endpoint usages in the same call (no extra round trips)
+    return subprocess.run(psql_cmd(db), input=endpoint_log.drain_sql() + sql,
+                          capture_output=True, text=True)
 
 
 def db_max_created_at_ms(db: str) -> int:
@@ -379,6 +387,7 @@ def fetch_battles_sequential(session: requests.Session, since_ms: int, until_ms:
         payload = {"limit": 100, "direction": "forward"}
         if cursor is not None:
             payload["cursor"] = cursor
+        endpoint_log.log("battle.getBattles")
         items = fetch_data(session, BATTLES_URL, payload)["items"]
         pages += 1
         if not items:
@@ -431,6 +440,7 @@ def fetch_battles(session: requests.Session, since_ms: int, until_ms: int, index
             print("  ⚠ > INDEX_STEP battles newer than the index — walking down", file=sys.stderr, flush=True)
             cursor = str(to_unix_ms(items[-1]["createdAt"]) + 1)
             while True:
+                endpoint_log.log("battle.getBattles")
                 items = fetch_data(session, BATTLES_URL,
                                    {"limit": 100, "direction": "forward", "cursor": cursor})["items"]
                 if not items:
@@ -466,6 +476,7 @@ def fetch_battles(session: requests.Session, since_ms: int, until_ms: int, index
         for payload, res in zip(chunk, results):
             pages += 1
             if "error" in res:
+                endpoint_log.log("battle.getBattles")
                 items = fetch_data(session, BATTLES_URL, payload)["items"]  # retry singly
             else:
                 items = res["result"]["data"]["items"]
@@ -482,6 +493,7 @@ def fetch_battles(session: requests.Session, since_ms: int, until_ms: int, index
     cursor = str(index_ms[0] + 1)
     tail_pages = 0
     while True:
+        endpoint_log.log("battle.getBattles")
         items = fetch_data(session, BATTLES_URL,
                            {"limit": 100, "direction": "forward", "cursor": cursor})["items"]
         tail_pages += 1
@@ -535,6 +547,7 @@ def fetch_active_docs(session: requests.Session, battle_ids: list[str], batch_si
         if results is None:
             for b in chunk:
                 try:
+                    endpoint_log.log("battle.getById")
                     docs.append(fetch_data(session, f"{API_URL}/battle.getById?batch=1", {"battleId": b}))
                 except RuntimeError as exc:
                     failed += 1
@@ -585,6 +598,7 @@ def fetch_rounds(session: requests.Session, round_ids: list[str], batch_size: in
         if results is None:
             for rid in chunk:
                 try:
+                    endpoint_log.log("round.getById")
                     rounds.append(minimize_round(fetch_data(session, ROUNDS_URL, {"roundId": rid})))
                 except RuntimeError as exc:
                     failed += 1
@@ -745,6 +759,9 @@ def main():
     fixed = repair_zero_damages(args.db)
     if fixed:
         print(f"damage repair: {fixed} battles now carry round-sum damages", flush=True)
+
+    # Flush any endpoint usages not covered by the last psql call
+    psql(args.db, endpoint_log.drain_sql())
 
     print("Done.", flush=True)
     return 0

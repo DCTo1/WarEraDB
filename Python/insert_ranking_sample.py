@@ -37,6 +37,8 @@ import time
 import requests
 from requests.adapters import HTTPAdapter
 
+import endpoint_log
+
 API_URL = "https://api2.warera.io/trpc"
 KEY_FILE = os.path.expanduser("~/.config/warera/api_key.txt")
 DB = os.environ.get("BATTLE_DB", "tsdb")
@@ -63,7 +65,7 @@ def psql(sql):
     r = subprocess.run(
         ["docker", "exec", "-i", "timescaledb", "psql", "-U", "postgres", "-d", DB,
          "-v", "ON_ERROR_STOP=1", "-q", "-t", "-A"],
-        input=sql, capture_output=True, text=True)
+        input=endpoint_log.drain_sql() + sql, capture_output=True, text=True)
     if r.returncode != 0:
         raise RuntimeError(f"psql failed: {r.stderr[-800:]}")
     return r.stdout
@@ -80,10 +82,13 @@ def session():
 def batch_get(s, body):
     """body: {"0": params, ...} → [{"result": {"data": ...}}, ...]
     tRPC batch: endpoint repeated in the URL per call, ?batch=1. Responses
-    are aligned POSITIONALLY to the body keys (must be contiguous 0..n-1)."""
+    are aligned POSITIONALLY to the body keys (must be contiguous 0..n-1).
+    Logs one endpoint usage per call (always battleRanking.getRanking)."""
     global REQUESTS
     REQUESTS += 1
     n = len(body)
+    for _ in body:
+        endpoint_log.log("battleRanking.getRanking")
     url = (API_URL + "/"
            + ",".join(["battleRanking.getRanking"] * n) + "?batch=1")
     last = None

@@ -32,6 +32,8 @@ import time
 import requests
 from requests.adapters import HTTPAdapter
 
+import endpoint_log
+
 API_URL = "https://api2.warera.io/trpc"
 KEY_FILE = os.path.expanduser("~/.config/warera/api_key.txt")
 DB = os.environ.get("BATTLE_DB", "tsdb")
@@ -47,7 +49,7 @@ def psql(sql):
     r = subprocess.run(
         ["docker", "exec", "-i", "timescaledb", "psql", "-U", "postgres", "-d", DB,
          "-v", "ON_ERROR_STOP=1", "-q", "-t", "-A"],
-        input=sql, capture_output=True, text=True)
+        input=endpoint_log.drain_sql() + sql, capture_output=True, text=True)
     if r.returncode != 0:
         raise RuntimeError(f"psql failed: {r.stderr[-800:]}")
     return r.stdout
@@ -63,6 +65,8 @@ def session():
 
 def batch_get(s, body):
     n = len(body)
+    for _ in body:
+        endpoint_log.log("user.getUserLite")
     url = API_URL + "/" + ",".join(["user.getUserLite"] * n) + "?batch=1"
     last = None
     for attempt in range(8):
@@ -84,6 +88,7 @@ def fetch_snapshots(s):
     """{hex: {"damages": v|None, "bounty": v|None, "wealth": v|None, "xp": v|None, "mu": hex|None}}"""
     out = {}
     for typ in SNAPSHOT_TYPES:
+        endpoint_log.log("ranking.getRanking")
         r = s.post(API_URL + "/ranking.getRanking?batch=1",
                    json={"0": {"rankingType": typ}}, timeout=120)
         r.raise_for_status()

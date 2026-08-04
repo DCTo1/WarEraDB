@@ -76,3 +76,19 @@
 --     ON battle_ranking_entries (battle_id);
 -- CREATE INDEX IF NOT EXISTS idx_round_ranking_battle
 --     ON round_ranking_entries (battle_id);
+
+-- =============================================================================
+--  Endpoint usage
+--
+--  endpoints_used is append-only; the stats page aggregates it. Indexes only
+--  matter once it holds a lot of rows.
+-- =============================================================================
+
+-- Per-endpoint history (counts, last used) — covers the stats page's main
+-- GROUP BY when the log is large.
+-- CREATE INDEX IF NOT EXISTS idx_endpoints_used_endpoint
+--     ON endpoints_used (endpoint_id, date_used);
+
+-- Per-day trends (calls per day / per hour)
+-- CREATE INDEX IF NOT EXISTS idx_endpoints_used_date
+--     ON endpoints_used (date_used);
