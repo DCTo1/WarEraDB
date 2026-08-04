@@ -80,6 +80,10 @@ done
 # the per-entity live rankings
 .venv/bin/python Python/update_live.py
 
+# Incremental user.getUserLite backfill (unchecked users, wealth/damage
+# rankings first — runs automatically on the viewer's cycle too)
+.venv/bin/python Python/update_users_lite.py --limit 100
+
 # Seed the endpoint registry (idempotent; new endpoints auto-register anyway)
 .venv/bin/python Python/seed_endpoints.py
 ```
@@ -116,7 +120,9 @@ WARERA_DB_URL='postgresql+psycopg://postgres:postgres@localhost:5433/{db}' \
 ### Web viewer (optional)
 
 Local read-only web viewer + auto-updater (battles/rounds/countries, live
-battle sync, rankings, users, bounties — every 15 s):
+battle sync, rankings, users, bounties — every 15 s; the cycle also
+backfills user.getUserLite basic info for up to 100 unchecked users per run,
+wealth/damage rankings first):
 
 ```bash
 # WARERA_DB_URL must be set in the viewer's environment: the auto-updater
@@ -210,5 +216,5 @@ ORDER BY r.rank LIMIT 20;
 | Path | Purpose |
 |---|---|
 | `base_data/` | Schema DDL (`create_tables.sql`), PL/pgSQL functions (`functions.sql`), indexes, views |
-| `Python/` | Battle tooling: shared modules (`api.py` WarEra API client, `db.py` SQLAlchemy DB access + SQL helpers, `utils.py` time/state/constants + `prepare_transaction()`, `endpoint_log.py`) + the CLI scripts (`update_battles.py`, `update_live.py`, `update_countries.py`, `insert_ranking_sample.py`, `update_users.py`, `seed_endpoints.py`) + the web viewer (`db_web.py` entry point and the `viewer/` package with its pages) |
+| `Python/` | Battle tooling: shared modules (`api.py` WarEra API client, `db.py` SQLAlchemy DB access + SQL helpers, `utils.py` time/state/constants + `prepare_transaction()`, `endpoint_log.py`) + the CLI scripts (`update_battles.py`, `update_live.py`, `update_countries.py`, `insert_ranking_sample.py`, `update_users.py`, `update_users_lite.py`, `seed_endpoints.py`) + the web viewer (`db_web.py` entry point and the `viewer/` package with its pages) |
 | `data/battle_timestamps.json` | Battle timestamp index for batched pagination (oldest-first, append-only) |

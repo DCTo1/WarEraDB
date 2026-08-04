@@ -33,9 +33,11 @@ per-entity rankings, battle-doc refresh, and ends battles the server closed —
 rankings of live battles are fetched on a 5-minute cadence, see
 --ranking-interval), then Python/insert_ranking_sample.py --latest N fetches
 rankings for the newest N battles not yet in the ranking tables (N =
---ranking, default 1000; 0 disables the ranking pass). The header timer shows
-the seconds until the next run and switches to "updating…" while a run is in
-progress.
+--ranking, default 1000; 0 disables the ranking pass), then
+Python/update_users_lite.py fetches user.getUserLite for up to
+--user-lite (default 100) unchecked users, wealth/damage rankings first (0
+disables the user pass). The header timer shows the seconds until the next
+run and switches to "updating…" while a run is in progress.
 
 Stdlib only for the viewer itself (the spawned pipeline scripts use
 SQLAlchemy + requests, already in requirements.txt). All reads go through
@@ -67,10 +69,14 @@ def main() -> int:
     p.add_argument("--ranking", type=int, default=config.settings.ranking_latest,
                    help="newest battles to fetch rankings for after the battle "
                         "update (default 1000, 0 disables the ranking pass)")
+    p.add_argument("--user-lite", type=int, default=config.settings.user_lite_limit,
+                   help="unchecked users to fetch user.getUserLite for after the "
+                        "ranking pass (default 100, 0 disables the user pass)")
     args = p.parse_args()
 
     config.settings.db = args.db
     config.settings.ranking_latest = args.ranking
+    config.settings.user_lite_limit = args.user_lite
 
     threading.Thread(target=updater.scheduler_loop, daemon=True).start()
     srv = ThreadingHTTPServer(("127.0.0.1", args.port), server.Handler)
