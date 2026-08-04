@@ -1,6 +1,6 @@
 """Live battle sync — keeps the DB in sync with the WarEra API's active battles.
 
-Runs on the website's 15-second auto-update cycle (extra/db_web.py, between
+Runs on the website's 15-second auto-update cycle (Python/db_web.py, between
 update_battles.py and insert_ranking_sample.py) or standalone:
 
     python Python/update_live.py                  # full live sync
