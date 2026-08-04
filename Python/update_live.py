@@ -120,7 +120,7 @@ def db_active_hexes() -> list[str]:
 
 
 def reconcile_and_mark_ended(s: requests.Session, live: list[dict],
-                             db_active: list[str]) -> tuple[int, int]:
+                             db_active: list[str]) -> tuple[list[tuple[str, str]], list[dict]]:
     """DB-active battles missing from the API's active list → getById check.
 
     Returns (marked_ended, upserted_docs) — one psql call batches all updates.
@@ -239,7 +239,7 @@ def fetch_live_rankings(s: requests.Session, battles: list[dict]) -> tuple[int, 
         stmts = []
         buf_n = 0
 
-    def fetch_body(bodies: list[dict]) -> tuple[list[list], int]:
+    def fetch_body(bodies: dict) -> tuple[list[dict], int]:
         """One batched request. On batch failure, probe with a single call:
         if the probe also fails the whole endpoint is down (it intermittently
         400s for minutes at a time when ranking docs are rewritten at battle

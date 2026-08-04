@@ -79,6 +79,13 @@ The API authenticates with a generated API token (`x-api-key: wae_...` header) a
 from the `WARERA_API_KEY` environment variable, falling back to
 `~/.config/warera/api_key.txt` (plain text, 0600). The token is never stored in the repo.
 
+### Dev setup
+
+```bash
+.venv/bin/pip install -r requirements.txt
+.venv/bin/pyright Python/ extra/     # static type check (Pylance uses the same rules)
+```
+
 ### Testing on a scratch DB
 
 All three loaders accept a `BATTLE_DB` env var (or `--db` flag) to target a
