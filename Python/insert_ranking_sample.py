@@ -37,6 +37,7 @@ import requests
 import endpoint_log
 from api import batched_fetch, make_session
 from db import (
+    battle_summary_stmts,
     esc,
     exec_many,
     flush_endpoint_log,
@@ -205,6 +206,9 @@ def finish(battle, items):
             blk.append(entry_stmt(battle, int(num), side, typ, ent,
                                   dmg, pts, mon, loot, created, round_table=True))
     blk.extend(cleanup_stmts(battle))
+    # user_battle_stats for this battle, in the SAME flush as the upserts +
+    # cleanup deletes (exact by construction — the /user page reads it).
+    blk.extend(battle_summary_stmts([battle]))
     return blk, slots
 
 
