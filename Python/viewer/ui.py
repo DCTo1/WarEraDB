@@ -46,6 +46,77 @@ THEME_JS = """<script>
 })();
 </script>"""
 
+NAV_JS = """<script>
+(function () {
+  // Pjax-style navigation (2026-08-04): internal link clicks and GET form
+  // submits fetch the server-rendered page and swap only <main id="main">,
+  // so the header (timer, theme) and the page frame never reload. Falls back
+  // to a full navigation on any failure or when JS is disabled. The
+  // /update-status auto-refresh (meta http-equiv=refresh) is re-implemented
+  // here: the meta is removed from the head on load and the URL re-fetched
+  // with pjax while it stays present.
+  var main = document.getElementById('main');
+  if (!main) return;
+  var timer = null;
+  var scheme = /^[a-z][a-z0-9+.-]*:/i;
+  function schedule(url, secs) {
+    if (timer) { clearTimeout(timer); timer = null; }
+    timer = setTimeout(function () { nav(url, false); }, secs * 1000);
+  }
+  function swap(html, url, push) {
+    var doc = new DOMParser().parseFromString(html, 'text/html');
+    var fresh = doc.getElementById('main');
+    if (!fresh) { location.href = url; return; }
+    var t = doc.querySelector('title');
+    if (t) document.title = t.textContent;
+    main.innerHTML = fresh.innerHTML;
+    if (push) history.pushState({url: url}, '', url);
+    window.scrollTo(0, 0);
+    var meta = doc.querySelector('meta[http-equiv="refresh"]');
+    if (meta) schedule(url, parseInt((meta.getAttribute('content') || '2'), 10) || 2);
+    else if (timer) { clearTimeout(timer); timer = null; }
+  }
+  function nav(url, push) {
+    if (timer) { clearTimeout(timer); timer = null; }
+    fetch(url).then(function (r) {
+      if (!r.ok) { location.href = url; return; }
+      return r.text();
+    }).then(function (html) {
+      if (html) swap(html, url, push === undefined ? true : push);
+    }).catch(function () { location.href = url; });
+  }
+  document.addEventListener('click', function (e) {
+    if (e.defaultPrevented || e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
+    var a = e.target.closest ? e.target.closest('a[href]') : null;
+    if (!a || a.target || a.hasAttribute('download')) return;
+    var href = a.getAttribute('href');
+    if (!href || href.charAt(0) === '#' || scheme.test(href)) return;
+    e.preventDefault();
+    nav(href);
+  });
+  document.addEventListener('submit', function (e) {
+    if (e.defaultPrevented) return;
+    var f = e.target;
+    if (!f || !f.elements || (f.method && f.method.toLowerCase() !== 'get')) return;
+    var action = f.getAttribute('action');
+    if (action && scheme.test(action)) return;
+    var url = action || location.pathname;
+    var qs = new URLSearchParams(new FormData(f)).toString();
+    if (qs) url += (url.indexOf('?') !== -1 ? '&' : '?') + qs;
+    e.preventDefault();
+    nav(url);
+  });
+  window.addEventListener('popstate', function (e) {
+    nav(e.state && e.state.url ? e.state.url : location.href, false);
+  });
+  var meta = document.querySelector('meta[http-equiv="refresh"]');
+  if (meta) {
+    meta.parentNode.removeChild(meta);
+    schedule(location.href, parseInt((meta.getAttribute('content') || '2'), 10) || 2);
+  }
+})();
+</script>"""
+
 STYLES = """
   :root {
     --bg: #121417; --panel: #1b1e23; --border: #2a2e36; --text: #e6e8eb;
@@ -134,6 +205,7 @@ def layout(title: str, body: str, refresh: bool = False) -> str:
 <nav><a href="/">Overview</a><a href="/battles">Battles</a>
 <a href="/users">Users</a><a href="/bounties">Bounties</a><a href="/countries">Countries</a>
 <a href="/stats">Stats</a><a href="/sql">SQL</a></nav>
-<hr>{body}
+<hr><main id="main">{body}</main>
 {TIMER_JS}
-{THEME_JS}</body></html>"""
+{THEME_JS}
+{NAV_JS}</body></html>"""
