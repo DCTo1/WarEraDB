@@ -14,6 +14,7 @@ def page_overview(q: dict) -> str:
         " (SELECT COUNT(*) FROM countries) AS countries,"
         " (SELECT COUNT(*) FROM transactions) AS transactions,"
         " (SELECT COUNT(*) FROM users) AS users,"
+        " (SELECT COUNT(*) FROM users WHERE lite_checked_at IS NOT NULL) AS users_lite,"
         " (SELECT COUNT(*) FROM battles WHERE ended_at IS NULL) AS active")
     if err:
         return error_page(err)
@@ -35,6 +36,9 @@ def page_overview(q: dict) -> str:
     cards = "".join(
         f'<div class="card"><div class="num">{c[k]:,}</div><div class="lbl">{k}</div></div>'
         for k in ("battles", "rounds", "bounty_sides", "countries", "users", "transactions"))
+    cards += (f'<div class="card" title="users backfilled via user.getUserLite">'
+              f'<div class="num">{c.get("users_lite", 0):,}</div>'
+              f'<div class="lbl">users lite</div></div>')
     cards += (f'<a href="/battles?status=active"><div class="card"><div class="num">'
               f'{c.get("active", 0):,}</div><div class="lbl">active →</div></div></a>')
     rows = "".join(
