@@ -77,11 +77,21 @@ done
 
 # Live battle sync (active battles + reconciliation) — runs automatically on
 # the web viewer's 15 s cycle; standalone use: add --skip-rankings to skip
-# the per-entity live rankings
+# the per-entity live rankings (pipelined + batched, capped at the top 300
+# per ranking — the final end-of-battle fetch completes them)
 .venv/bin/python Python/update_live.py
 
-# Incremental user.getUserLite backfill (unchecked users, wealth/damage
-# rankings first — runs automatically on the viewer's cycle too)
+# Incremental user.getUserLite: backfills unchecked users (wealth/damage
+# rankings first) until the queue drains, then switches to an active-user
+# refresh — only users active within the last 4 days (users.last_active_at =
+# creation date of the last round they participated in, migration_11 — a
+# lower-bound approximation, replaced by the real getUserLite
+# dates.lastConnectionAt on every fetch) are re-fetched, ≤50 per cycle (one
+# batched request), ≥48 h apart, "just came back" users first; inactive
+# accounts are never requested. last_active_at is kept close by an activity
+# check every 2 h (--check-interval, min 1 h; state in
+# Python/users_lite_state.json): recent rounds raise it, raise-only. Runs
+# automatically on the viewer's cycle too.
 .venv/bin/python Python/update_users_lite.py --limit 100
 
 # Seed the endpoint registry (idempotent; new endpoints auto-register anyway)
@@ -120,9 +130,11 @@ WARERA_DB_URL='postgresql+psycopg://postgres:postgres@localhost:5433/{db}' \
 ### Web viewer (optional)
 
 Local read-only web viewer + auto-updater (battles/rounds/countries, live
-battle sync, rankings, users, bounties — every 15 s; the cycle also
-backfills user.getUserLite basic info for up to 100 unchecked users per run,
-wealth/damage rankings first):
+battle sync, rankings, users, bounties — every 15 s; the cycle also runs
+update_users_lite.py: backfills user.getUserLite basic info for up to 100
+unchecked users per run, wealth/damage rankings first, then re-checks users
+active within 4 days only — users.last_active_at, ≤50 per cycle, ≥48 h
+apart, real lastConnectionAt stored on fetch, activity check every 2 h):
 
 ```bash
 # WARERA_DB_URL must be set in the viewer's environment: the auto-updater
@@ -159,6 +171,7 @@ remember the `WARERA_DB_URL` override applies there too.
 | `countries` | Current-state country snapshot (no history) | `country_id` (= `inventory_ids.id`), `name`, `code`, population, development, taxes |
 | `battle_ranking_entries` | Battle-level rankings (attacker/defender since 2025-05, merged since 2026-03-29) | `battle_id` (int FK), `side` (1=attacker, 2=defender, **3=merged — exceptions only**, the API-official values that differ from the side sums), `entity_type` (1=user, 2=country, 3=mu), `entity_id` (FK `inventory_ids`), `damage`, `points`, `money`, `loot_item_id` (FK `items`), `created_at` |
 | `round_ranking_entries` | Round-level rankings | same + `round_number`; PK `(created_at, battle_id, round_number, side, entity_type, entity_id)` (hypertable partition col in the unique index); side=3 = exceptions only |
+| `user_battle_stats` | Per (user, battle, side) ranking totals — the /user page reads this instead of scanning the compressed hypertable per entity | PK `(user_id, battle_id, side)`, damage/points/money/entries sums; maintained by the ranking writers (rebuild per touched battle, exact) |
 
 Naming convention: `*_id` columns are INT FKs into `inventory_ids`; bare UUID
 columns (regions, tournament teams) are raw API ObjectIDs — those entities
