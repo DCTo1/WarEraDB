@@ -377,5 +377,37 @@ CREATE TABLE users (
     total_xp        INTEGER NULL,                             -- getUserLite leveling.totalXp
     military_rank   SMALLINT NULL,                            -- getUserLite militaryRank (numeric)
     username        TEXT NULL,                                -- getUserLite username
-    lite_checked_at TIMESTAMPTZ NULL                          -- last successful getUserLite fetch
+    lite_checked_at TIMESTAMPTZ NULL,                         -- last successful getUserLite fetch
+    last_active_at  TIMESTAMPTZ NULL                          -- creation date of the last round the
+                                                              -- user participated in (round_ranking_
+                                                              -- entries; lower-bound approximation,
+                                                              -- replaced by getUserLite dates.
+                                                              -- lastConnectionAt when available);
+                                                              -- NULL = never fought (inactive).
+                                                              -- Refresh pool: within 4 days.
+);
+
+
+-- =============================================================================
+-- 9. User battle stats
+--
+-- Per (user, battle, side) ranking totals — the /user page reads this instead
+-- of scanning the compressed battle-ranking hypertable per entity (compressed
+-- chunks carry no per-entity index, so a page scan reads ~8M rows / ~0.6 s;
+-- this makes cold loads ~10 ms). Maintained by the ranking writers
+-- (update_live.py, insert_ranking_sample.py) as a DELETE + INSERT-from-source
+-- per touched battle, appended to the same flush as the ranking writes
+-- (db.battle_summary_stmts) — exact by construction. Backfilled by
+-- migration_12.
+-- =============================================================================
+
+CREATE TABLE user_battle_stats (
+    user_id   INT NOT NULL REFERENCES inventory_ids(id),
+    battle_id INT NOT NULL REFERENCES battles(id),
+    side      SMALLINT NOT NULL CHECK (side IN (1, 2)),
+    damage    BIGINT NOT NULL DEFAULT 0,
+    points    INT NOT NULL DEFAULT 0,
+    money     DOUBLE PRECISION NOT NULL DEFAULT 0,
+    entries   INT NOT NULL DEFAULT 0,
+    PRIMARY KEY (user_id, battle_id, side)
 );
