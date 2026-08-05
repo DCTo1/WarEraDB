@@ -29,9 +29,17 @@ Per run:
      live battles (damages, hit counts, won rounds).
   4. Per-entity battle rankings for live battles: dataTypes damage/points ×
      sides attacker/defender × types user/country/mu, limit=100 + cursor
-     pagination, batched <=50 calls per request, upserted via
-     insert_battle_ranking_entry. Rows are partial while the battle runs and
-     are overwritten by the final end-of-battle fetch.
+     pagination — batched (<=BODY_CAP calls/request) AND continuously
+     pipelined (WORKERS=16 requests in flight; the walk was sequential until
+     2026-08-04 and one sync of the live battles took 30-60 s), upserted via
+     insert_battle_ranking_entry on a background flusher thread (the DB
+     writes no longer stall the API walk). Pagination is capped at LIVE_PAGES
+     (3) per combo: the rows are partial by design (the final end-of-battle
+     fetch overwrites them) and the site only shows the top of each ranking,
+     so deep pages would only buy discarded rows — the API takes ~25 s to
+     serve 46K entries of them every sync, vs ~10 s for the capped walk.
+     Rows are partial while the battle runs and are overwritten by the final
+     end-of-battle fetch.
 
 Not fetched live (only materialize at round/battle end): round rankings,
 loot finalization, battle endedAt/wonBy fields.
@@ -42,8 +50,12 @@ Exit codes: 0 success, 1 API/auth failure, 2 DB failure.
 import argparse
 import json
 import os
+import queue
 import sys
 import time
+import threading
+from collections import deque
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 
 import requests
 
@@ -51,7 +63,9 @@ import endpoint_log
 from api import batched_fetch, make_session
 from db import (
     active_battle_hexes,
+    battle_summary_stmts,
     esc,
+    exec_batch,
     exec_many,
     flush_endpoint_log,
     loot_sql,
@@ -73,6 +87,12 @@ STATE_FILE = os.path.join(BASE_DIR, "live_state.json")
 FLUSH = 20000
 FUTURE_CURSOR = "2099-01-01T00:00:00Z"
 RANKING_INTERVAL = 300  # seconds between per-entity ranking syncs (default)
+WORKERS = 16            # concurrent batched requests during the ranking walk
+BODY_CAP = 20           # calls per batched request in the walk (<= MAX_BATCH;
+                        # smaller bodies keep the pool saturated: with ~240
+                        # live combos and bodies of 50 only ~5 requests fit
+                        # in flight at once)
+LIVE_PAGES = 3          # pagination depth cap per live combo (300 entries).
 
 DATA_TYPES = ("damage", "points")
 
@@ -126,6 +146,9 @@ def reconcile_and_mark_ended(s: requests.Session, live: list[dict],
                   f"WHERE battle_id = (SELECT id FROM battles WHERE battle_id = objectid_to_uuid('{h}'))"
                   f"  AND created_at > now() - interval '7 days';"
                   for h, _ in marked]
+        # user_battle_stats for the ended battles: rows are gone (or ancient
+        # leftovers) — DELETE + INSERT-from-source is a no-op either way.
+        stmts += battle_summary_stmts([h for h, _ in marked])
         exec_many(stmts, dbname)
         for h, ts in marked:
             print(f"  ended + rows cleared: {h} (ended_at={ts})", flush=True)
@@ -188,11 +211,34 @@ def fetch_live_rankings(s: requests.Session, battles: list[dict], dbname: str) -
     entries_n = 0
     requests_n = 0
 
+    # DB writes run on a flusher thread so the API walk never pauses for
+    # them: exec_batch of ~20K upserts takes 5-13 s, and before this the
+    # walk ground to a halt while each flush ran inline (the ranking
+    # requests idle during that time).
+    flush_q: queue.Queue = queue.Queue()
+    db_errors: list[str] = []
+
+    def flusher_loop() -> None:
+        while True:
+            batch = flush_q.get()
+            if batch is None:
+                flush_q.task_done()
+                return
+            try:
+                exec_batch(batch, dbname)
+            except RuntimeError as exc:
+                db_errors.append(str(exc))
+            flush_q.task_done()
+
+    flusher = threading.Thread(target=flusher_loop, daemon=True)
+    flusher.start()
+
     def flush() -> None:
+        """Hand the buffered upsert statements to the flusher thread."""
         nonlocal stmts, buf_n
         if not stmts:
             return
-        exec_many(stmts, dbname)
+        flush_q.put(stmts)
         stmts = []
         buf_n = 0
 
@@ -224,65 +270,45 @@ def fetch_live_rankings(s: requests.Session, battles: list[dict], dbname: str) -
                     out.append({"error": {"message": str(e2)}})
             return out, failed
 
-    pending = [(b["_id"], dt, typ, side)
-               for b in battles for dt in DATA_TYPES for typ in ENTITY for side in SIDE]
+    pending = deque((b["_id"], dt, typ, side)
+                    for b in battles for dt in DATA_TYPES for typ in ENTITY for side in SIDE)
+    active = set(pending)  # combos with pages still to fetch (pending or in flight)
     cursors: dict = {}
     items: dict = {}
-    pos = 0
+    inflight: dict = {}    # future -> body (combo -> payload)
+    requests_done = 0
     t0 = time.time()
     combo_failed = 0
     aborted = False
-    while pos < len(pending):
-        wave = pending[pos:pos + MAX_BATCH * 8]
-        pos += len(wave)
-        bodies = []
-        for off in range(0, len(wave), MAX_BATCH):
-            chunk = wave[off:off + MAX_BATCH]
-            bodies.append({c: {"battleId": c[0], "dataType": c[1], "type": c[2],
-                               "side": c[3], "limit": PAGE_LIMIT}
-                           | ({"cursor": cursors[c]} if c in cursors else {})
-                           for c in chunk})
-        results = []
-        for b in bodies:
-            try:
-                results.append(fetch_body(b))
-            except EndpointDown as exc:
-                print(f"  ranking endpoint down ({exc}) — aborting ranking sync "
-                      f"(retry next cycle)", file=sys.stderr)
-                aborted = True
-                break
-        if aborted:
-            break
-        requests_n += len(bodies)
-        wave_failed = 0
-        for body, (data, failed) in zip(bodies, results):
-            wave_failed += failed
-            for c, res in zip(body.keys(), data):
-                if "error" in res:
-                    wave_failed += 1
-                    continue
-                d = res["result"]["data"]
-                items.setdefault(c, []).extend(d.get("items", []))
-                nc = d.get("nextCursor")
-                if nc and (not d.get("itemCount") or len(items[c]) < d["itemCount"]):
-                    cursors[c] = nc
-                    pending.append(c)
-                else:
-                    cursors.pop(c, None)
-        combo_failed += wave_failed
-        # The ranking endpoint intermittently 400s for minutes at a time
-        # (ranking docs rewritten at battle end). If most combos fail, the
-        # endpoint is down — abort and let the next cycle retry.
-        if wave_failed > len(wave) / 2:
-            print(f"  ranking endpoint flaky: {wave_failed}/{len(wave)} combos failed "
-                  f"— aborting ranking sync (retry next cycle)", file=sys.stderr)
-            aborted = True
-            break
-        time.sleep(0.05)
-        # drain finished combos
+    # Batched (<=MAX_BATCH calls/request) AND continuously pipelined (WORKERS
+    # requests in flight, new pages submitted the moment one completes): the
+    # walk used to send requests one at a time, making a sync of the ~19 live
+    # battles take 30-60 s (1000+ calls); wave batching improved that but the
+    # wave barrier still idled the pool between pagination rounds. The session
+    # is thread-safe for parallel requests.
+    pool = ThreadPoolExecutor(max_workers=WORKERS)
+
+    def fill() -> None:
+        """Submit batched bodies until the pool is full or no work is left."""
+        nonlocal requests_n
+        while pending and len(inflight) < WORKERS:
+            body: dict = {}
+            while pending and len(body) < BODY_CAP:
+                c = pending.popleft()
+                payload = {"battleId": c[0], "dataType": c[1], "type": c[2],
+                           "side": c[3], "limit": PAGE_LIMIT}
+                if c in cursors:
+                    payload["cursor"] = cursors[c]
+                body[c] = payload
+            if body:
+                inflight[pool.submit(fetch_body, body)] = body
+                requests_n += 1
+
+    def drain() -> None:
+        """Turn finished combos' accumulated items into upsert statements."""
+        nonlocal buf_n, entries_n
         for c in list(items):
-            total = len(items[c])
-            if c in cursors or total == 0:
+            if c in active:
                 continue
             for it in items[c]:
                 ent = it.get("user") or it.get("country") or it.get("mu")
@@ -299,11 +325,71 @@ def fetch_live_rankings(s: requests.Session, battles: list[dict], dbname: str) -
             del items[c]
             if len(stmts) >= FLUSH:
                 flush()
-        if pos % (MAX_BATCH * 8) == 0:
-            print(f"  ranking walk: {pos}/{len(pending)} queued, "
-                  f"{sum(len(v) for v in items.values())} items, "
-                  f"{len(stmts)} stmts, {time.time() - t0:.0f}s", flush=True)
+
+    try:
+        fill()
+        while inflight:
+            done, _ = wait(list(inflight), return_when=FIRST_COMPLETED)
+            for fut in done:
+                body = inflight.pop(fut)
+                try:
+                    data, failed = fut.result()
+                except EndpointDown as exc:
+                    print(f"  ranking endpoint down ({exc}) — aborting ranking sync "
+                          f"(retry next cycle)", file=sys.stderr)
+                    aborted = True
+                    inflight.clear()
+                    break
+                combo_failed += failed
+                for c, res in zip(body.keys(), data):
+                    if "error" in res:
+                        combo_failed += 1
+                        continue
+                    d = res["result"]["data"]
+                    items.setdefault(c, []).extend(d.get("items", []))
+                    nc = d.get("nextCursor")
+                    # LIVE_PAGES cap: the walk's rows are partial by design
+                    # (the final end-of-battle fetch overwrites them) and the
+                    # site only shows the top of each ranking, so deep
+                    # pagination would only buy discarded rows — while the
+                    # API takes ~25 s to serve 46K entries of it every sync.
+                    if (nc and (not d.get("itemCount") or len(items[c]) < d["itemCount"])
+                            and len(items[c]) < LIVE_PAGES * PAGE_LIMIT):
+                        cursors[c] = nc
+                        pending.append(c)
+                    else:
+                        cursors.pop(c, None)
+                        active.discard(c)
+                # The ranking endpoint intermittently 400s for minutes at a
+                # time (ranking docs rewritten at battle end). If most calls
+                # of a request fail, the endpoint is down — abort and let the
+                # next cycle retry.
+                if failed > len(body) / 2:
+                    print(f"  ranking endpoint flaky: {failed}/{len(body)} calls failed "
+                          f"— aborting ranking sync (retry next cycle)", file=sys.stderr)
+                    aborted = True
+                    inflight.clear()
+                    break
+                drain()
+                fill()
+            if aborted:
+                break
+            requests_done += len(done)
+            if requests_done % (MAX_BATCH * 8) == 0:
+                print(f"  ranking walk: {requests_done} requests done, "
+                      f"{sum(len(v) for v in items.values())} items buffered, "
+                      f"{len(stmts)} stmts, {time.time() - t0:.0f}s", flush=True)
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
+    # Rebuild the /user page's summary (user_battle_stats) for the walked
+    # battles — appended AFTER their upserts so the flusher runs it after
+    # them (FIFO queue).
+    stmts.extend(battle_summary_stmts(hexes))
     flush()
+    flush_q.put(None)  # stop the flusher, then wait for its remaining work
+    flusher.join()
+    if db_errors:
+        raise RuntimeError(db_errors[0])
     if aborted or combo_failed:
         print(f"  ranking walk: {combo_failed} combos failed (partial sync)",
               file=sys.stderr)
