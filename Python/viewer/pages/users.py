@@ -18,7 +18,15 @@ def page_users(q: dict) -> str:
         page = max(0, int(q.get("page", ["0"])[0]))
     except ValueError:
         page = 0
-    where = f" WHERE username ILIKE '%{search.replace(chr(39), chr(39) + chr(39))}%'" if search else ""
+    # psycopg parses % as placeholders in the SQL string, so every literal %
+    # must be doubled (%%); the ESCAPE clause keeps the user's own % and _
+    # literal instead of acting as LIKE wildcards.
+    if search:
+        like = (search.replace("\\", "\\\\").replace("'", "''")
+                .replace("%", "\\%%").replace("_", "\\_"))
+        where = f" WHERE username ILIKE '%%{like}%%' ESCAPE '\\'"
+    else:
+        where = ""
     rows, err = query_dicts(
         "SELECT lower(uuid_to_objectid(user_id)) AS user_id, username,"
         " user_damages, user_bounty, user_wealth, total_xp, military_rank"
