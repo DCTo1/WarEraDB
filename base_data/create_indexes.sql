@@ -92,3 +92,16 @@
 -- Per-day trends (calls per day / per hour)
 -- CREATE INDEX IF NOT EXISTS idx_endpoints_used_date
 --     ON endpoints_used (date_used);
+
+-- =============================================================================
+--  Users
+--
+--  The user-lite picker queries users by activity window: last_active_at >
+--  now - 4 days, ordered by lite_checked_at age + wealth. A 101K-row seq
+--  scan + sort is a few ms, so nothing here is needed yet.
+-- =============================================================================
+
+-- Active-pool picker (users active within 4 days)
+-- CREATE INDEX IF NOT EXISTS idx_users_last_active
+--     ON users (last_active_at);
+
