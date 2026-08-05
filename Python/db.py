@@ -12,6 +12,7 @@ API
     query_dicts(sql) -> list[dict]   # one SELECT; rows as dicts (web viewer)
     scalar(sql)                      # first column of the first row
     exec_many(stmts, pre="") -> int  # run each statement in ONE transaction
+    exec_batch(stmts, pre="")        # same, but statements sent in bulk
     exec_sql(sql)                    # run one single statement
     flush_endpoint_log()             # flush queued endpoint usages
 
@@ -122,6 +123,26 @@ def exec_many(stmts: list[str], db: str | None = None, pre: str = "") -> int:
 
 
 @_as_db_error
+def exec_batch(stmts: list[str], db: str | None = None, pre: str = "",
+               chunk: int = 1000) -> None:
+    """Run statements in ONE transaction, `chunk` of them per round trip.
+
+    For pure-INSERT batches (upsert function calls) where per-statement
+    rowcounts don't matter: psycopg only surfaces the LAST result set of a
+    multi-statement string, but every statement runs. Sending 20K
+    statements as 1000-per-string turns 20K round trips into 20 — the live
+    ranking walk's flush used to spend 8-12 s per 20K statements purely in
+    round trips (exec_many sends each statement individually).
+    """
+    with engine(db).begin() as conn:
+        _flush_endpoint_log(conn)
+        if pre:
+            conn.exec_driver_sql(pre)
+        for i in range(0, len(stmts), chunk):
+            conn.exec_driver_sql(";\n".join(stmts[i:i + chunk]) + ";")
+
+
+@_as_db_error
 def exec_sql(sql: str, db: str | None = None) -> Result | None:
     """Run a single statement (no transaction grouping needed)."""
     with engine(db).begin() as conn:
@@ -137,6 +158,30 @@ def flush_endpoint_log(db: str | None = None) -> None:
 
 
 # ── SQL literal helpers ──────────────────────────────────────────────────
+
+def battle_summary_stmts(battle_hexes: list[str]) -> list[str]:
+    """Statements recomputing user_battle_stats for the given battles.
+
+    DELETE + INSERT-from-source per battle — exact by construction (the /user
+    page reads this table instead of scanning the compressed ranking
+    hypertable per entity). Append them to the same flush as the ranking
+    writes (insert_ranking_sample.py finish(), update_live.py walk/reconcile)
+    so the summary can never drift from battle_ranking_entries.
+    """
+    out: list[str] = []
+    for h in battle_hexes:
+        out.append("DELETE FROM user_battle_stats WHERE battle_id ="
+                   f" (SELECT id FROM battles WHERE battle_id = objectid_to_uuid('{h}'));")
+        out.append(
+            "INSERT INTO user_battle_stats (user_id, battle_id, side,"
+            " damage, points, money, entries)\n"
+            f"SELECT r.entity_id, r.battle_id, r.side, COALESCE(SUM(r.damage), 0)::bigint,"
+            f" COALESCE(SUM(r.points), 0)::int, COALESCE(SUM(r.money), 0)::float8, COUNT(*)\n"
+            "FROM battle_ranking_entries r\n"
+            f"WHERE r.battle_id = (SELECT id FROM battles WHERE battle_id = objectid_to_uuid('{h}'))\n"
+            "  AND r.entity_type = 1 AND r.side IN (1, 2)\n"
+            "GROUP BY r.entity_id, r.battle_id, r.side;")
+    return out
 
 def esc(v) -> str:
     """Escape a string for inclusion in a SQL literal."""
