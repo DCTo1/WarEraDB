@@ -94,6 +94,23 @@ done
 # automatically on the viewer's cycle too.
 .venv/bin/python Python/update_users_lite.py --limit 100
 
+# Official weekly-ranking snapshots (weeklyUserDamages / weeklyCountryDamages
+# / muWeeklyDamages) stored at xx:01 every hour (self-throttled; state in
+# Python/weekly_ranking_state.json), finished weeks pruned to their per-entity
+# final value at each Monday rollover. Every web cycle a straddler reconcile
+# moves the post-reset portion of users' reset-straddling rounds to the
+# correct week — gated by inactivity (no pre-reset-started active battles,
+# official value stable across the last 2 snapshots, user.getUserLite
+# lastConnectionAt ≥ 2 h old, 100 checks per cycle, one-time per settled
+# user; stored in user_weekly_corrections, re-applied by every rebuild),
+# and an audit re-verifies saved corrections and stamps verified_at.
+# --backfill rebuilds the derived user_weekly_damage table from round rows
+# (bucketed by the week of the round's start, + corrections); --verify
+# reports snapshot + derived-vs-official stats. Runs automatically on the
+# viewer's cycle (--weekly 0 disables).
+.venv/bin/python Python/update_weekly_ranking.py
+.venv/bin/python Python/update_weekly_ranking.py --backfill
+
 # Seed the endpoint registry (idempotent; new endpoints auto-register anyway)
 .venv/bin/python Python/seed_endpoints.py
 ```
@@ -172,6 +189,9 @@ remember the `WARERA_DB_URL` override applies there too.
 | `battle_ranking_entries` | Battle-level rankings (attacker/defender since 2025-05, merged since 2026-03-29) | `battle_id` (int FK), `side` (1=attacker, 2=defender, **3=merged — exceptions only**, the API-official values that differ from the side sums), `entity_type` (1=user, 2=country, 3=mu), `entity_id` (FK `inventory_ids`), `damage`, `points`, `money`, `loot_item_id` (FK `items`), `created_at` |
 | `round_ranking_entries` | Round-level rankings | same + `round_number`; PK `(created_at, battle_id, round_number, side, entity_type, entity_id)` (hypertable partition col in the unique index); side=3 = exceptions only |
 | `user_battle_stats` | Per (user, battle, side) ranking totals — the /user page reads this instead of scanning the compressed hypertable per entity | PK `(user_id, battle_id, side)`, damage/points/money/entries sums; maintained by the ranking writers (rebuild per touched battle, exact) |
+| `weekly_ranking_snapshots` | Official copies of the game's weekly ranking (hourly `ranking.getRanking` fetches; current week displayed, finished weeks pruned to per-entity finals at rollover) | PK `(entity_type, entity_id, week_start, snapshot_at)`, `value`, `rank`, `tier`; hypertable, compressed |
+| `user_weekly_damage` | Derived per-user weekly damage (bucketed by the week of the round's start; damage tracker + fallback) | PK `(user_id, week_start)`, `damage`; rebuilt at battle end + `--backfill`; = round rows + `user_weekly_corrections` |
+| `user_weekly_corrections` | Signed per-week adjustments fixing the reset-straddling attribution (from official snapshots, only for settled users) | PK `(user_id, week_start)`, `damage` signed, `corrected_at`, `verified_at` (audit stamp); applied by every rebuild |
 
 Naming convention: `*_id` columns are INT FKs into `inventory_ids`; bare UUID
 columns (regions, tournament teams) are raw API ObjectIDs — those entities
@@ -229,5 +249,5 @@ ORDER BY r.rank LIMIT 20;
 | Path | Purpose |
 |---|---|
 | `base_data/` | Schema DDL (`create_tables.sql`), PL/pgSQL functions (`functions.sql`), indexes, views |
-| `Python/` | Battle tooling: shared modules (`api.py` WarEra API client, `db.py` SQLAlchemy DB access + SQL helpers, `utils.py` time/state/constants + `prepare_transaction()`, `endpoint_log.py`) + the CLI scripts (`update_battles.py`, `update_live.py`, `update_countries.py`, `insert_ranking_sample.py`, `update_users.py`, `update_users_lite.py`, `seed_endpoints.py`) + the web viewer (`db_web.py` entry point and the `viewer/` package with its pages) |
+| `Python/` | Battle tooling: shared modules (`api.py` WarEra API client, `db.py` SQLAlchemy DB access + SQL helpers, `utils.py` time/state/constants + `prepare_transaction()`, `endpoint_log.py`) + the CLI scripts (`update_battles.py`, `update_live.py`, `update_countries.py`, `insert_ranking_sample.py`, `update_users.py`, `update_users_lite.py`, `update_weekly_ranking.py`, `seed_endpoints.py`) + the web viewer (`db_web.py` entry point and the `viewer/` package with its pages, incl. the `/tracker` damage tracker and the `/weekly` rankings) |
 | `data/battle_timestamps.json` | Battle timestamp index for batched pagination (oldest-first, append-only) |

@@ -183,6 +183,68 @@ def battle_summary_stmts(battle_hexes: list[str]) -> list[str]:
             "GROUP BY r.entity_id, r.battle_id, r.side;")
     return out
 
+def weekly_damage_stmts(battle_hex: str) -> list[str]:
+    """Statements rebuilding user_weekly_damage for the weeks a battle's
+    rounds fall in.
+
+    The table has NO battle dimension (per (user, week) totals across ALL
+    battles), so a per-battle delete+insert of the battle's own rows would
+    drop the users' other-battle damage. Instead the AFFECTED WEEKS are
+    rebuilt from source for all users (DELETE + INSERT-from-source of the
+    deduped round rows JOIN rounds, sides 1+2, entity_type 1) — exact by
+    construction and self-healing. A battle's rounds span at most 2 weeks,
+    so each rebuild is one small transaction. Appended to the battle-end
+    flush (insert_ranking_sample.py finish()) — never run for active battles
+    (round rows exist only for ended battles by design, HISTORIC_RANKING.md
+    §4). The rre.created_at window is a chunk-pruning over-approximation
+    ONLY: a round STARTED in week W gets its ranking rows at the battle-end
+    fetch — up to a full week + battle duration after the round start (the
+    current week's battles ending on day 4-7 of the week proved +3 days too
+    tight, 2026-08-06), so the upper bound is a generous +14 days; the exact
+    filter is rounds.created_at (the bucketing key).
+
+    The rebuild is "round rows + straddle corrections": the INSERT LEFT JOINS
+    user_weekly_corrections (signed adjustments computed by
+    update_weekly_ranking.py --reconcile from the official snapshots) so the
+    correction survives every rebuild, and a fill statement materializes
+    correction-only rows (users whose adjusted week has no round rows, e.g.
+    a user whose only week damage is the post-reset straddler portion)."""
+    weeks = (
+        "SELECT DISTINCT date_trunc('week', r.created_at AT TIME ZONE 'UTC')"
+        " AT TIME ZONE 'UTC' AS wk\n"
+        f"FROM rounds r WHERE r.battle_id = objectid_to_uuid('{esc(battle_hex)}')")
+    return [
+        "DELETE FROM user_weekly_damage uwd USING (" + weeks + ") w\n"
+        "WHERE uwd.week_start = w.wk;",
+        "INSERT INTO user_weekly_damage (user_id, week_start, damage)\n"
+        "SELECT rre.entity_id,\n"
+        "       date_trunc('week', r.created_at AT TIME ZONE 'UTC') AT TIME ZONE 'UTC',\n"
+        "       SUM(rre.damage)::bigint + COALESCE(MAX(c.damage), 0)\n"
+        "FROM round_ranking_entries rre\n"
+        "JOIN battles b ON b.id = rre.battle_id\n"
+        "JOIN rounds r ON r.battle_id = b.battle_id AND r.number = rre.round_number\n"
+        "LEFT JOIN user_weekly_corrections c\n"
+        "  ON c.user_id = rre.entity_id\n"
+        " AND c.week_start = date_trunc('week', r.created_at AT TIME ZONE 'UTC')"
+        " AT TIME ZONE 'UTC'\n"
+        "WHERE rre.side IN (1, 2) AND rre.entity_type = 1 AND rre.damage IS NOT NULL\n"
+        "  AND date_trunc('week', r.created_at AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'\n"
+        "      IN (SELECT wk FROM (" + weeks + ") w)\n"
+        "  AND rre.created_at >= (SELECT MIN(wk) - INTERVAL '2 days' FROM (" + weeks + ") w)\n"
+        "  AND rre.created_at <  (SELECT MAX(wk) + INTERVAL '14 days' FROM (" + weeks + ") w)\n"
+        "GROUP BY 1, 2\n"
+        "ON CONFLICT (user_id, week_start) DO UPDATE SET damage = EXCLUDED.damage;",
+        "INSERT INTO user_weekly_damage (user_id, week_start, damage)\n"
+        "SELECT c.user_id, c.week_start, c.damage\n"
+        "FROM user_weekly_corrections c\n"
+        "WHERE c.damage <> 0\n"
+        "  AND c.week_start IN (SELECT wk FROM (" + weeks + ") w)\n"
+        "  AND NOT EXISTS (SELECT 1 FROM user_weekly_damage uwd\n"
+        "                  WHERE uwd.user_id = c.user_id\n"
+        "                    AND uwd.week_start = c.week_start)\n"
+        "ON CONFLICT (user_id, week_start) DO NOTHING;",
+    ]
+
 def esc(v) -> str:
     """Escape a string for inclusion in a SQL literal."""
     return str(v).replace("'", "''")

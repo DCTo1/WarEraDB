@@ -411,3 +411,113 @@ CREATE TABLE user_battle_stats (
     entries   INT NOT NULL DEFAULT 0,
     PRIMARY KEY (user_id, battle_id, side)
 );
+
+
+-- =============================================================================
+-- 10. Weekly historic rankings (migration_14, 2026-08-06)
+--
+-- Two tables feeding the weekly-ranking / damage-tracker features (see
+-- extra/HISTORIC_RANKING.md §3-4):
+--
+-- weekly_ranking_snapshots — OFFICIAL copies of the game's weekly ranking
+-- (ranking.getRanking: weeklyUserDamages / weeklyCountryDamages /
+-- muWeeklyDamages), fetched at xx:01 every hour by
+-- Python/update_weekly_ranking.py (throttled; the fetch runs on the web
+-- viewer's cycle). snapshot_at = the ranking doc's REGEN time (ObjectID
+-- timestamp of the item _id), NOT our fetch time; week_start = Monday 00:00
+-- UTC of the week the ranking is for. Displayed current week = latest
+-- snapshot per entity_type; at each Monday rollover the finished weeks are
+-- pruned down to the per-entity final row (max snapshot_at) — the permanent
+-- official value. NOT refetchable historically (API serves only the current
+-- week) → backup it. Hypertable (7-day chunks) + compression: the current
+-- week's chunk stays uncompressed while the hourly writes land in it; the
+-- rollover-pruning DELETE hits the just-finished week's still-uncompressed
+-- chunk (no decompress churn), and the daily policy re-compresses within a
+-- day.
+--
+-- user_weekly_damage — DERIVED per-user weekly totals, bucketed by the WEEK
+-- OF THE ROUND'S START (date_trunc('week', rounds.created_at), UTC) — the
+-- stored approximation of the game's per-hit weekly attribution. Built by
+-- the one-time backfill (below) and by insert_ranking_sample finish()'s
+-- whole-week rebuild per touched battle (db.weekly_damage_stmts; battle end
+-- only — round rows exist solely for ended battles, so active battles are
+-- excluded by construction). DERIVED → excluded from backups, rebuilt on
+-- load (BACKUPS.md §4, like user_battle_stats).
+-- =============================================================================
+
+CREATE TABLE weekly_ranking_snapshots (
+    -- 8-byte aligned
+    week_start  TIMESTAMPTZ NOT NULL,      -- the week the ranking is for (Monday 00:00 UTC)
+    snapshot_at TIMESTAMPTZ NOT NULL,      -- regen time of the ranking doc (ObjectID ts), NOT our fetch time
+    value       BIGINT NOT NULL,           -- damage for that week
+
+    -- 4-byte aligned
+    entity_id   INT NOT NULL REFERENCES inventory_ids(id),
+    rank        INT NOT NULL,
+
+    -- 2-byte aligned
+    entity_type SMALLINT NOT NULL,         -- 1=user, 2=country, 3=mu
+
+    -- text
+    tier        TEXT NULL,
+
+    PRIMARY KEY (entity_type, entity_id, week_start, snapshot_at)
+);
+
+SELECT create_hypertable('weekly_ranking_snapshots', 'week_start',
+                         chunk_time_interval => INTERVAL '7 days');
+DROP INDEX IF EXISTS weekly_ranking_snapshots_week_start_idx;
+ALTER TABLE weekly_ranking_snapshots SET (
+    timescaledb.compress,
+    timescaledb.compress_segmentby = 'entity_type',
+    timescaledb.compress_orderby = 'week_start, snapshot_at, rank');
+SELECT add_compression_policy('weekly_ranking_snapshots', INTERVAL '7 days', if_not_exists => TRUE);
+-- display query: week + latest snapshot per entity_type, ordered by rank
+CREATE INDEX weekly_ranking_snapshots_week_idx
+    ON weekly_ranking_snapshots (week_start, snapshot_at, rank);
+
+CREATE TABLE user_weekly_damage (
+    -- 8-byte aligned
+    week_start TIMESTAMPTZ NOT NULL,       -- Monday 00:00 UTC of the ROUND's start
+    damage     BIGINT NOT NULL DEFAULT 0,
+
+    -- 4-byte aligned
+    user_id    INT NOT NULL REFERENCES inventory_ids(id),
+
+    PRIMARY KEY (user_id, week_start)
+);
+-- weekly leaderboard query: ORDER BY damage DESC per week
+CREATE INDEX user_weekly_damage_week_idx ON user_weekly_damage (week_start, damage DESC);
+
+
+-- =============================================================================
+-- 11. Weekly straddle corrections (migration_15, 2026-08-06)
+--
+-- Signed per-week adjustments to user_weekly_damage, from the straddler
+-- deduction (HISTORIC_RANKING.md §7.2): the post-reset portion of a user's
+-- reset-straddling rounds = official(W) - derived(W) - active(W), computed
+-- by update_weekly_ranking.py --reconcile only when the user is settled
+-- (no active battles, official value stable across the last 2 hourly
+-- snapshots, getUserLite lastConnectionAt >= 2 h old, 0 < post <=
+-- d_straddle). Stored as SIGNED adjustments — +post for the straddle week,
+-- -post for the previous week — and applied by the whole-week rebuilds
+-- (db.weekly_damage_stmts) and --backfill: user_weekly_damage is exactly
+-- "round rows + corrections". The table is the idempotency marker (a
+-- corrected user is never re-examined) and survives rebuilds. Only the
+-- current week's reset is correctable (official snapshots start 2026-08-06).
+-- =============================================================================
+
+CREATE TABLE user_weekly_corrections (
+    -- 8-byte aligned
+    week_start   TIMESTAMPTZ NOT NULL,      -- the week the adjustment applies to (UTC Monday)
+    damage       BIGINT NOT NULL,           -- signed: +post for the straddle week, -post for the previous week
+    corrected_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    verified_at  TIMESTAMPTZ NULL,          -- audit stamp (migration_16): the correction
+                                            -- was re-verified against current data and is
+                                            -- consistent; NULL = not yet audited / failed
+
+    -- 4-byte aligned
+    user_id      INT NOT NULL REFERENCES inventory_ids(id),
+
+    PRIMARY KEY (user_id, week_start)
+);

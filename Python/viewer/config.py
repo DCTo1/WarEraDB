@@ -17,6 +17,7 @@ REPO = os.path.join(ROOT, "..")                                # repo root
 UPDATE_SCRIPT = os.path.join(REPO, "Python", "update_battles.py")
 LIVE_SCRIPT = os.path.join(REPO, "Python", "update_live.py")
 RANKING_SCRIPT = os.path.join(REPO, "Python", "insert_ranking_sample.py")
+WEEKLY_SCRIPT = os.path.join(REPO, "Python", "update_weekly_ranking.py")
 USER_LITE_SCRIPT = os.path.join(REPO, "Python", "update_users_lite.py")
 
 HEX_RE = re.compile(r"^[0-9a-f]{24}$")
@@ -34,6 +35,7 @@ class Settings:
     db: str = os.environ.get("BATTLE_DB", "tsdb")
     ranking_latest: int = 1000
     user_lite_limit: int = 100
+    weekly_enabled: bool = True
 
 
 settings = Settings()
