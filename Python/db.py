@@ -337,6 +337,22 @@ def battle_index_ms(db: str | None = None, step: int = 100) -> list[int]:
         f"WHERE rn %% {step} = 0 ORDER BY created_at ASC;", db)]
 
 
+def refresh_active_damages(db: str | None = None) -> int:
+    """Active battles' damage columns set from round sums.
+
+    The API's battle doc reports damages: 0 at battle level (and stale
+    mid-battle totals) while rounds accrue damage — the rounds are the
+    source of truth. Must run AFTER insert_battle upserts, which overwrite
+    the battle row with the doc's values.
+    """
+    return exec_many([
+        "UPDATE battles b SET attacker_damages = r.att, defender_damages = r.def\n"
+        "FROM (SELECT battle_id, COALESCE(SUM(attacker_damages), 0) AS att,\n"
+        "      COALESCE(SUM(defender_damages), 0) AS def FROM rounds GROUP BY battle_id) r\n"
+        "WHERE b.battle_id = r.battle_id AND b.ended_at IS NULL;"
+    ], db)
+
+
 def repair_zero_damages(db: str | None = None) -> int:
     """Battles stored with 0/0 damages get them set from round sums.
 

@@ -70,6 +70,7 @@ from db import (
     flush_endpoint_log,
     loot_sql,
     query,
+    refresh_active_damages,
     value_sql,
 )
 from utils import (
@@ -437,6 +438,10 @@ def _sync(s: requests.Session, live: list[dict], args, dbname: str) -> None:
 
     insert_battle_docs(dbname, live + extra_docs)
     print(f"battles: refreshed {len(live) + len(extra_docs)} docs", flush=True)
+
+    fixed = refresh_active_damages(dbname)
+    if fixed:
+        print(f"damage repair: {fixed} active battles carry round-sum damages", flush=True)
 
     if not args.skip_rankings and live:
         state = read_json(STATE_FILE, {})
