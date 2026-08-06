@@ -2,7 +2,7 @@
 
 from ..config import HEX_RE
 from ..queries import first_val, query_dicts
-from ..ui import esc, error_page, layout, ts, user_link
+from ..ui import abbr, esc, error_page, layout, ts, user_link
 
 
 def page_battle(q: dict) -> str:
@@ -63,17 +63,21 @@ def page_battle(q: dict) -> str:
         return f"<tr><td class='k'>{label}</td><td>{value}</td></tr>"
 
     bounty = ""
-    if b.get("attacker_money_pool") is not None or b.get("defender_money_pool") is not None:
-        bounty = "<h2>Bounties</h2><table>" + "".join([
-            kv("Attacker pool", f"{b['attacker_money_pool']:,.2f}" if b.get("attacker_money_pool") is not None else "—"),
-            kv("Attacker per 1k dmg", b.get("attacker_money_per_1k_damages")),
-            kv("Attacker national", b.get("attacker_bounty_is_national")),
-            kv("Attacker effective", b.get("attacker_bounty_effective_at")),
-            kv("Defender pool", f"{b['defender_money_pool']:,.2f}" if b.get("defender_money_pool") is not None else "—"),
-            kv("Defender per 1k dmg", b.get("defender_money_per_1k_damages")),
-            kv("Defender national", b.get("defender_bounty_is_national")),
-            kv("Defender effective", b.get("defender_bounty_effective_at")),
-        ]) + "</table>"
+    sides = [
+        ("Attacker", b.get("attacker_money_pool"), b.get("attacker_money_per_1k_damages"),
+         b.get("attacker_bounty_is_national"), b.get("attacker_bounty_effective_at")),
+        ("Defender", b.get("defender_money_pool"), b.get("defender_money_per_1k_damages"),
+         b.get("defender_bounty_is_national"), b.get("defender_bounty_effective_at")),
+    ]
+    sides = [s for s in sides if (s[1] or 0) > 0]
+    if sides:
+        bounty_rows = []
+        for label, pool, rate, nat, eff in sides:
+            bounty_rows += [kv(f"{label} pool", abbr(pool)),
+                            kv(f"{label} per 1k dmg", rate),
+                            kv(f"{label} national", nat),
+                            kv(f"{label} effective", eff)]
+        bounty = "<h2>Bounties</h2><table>" + "".join(bounty_rows) + "</table>"
     round_rows = "".join(
         f"<tr><td>{r['number']}</td><td>{esc(ts(r['created_at'], 19))}</td>"
         f"<td>{esc(r['won_by_country_name'] or '—')}</td>"
