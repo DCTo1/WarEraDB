@@ -170,6 +170,55 @@ All pipeline scripts accept a `BATTLE_DB` env var (or `--db` flag) to target
 a throwaway database instead of `tsdb` — apply `base_data/` to it first and
 remember the `WARERA_DB_URL` override applies there too.
 
+### Backups
+
+`Python/backups.py` saves and restores the load-bearing data (ranking
+hypertables with their original timestamps, items, users, inventory_ids,
+battles, rounds, bounties, countries, transactions, weekly snapshots +
+corrections) while leaving the rebuildable parts out of the dump —
+`user_battle_stats` (830 MB), `user_weekly_damage` and `endpoints_used` are
+excluded by data (`pg_dump --exclude-table-data`), so their DDL/PKs restore
+but their rows are rebuilt on load (see `extra/BACKUPS.md` for the full
+derivable-vs-core decision table). Backups land in `extra/db_backups/`
+(timestamped `.dump`, sha256 printed) and can optionally be pushed to GitHub
+Releases — every release carries the fixed asset name `tsdb_backup.dump`, so
+this link always resolves to the newest backup:
+
+```bash
+# Dump locally + upload to GitHub Releases + retire releases beyond --keep
+.venv/bin/python Python/backups.py save [--note "after 2026-08-06 backfill"]
+
+# Restore into an EMPTY database (pg_restore + rebuilds + verify)
+.venv/bin/python Python/backups.py load            # default: --latest from GitHub
+.venv/bin/python Python/backups.py load --file extra/db_backups/tsdb_backup_*.dump
+.venv/bin/python Python/backups.py list            # --local and/or --remote
+.venv/bin/python Python/backups.py latest-url      # the shareable "latest" link
+```
+
+- All commands accept `--docker [CONTAINER]`: runs pg_dump/pg_restore/psql
+  inside the timescaledb container instead of from PATH (auto-detects the
+  running timescale container when the name is omitted). Recommended for
+  everyone — no client install, tool versions always match the server.
+
+- `load` refuses a target DB that already has data (unless `--force`), runs
+  the TimescaleDB restore flow (`timescaledb_pre_restore()` → `pg_restore`
+  → `timescaledb_post_restore()`), then rebuilds `user_battle_stats` (full
+  DELETE + INSERT-from-source), `user_weekly_damage`
+  (`update_weekly_ranking.py --backfill`), `data/battle_timestamps.json` and
+  the `Python/*.json` state files, and finishes with
+  `insert_ranking_sample.py --verify` + a stats spot check.
+- **Uploading is owner-only**: it requires the `WARERA_GITHUB_TOKEN` env var
+  or `~/.config/warera/github_token.txt` (plain text, 0600 — same pattern as
+  the API key; a fine-grained PAT with Contents read/write on the backup
+  repo). The token is never stored in the repo, so users running these same
+  scripts can download/restore backups but can never overwrite or delete the
+  cloud copies. Without a token, `save` keeps the dump local only.
+- Backup repo: `WARERA_BACKUP_REPO="owner/name"` env var, default
+  `DCTo1/WarEraDB-backups` (create it — or point at an existing repo).
+  Downloads are anonymous (public repo). The postgres client tools
+  (`pg_dump`/`pg_restore`/`psql`) are only needed on PATH when you don't use
+  `--docker`.
+
 ## Database schema
 
 ### Base tables
