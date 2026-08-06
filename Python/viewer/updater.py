@@ -6,21 +6,55 @@ Python/insert_ranking_sample.py --latest N (skipped when N == 0). A run is
 skipped (retried half an interval later) if a previous run is still going.
 Output is tee'd into UPDATE_STATE and shown on /update-status; /timer serves
 the countdown for the header.
+
+The FIRST run of a boot also does a one-shot completeness check (_boot_check,
+also skipped when --ranking 0 disables the ranking pass): battles ended in
+the last 7 days whose rounds lack round-ranking rows are re-fetched via
+insert_ranking_sample.py --ids. This repairs battles that ended while the
+site was down (or whose final fetch fell through the settle window), so
+gaps from battles ending overnight are fixed as soon as the site boots.
 """
 
 import os
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 
-from .config import LIVE_SCRIPT, MAX_UPDATE_LINES, RANKING_SCRIPT, UPDATE_INTERVAL, UPDATE_SCRIPT, USER_LITE_SCRIPT, settings
+from .config import (LIVE_SCRIPT, MAX_UPDATE_LINES, RANKING_SCRIPT, UPDATE_INTERVAL, UPDATE_SCRIPT, USER_LITE_SCRIPT, WEEKLY_SCRIPT, settings)
+from .queries import query_dicts
 from .ui import esc, layout
 
 # State of the background updater. Guarded by UPDATE_LOCK.
 UPDATE_STATE: dict = {"running": False, "done": False, "rc": None, "output": [],
                       "next_at": None}
 UPDATE_LOCK = threading.Lock()
+
+# Set by the first updater run of a boot; guarded by UPDATE_LOCK.
+_BOOT_CHECKED = False
+
+# Ended battles of the last 7 days that have damage-bearing rounds but fewer
+# DISTINCT ranked round_numbers than DISTINCT round numbers (no round-ranking
+# rows at all, or partial coverage). 0-damage rounds are excluded: their
+# ranking docs are genuinely empty (e.g. tournaments 1906/8368).
+BOOT_CHECK_SQL = """
+    SELECT uuid_to_objectid(b.battle_id) AS hex
+    FROM battles b
+    LEFT JOIN (SELECT battle_id, count(DISTINCT round_number) cnt
+               FROM round_ranking_entries GROUP BY 1) rc
+      ON rc.battle_id = b.id
+    LEFT JOIN (SELECT battle_id, count(DISTINCT number) cnt
+               FROM rounds
+               WHERE attacker_damages > 0 OR defender_damages > 0
+               GROUP BY 1) rn
+      ON rn.battle_id = b.battle_id
+    WHERE b.ended_at IS NOT NULL
+      AND b.ended_at > now() - interval '7 days'
+      AND rn.cnt IS NOT NULL
+      AND (rc.cnt IS NULL OR rc.cnt < rn.cnt)
+    ORDER BY b.id
+"""
 
 
 def _tee_output(proc: subprocess.Popen) -> int:
@@ -34,19 +68,70 @@ def _tee_output(proc: subprocess.Popen) -> int:
     return proc.wait()
 
 
+def _boot_check(db: str, env: dict) -> int:
+    """One-shot startup completeness check (viewer boot): find battles ended
+    in the last 7 days with missing round rankings and re-fetch them.
+
+    Live-walk rows can stop minutes before battle end, and battles that end
+    while the site is down never get a final fetch — those rounds stay empty
+    unless re-picked. The boot check runs insert_ranking_sample.py --ids on
+    the flagged battles so the gap is closed on the next boot (idempotent
+    ON CONFLICT upserts). Runs once per process; skipped when the ranking
+    pass is disabled (--ranking 0)."""
+    global _BOOT_CHECKED
+    with UPDATE_LOCK:
+        if _BOOT_CHECKED:
+            return 0
+        _BOOT_CHECKED = True
+    rows, err = query_dicts(BOOT_CHECK_SQL)
+    hexes = [r["hex"] for r in rows]
+    with UPDATE_LOCK:
+        UPDATE_STATE["output"].append(
+            f"\n=== boot check: {len(hexes)} battle(s) ended in the last 7 days "
+            f"with missing round rankings ===")
+    if err:
+        with UPDATE_LOCK:
+            UPDATE_STATE["output"].append(f"boot check query failed: {err}")
+        return 2
+    if not hexes:
+        return 0
+    fd, path = tempfile.mkstemp(prefix="warera_boot_", suffix=".txt")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write("\n".join(hexes) + "\n")
+        return _tee_output(subprocess.Popen(
+            [sys.executable, RANKING_SCRIPT, "--ids", path],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, bufsize=1, env=env))
+    finally:
+        os.unlink(path)
+
+
+def _first_nonzero(*rcs: int) -> int:
+    """Overall run rc = the first non-zero step rc (0 = all steps ok)."""
+    for rc in rcs:
+        if rc:
+            return rc
+    return 0
+
+
 def _run_updater() -> None:
-    """Background thread: run update_battles.py then update_live.py, then
-    insert_ranking_sample.py."""
+    """Background thread: boot check first, then update_battles.py, then
+    update_live.py, then insert_ranking_sample.py, then
+    update_weekly_ranking.py (hourly self-throttled snapshot fetch), then
+    update_users_lite.py."""
     db = settings.db
     env = dict(os.environ, BATTLE_DB=db)
     rc2 = 0  # ranking step rc (0 = skipped when --ranking 0 disables it)
+    rc5 = 0  # weekly snapshot step rc (0 = skipped when --weekly 0 disables it)
     try:
+        rc0 = _boot_check(db, env) if settings.ranking_latest else 0
         rc = _tee_output(subprocess.Popen(
             [sys.executable, UPDATE_SCRIPT, "--db", db, "--force-active"],
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             text=True, bufsize=1, env=env))
         with UPDATE_LOCK:
-            UPDATE_STATE["rc"] = rc
+            UPDATE_STATE["rc"] = _first_nonzero(rc0, rc)
         with UPDATE_LOCK:
             UPDATE_STATE["output"].append("\n=== live sync: update_live.py ===")
         rc3 = _tee_output(subprocess.Popen(
@@ -54,7 +139,7 @@ def _run_updater() -> None:
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             text=True, bufsize=1, env=env))
         with UPDATE_LOCK:
-            UPDATE_STATE["rc"] = rc if rc != 0 else rc3
+            UPDATE_STATE["rc"] = _first_nonzero(rc0, rc, rc3)
         if settings.ranking_latest:
             with UPDATE_LOCK:
                 UPDATE_STATE["output"].append(
@@ -64,7 +149,17 @@ def _run_updater() -> None:
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                 text=True, bufsize=1, env=env))
             with UPDATE_LOCK:
-                UPDATE_STATE["rc"] = rc if rc != 0 else (rc3 if rc3 != 0 else rc2)
+                UPDATE_STATE["rc"] = _first_nonzero(rc0, rc, rc3, rc2)
+        if settings.weekly_enabled:
+            with UPDATE_LOCK:
+                UPDATE_STATE["output"].append(
+                    "\n=== weekly snapshots: update_weekly_ranking.py ===")
+            rc5 = _tee_output(subprocess.Popen(
+                [sys.executable, WEEKLY_SCRIPT, "--db", db],
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, bufsize=1, env=env))
+            with UPDATE_LOCK:
+                UPDATE_STATE["rc"] = _first_nonzero(rc0, rc, rc3, rc2, rc5)
         if settings.user_lite_limit:
             with UPDATE_LOCK:
                 UPDATE_STATE["output"].append(
@@ -74,7 +169,7 @@ def _run_updater() -> None:
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                 text=True, bufsize=1, env=env))
             with UPDATE_LOCK:
-                UPDATE_STATE["rc"] = (rc if rc != 0 else (rc3 if rc3 != 0 else (rc2 if rc2 != 0 else rc4)))
+                UPDATE_STATE["rc"] = _first_nonzero(rc0, rc, rc3, rc2, rc5, rc4)
     except Exception as exc:
         with UPDATE_LOCK:
             UPDATE_STATE["rc"] = -1

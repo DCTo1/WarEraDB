@@ -120,6 +120,7 @@ CREATE TABLE battles (
     created_at              TIMESTAMPTZ NOT NULL,
     updated_at              TIMESTAMPTZ NOT NULL,
     ended_at                TIMESTAMPTZ NULL,   -- NULL == battle active (no is_active column)
+    ranking_verified_at     TIMESTAMPTZ NULL,   -- set ONLY by insert_ranking_sample finish() (API review); NULL = not yet reviewed (see migration_13)
     attacker_damages        DOUBLE PRECISION NOT NULL,
     defender_damages        DOUBLE PRECISION NOT NULL,
 
