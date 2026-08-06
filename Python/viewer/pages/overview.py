@@ -3,7 +3,7 @@
 from urllib.parse import urlencode
 
 from ..queries import query_dicts
-from ..ui import esc, error_page, layout, ts
+from ..ui import abbr, aligned_pair, battle_link, esc, error_page, layout, ts
 
 
 def page_overview(q: dict) -> str:
@@ -20,10 +20,15 @@ def page_overview(q: dict) -> str:
         return error_page(err)
     c = counts[0] if counts else {}
     latest, err = query_dicts(
-        "SELECT uuid_to_objectid(battle_id) AS battle_id, created_at, battle_type,"
-        " attacker_country_name, attacker_damages, attacker_won_rounds_count,"
-        " defender_country_name, defender_damages, defender_won_rounds_count"
-        " FROM battle_details ORDER BY created_at DESC LIMIT 10")
+        "SELECT uuid_to_objectid(bd.battle_id) AS battle_id, bd.created_at, bd.battle_type,"
+        " bd.attacker_country_name, bd.attacker_damages, bd.attacker_won_rounds_count,"
+        " bd.defender_country_name, bd.defender_damages, bd.defender_won_rounds_count,"
+        " lr.attacker_damages AS lr_attacker_damages,"
+        " lr.defender_damages AS lr_defender_damages"
+        " FROM battle_details bd"
+        " LEFT JOIN LATERAL (SELECT attacker_damages, defender_damages FROM rounds"
+        " WHERE battle_id = bd.battle_id ORDER BY number DESC NULLS LAST LIMIT 1) lr ON true"
+        " ORDER BY created_at DESC LIMIT 10")
     if err:
         return error_page(err)
     hidden, err = query_dicts(
@@ -41,12 +46,17 @@ def page_overview(q: dict) -> str:
               f'<div class="lbl">users lite</div></div>')
     cards += (f'<a href="/battles?status=active"><div class="card"><div class="num">'
               f'{c.get("active", 0):,}</div><div class="lbl">active →</div></div></a>')
+    wdam = max((len(abbr(r["defender_damages"])) for r in latest), default=1)
+    wlr = max((len(abbr(r.get("lr_defender_damages") or 0)) for r in latest), default=1)
     rows = "".join(
-        f"<tr><td><a href='/battle?id={r['battle_id']}' title='{r['battle_id']}'>"
-        f"{esc(r['attacker_country_name'] or '?')} vs {esc(r['defender_country_name'] or '?')}</a></td>"
-        f"<td>{esc(ts(r['created_at'], 10))}</td><td>{esc(r['battle_type'])}</td>"
-        f"<td>{r['attacker_won_rounds_count']}/{r['defender_won_rounds_count']}</td>"
-        f"<td>{r['attacker_damages']:,.0f}</td><td>{r['defender_damages']:,.0f}</td></tr>"
+        f"<tr><td>{battle_link(r['battle_id'], r['battle_type'],
+                               r['defender_country_name'], r['attacker_country_name'])}</td>"
+        f"<td>{r['defender_won_rounds_count'] or 0}-{r['attacker_won_rounds_count'] or 0}</td>"
+        f"<td>{esc(ts(r['created_at'], 10))}</td>"
+        f"<td>{aligned_pair(wdam, abbr(r['defender_damages']), abbr(r['attacker_damages']))}</td>"
+        f"<td>{aligned_pair(wlr,
+                            abbr(r.get('lr_defender_damages') or 0),
+                            abbr(r.get('lr_attacker_damages') or 0))}</td></tr>"
         for r in latest)
     hid_rows = "".join(
         f"<tr><td><a href='/battles?country={urlencode({'country': r['country']})}'>"
@@ -56,8 +66,9 @@ def page_overview(q: dict) -> str:
     return layout("Overview", f"""
         <div class="cards">{cards}</div>
         <h2>Latest battles</h2>
-        <table><tr><th>Battle</th><th>Date</th><th>Type</th><th>Rounds won</th>
-        <th>Att. dmg</th><th>Def. dmg</th></tr>{rows}</table>
+        <table style="width:max-content"><tr><th>Battle (Defender vs Attacker)</th>
+        <th style='width:40px'>Rounds</th><th>Date</th><th>Damage</th>
+        <th>Last Round Damage</th></tr>{rows}</table>
         <h2>Biggest "hidden" bounty pools <small>(money parked in ended battles)</small></h2>
         <table><tr><th>Country</th><th>Total pool</th><th>Ended-battle pool</th>
         <th>Sides</th></tr>{hid_rows}</table>
