@@ -183,6 +183,27 @@ def battle_summary_stmts(battle_hexes: list[str]) -> list[str]:
             "GROUP BY r.entity_id, r.battle_id, r.side;")
     return out
 
+def user_battle_stats_rebuild_stmts() -> list[str]:
+    """Full-table DELETE + INSERT-from-source rebuild of user_battle_stats.
+
+    The backups.py load() step: the table's DATA is excluded from backups
+    (it is pure derivation over battle_ranking_entries — ~830 MB, see
+    BACKUPS.md §4) and this rebuilds it exactly, same SQL shape as
+    battle_summary_stmts() but without the per-battle filter. ~85 s on the
+    full table.
+    """
+    return [
+        "DELETE FROM user_battle_stats;",
+        "INSERT INTO user_battle_stats (user_id, battle_id, side,"
+        " damage, points, money, entries)\n"
+        "SELECT r.entity_id, r.battle_id, r.side, COALESCE(SUM(r.damage), 0)::bigint,"
+        " COALESCE(SUM(r.points), 0)::int, COALESCE(SUM(r.money), 0)::float8, COUNT(*)\n"
+        "FROM battle_ranking_entries r\n"
+        "WHERE r.entity_type = 1 AND r.side IN (1, 2)\n"
+        "GROUP BY r.entity_id, r.battle_id, r.side;",
+    ]
+
+
 def weekly_damage_stmts(battle_hex: str) -> list[str]:
     """Statements rebuilding user_weekly_damage for the weeks a battle's
     rounds fall in.
