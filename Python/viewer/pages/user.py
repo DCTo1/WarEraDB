@@ -10,7 +10,7 @@ from urllib.parse import urlencode
 
 from ..config import HEX_RE
 from ..queries import query_dicts
-from ..ui import esc, error_page, layout, ts
+from ..ui import abbr, aligned_pair, battle_link, esc, error_page, layout, ts
 
 
 def page_user(q: dict) -> str:
@@ -36,17 +36,24 @@ def page_user(q: dict) -> str:
         "SELECT uuid_to_objectid(b.battle_id) AS battle_id, b.created_at,"
         " b.ended_at IS NULL AS live, bt.code AS battle_type,"
         " ca.name AS attacker_country_name, cd.name AS defender_country_name,"
+        " b.attacker_won_rounds_count, b.defender_won_rounds_count,"
         " SUM(s.entries)::bigint AS n, SUM(s.damage)::bigint AS damage,"
         " SUM(s.points)::bigint AS points, SUM(s.money)::float8 AS money,"
-        " (ARRAY_AGG(s.side ORDER BY s.damage DESC NULLS LAST))[1] AS side"
+        " (ARRAY_AGG(s.side ORDER BY s.damage DESC NULLS LAST))[1] AS side,"
+        " lr.attacker_damages AS lr_attacker_damages,"
+        " lr.defender_damages AS lr_defender_damages"
         " FROM user_battle_stats s"
         " JOIN battles b ON b.id = s.battle_id"
         " JOIN battle_types bt ON bt.id = b.type_id"
         " LEFT JOIN countries ca ON ca.country_id = b.attacker_country_id"
         " LEFT JOIN countries cd ON cd.country_id = b.defender_country_id"
+        " LEFT JOIN LATERAL (SELECT attacker_damages, defender_damages FROM rounds"
+        " WHERE battle_id = b.battle_id ORDER BY number DESC NULLS LAST LIMIT 1) lr ON true"
         f" WHERE s.user_id = (SELECT id FROM inventory_ids"
         f" WHERE external_id = objectid_to_uuid('{hexid}'))"
-        " GROUP BY b.battle_id, b.created_at, b.ended_at, bt.code, ca.name, cd.name"
+        " GROUP BY b.battle_id, b.created_at, b.ended_at, bt.code, ca.name, cd.name,"
+        " b.attacker_won_rounds_count, b.defender_won_rounds_count,"
+        " lr.attacker_damages, lr.defender_damages"
         " ORDER BY SUM(s.damage) DESC NULLS LAST")
     if err:
         return error_page(err)
@@ -57,17 +64,22 @@ def page_user(q: dict) -> str:
         "money": sum(r["money"] or 0 for r in history),
     }
     top = history[:50]
+    wlr = max((len(abbr(r.get("lr_defender_damages") or 0)) for r in top), default=1)
 
     def kv(label, value):
         return f"<tr><td class='k'>{label}</td><td>{value}</td></tr>"
 
     hist_rows = "".join(
-        f"<tr><td><a href='/battle?id={r['battle_id']}' title='{r['battle_id']}'>"
-        f"{esc(r['attacker_country_name'] or '?')} vs {esc(r['defender_country_name'] or '?')}</a>"
+        f"<tr><td>{battle_link(r['battle_id'], r['battle_type'],
+                               r['defender_country_name'], r['attacker_country_name'])}"
         f"{' <span class=\"status-live\">LIVE</span>' if r['live'] else ''}</td>"
-        f"<td>{esc(ts(r['created_at'], 10))}</td><td>{esc(r['battle_type'])}</td>"
+        f"<td>{r['defender_won_rounds_count'] or 0}-{r['attacker_won_rounds_count'] or 0}</td>"
+        f"<td>{esc(ts(r['created_at'], 10))}</td>"
         f"<td>{'A' if r['side'] == 1 else 'D'}</td>"
-        f"<td>{r['damage'] or 0:,.0f}</td><td>{r['points'] or 0:,.0f}</td></tr>"
+        f"<td>{abbr(r['damage'])}</td><td>{abbr(r['points'])}</td>"
+        f"<td>{aligned_pair(wlr,
+                            abbr(r.get('lr_defender_damages') or 0),
+                            abbr(r.get('lr_attacker_damages') or 0))}</td></tr>"
         for r in top)
     title = u.get("username") or f"…{hexid[-8:]}"
     return layout(f"User: {title}", f"""
@@ -87,5 +99,6 @@ def page_user(q: dict) -> str:
         {kv("Σ money", f"{a.get('money') or 0:,.2f}")}
         </table>
         <h2>Top battles ({len(top)} of {a.get('battles') or 0:,} by damage)</h2>
-        <table><tr><th>Battle</th><th>Date</th><th>Type</th><th>Side</th>
-        <th>Damage</th><th>Points</th></tr>{hist_rows}</table>""")
+        <table style="width:max-content"><tr><th>Battle (Defender vs Attacker)</th>
+        <th style='width:40px'>Rounds</th><th>Date</th><th>Side</th>
+        <th>Damage</th><th>Points</th><th>Last Round Damage</th></tr>{hist_rows}</table>""")
