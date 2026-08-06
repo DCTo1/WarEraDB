@@ -7,6 +7,55 @@ variables, same dark/light theme toggle (localStorage, no server state).
 import html
 from urllib.parse import urlencode
 
+from .config import BATTLE_TYPES
+
+_UNITS = ("k", "m", "b", "t")
+TYPE_PAD = max(len(t) for t in BATTLE_TYPES) + 1
+
+
+def abbr(v) -> str:
+    """Compact number: 5, 10, 300, 4.55k, 82.93k, 145.32k, 182.35m…"""
+    if v is None:
+        return "—"
+    v = float(v)
+    if abs(v) < 1000:
+        return f"{v:,.0f}"
+    i = -1
+    while abs(v) >= 1000 and i < len(_UNITS) - 1:
+        v /= 1000
+        i += 1
+    s = f"{v:.2f}".rstrip("0").rstrip(".")
+    if s == "1000" and i < len(_UNITS) - 1:
+        return f"1{_UNITS[i + 1]}"
+    return f"{s}{_UNITS[i]}"
+
+
+def fmt_bounty(rate, pool) -> str:
+    """Bounty as rate/pool: a 500 pool at 0.2 money per 1k damages → 0.2/500.
+
+    A pool of 0 or less is the remnant of a depleted bounty — not shown.
+    """
+    if rate is None or pool is None or pool <= 0:
+        return "—"
+    rate_s = f"{rate:.3f}".rstrip("0").rstrip(".")
+    return f"{rate_s}/{abbr(round(pool))}"
+
+
+def aligned_pair(w: int, left: str, right: str) -> str:
+    """Fixed-width blocks around " - " so the separator aligns in a column."""
+    return (f"<span style='display:inline-block;text-align:right;width:{w}ch'>"
+            f"{esc(left)}</span> - "
+            f"<span style='display:inline-block;text-align:left;width:{w}ch'>"
+            f"{esc(right)}</span>")
+
+
+def battle_link(bid: str, btype: str, defender: str, attacker: str) -> str:
+    """Compact battle cell: Type | Defender vs Attacker ("|" aligned)."""
+    return (f"<a href='/battle?id={esc(bid)}' title='{esc(bid)}'>"
+            f"<span style='display:inline-block;text-align:right;width:{TYPE_PAD}ch'>"
+            f"{esc(btype.title())}</span> battle | "
+            f"{esc(defender or '?')} vs {esc(attacker or '?')}</a>")
+
 TIMER_JS = """<script>
 (function () {
   var lbl = document.getElementById('upd_lbl');
