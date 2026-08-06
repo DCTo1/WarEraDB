@@ -1,10 +1,23 @@
 """Battle list page: Active / Finished / All tabs, country + type filters."""
 
+from datetime import datetime, timedelta, timezone
 from urllib.parse import urlencode
 
 from ..config import BATTLE_TYPES
 from ..queries import country_where, first_val, query_dicts
-from ..ui import esc, error_page, layout, ts
+from ..ui import abbr, aligned_pair, battle_link, esc, error_page, fmt_bounty, layout, ts
+
+
+def _elapsed(v: datetime) -> str:
+    """Time since the battle started: <1m, 10m, 2h36m, 1d4h."""
+    d = datetime.now(timezone.utc) - (v if v.tzinfo else v.replace(tzinfo=timezone.utc))
+    if d < timedelta(minutes=1):
+        return "<1m"
+    if d < timedelta(hours=1):
+        return f"{int(d.total_seconds() // 60)}m"
+    if d < timedelta(days=1):
+        return f"{int(d.total_seconds() // 3600)}h{int(d.total_seconds() % 3600 // 60)}m"
+    return f"{int(d.total_seconds() // 86400)}d{int(d.total_seconds() % 86400 // 3600)}h"
 
 
 def page_battles(q: dict) -> str:
@@ -30,12 +43,21 @@ def page_battles(q: dict) -> str:
     elif status == "finished":
         where.append("ended_at IS NOT NULL")
     wsql = (" WHERE " + " AND ".join(where)) if where else ""
+    order = ("bd.attacker_damages + bd.defender_damages DESC" if status == "active"
+             else "bd.created_at DESC")
     rows, err = query_dicts(
-        "SELECT uuid_to_objectid(battle_id) AS battle_id, created_at, ended_at, battle_type,"
-        " attacker_country_name, attacker_damages, attacker_won_rounds_count,"
-        " defender_country_name, defender_damages, defender_won_rounds_count,"
-        " attacker_money_pool, defender_money_pool"
-        f" FROM battle_details{wsql} ORDER BY created_at DESC LIMIT 100 OFFSET {page * 100}")
+        "SELECT uuid_to_objectid(bd.battle_id) AS battle_id, bd.created_at, bd.ended_at,"
+        " bd.battle_type, bd.attacker_country_name, bd.attacker_damages,"
+        " bd.attacker_won_rounds_count, bd.attacker_money_pool,"
+        " bd.attacker_money_per_1k_damages, bd.defender_country_name, bd.defender_damages,"
+        " bd.defender_won_rounds_count, bd.defender_money_pool,"
+        " bd.defender_money_per_1k_damages,"
+        " lr.attacker_damages AS lr_attacker_damages,"
+        " lr.defender_damages AS lr_defender_damages"
+        " FROM battle_details bd"
+        " LEFT JOIN LATERAL (SELECT attacker_damages, defender_damages FROM rounds"
+        " WHERE battle_id = bd.battle_id ORDER BY number DESC NULLS LAST LIMIT 1) lr ON true"
+        f"{wsql} ORDER BY {order} LIMIT 100 OFFSET {page * 100}")
     if err:
         return error_page(err)
     total_rows, _ = query_dicts(f"SELECT COUNT(*) AS n FROM battle_details{wsql}")
@@ -60,15 +82,46 @@ def page_battles(q: dict) -> str:
             + tab("finished", f"Finished ({c.get('finished', 0):,})")
             + tab("all", "All") + "</div>")
 
-    rows_html = "".join(
-        f"<tr><td><a href='/battle?id={r['battle_id']}' title='{r['battle_id']}'>"
-        f"{esc(r['attacker_country_name'] or '?')} vs {esc(r['defender_country_name'] or '?')}</a></td>"
-        f"<td>{esc(ts(r['created_at'], 10))}</td><td>{esc(r['battle_type'])}</td>"
-        f"<td>{r['attacker_won_rounds_count']}</td><td>{r['attacker_damages']:,.0f}</td>"
-        f"<td>{r['defender_won_rounds_count']}</td><td>{r['defender_damages']:,.0f}</td>"
-        f"<td>{f"{r['attacker_money_pool'] or 0:,.0f}" if r.get('attacker_money_pool') else '—'}</td>"
-        f"<td>{f"{r['defender_money_pool'] or 0:,.0f}" if r.get('defender_money_pool') else '—'}</td></tr>"
-        for r in rows)
+    wdam = max((len(abbr(r["defender_damages"])) for r in rows), default=1)
+    wboun = max((len(fmt_bounty(r.get("defender_money_per_1k_damages"),
+                                r.get("defender_money_pool"))) for r in rows), default=1)
+    wlr = max((len(abbr(r.get("lr_defender_damages") or 0)) for r in rows), default=1)
+
+    def bounty_pair(r: dict) -> str:
+        return aligned_pair(
+            wboun,
+            fmt_bounty(r.get("defender_money_per_1k_damages"), r.get("defender_money_pool")),
+            fmt_bounty(r.get("attacker_money_per_1k_damages"), r.get("attacker_money_pool")))
+
+    def lr_pair(r: dict) -> str:
+        """Damage of the current/last round: defender - attacker."""
+        if r.get("lr_defender_damages") is None:
+            return aligned_pair(wlr, "—", "—")
+        return aligned_pair(wlr, abbr(r["lr_defender_damages"]), abbr(r["lr_attacker_damages"]))
+
+    battle_th = "<th>Battle (Defender vs Attacker)</th>"
+    if status == "active":
+        head = (f"<tr>{battle_th}<th style='width:40px'>Rounds</th>"
+                "<th>Started</th><th>Damage</th><th>Last Round Damage</th><th>Bounty</th></tr>")
+        rows_html = "".join(
+            f"<tr><td>{battle_link(r['battle_id'], r['battle_type'],
+                                   r['defender_country_name'], r['attacker_country_name'])}</td>"
+            f"<td>{r['defender_won_rounds_count'] or 0}-{r['attacker_won_rounds_count'] or 0}</td>"
+            f"<td>{esc(_elapsed(r['created_at']))}</td>"
+            f"<td>{aligned_pair(wdam, abbr(r['defender_damages']), abbr(r['attacker_damages']))}</td>"
+            f"<td>{lr_pair(r)}</td><td>{bounty_pair(r)}</td></tr>"
+            for r in rows)
+    else:
+        head = (f"<tr>{battle_th}<th style='width:40px'>Rounds</th>"
+                "<th>Date</th><th>Damage</th><th>Last Round Damage</th><th>Bounty</th></tr>")
+        rows_html = "".join(
+            f"<tr><td>{battle_link(r['battle_id'], r['battle_type'],
+                                   r['defender_country_name'], r['attacker_country_name'])}</td>"
+            f"<td>{r['defender_won_rounds_count'] or 0}-{r['attacker_won_rounds_count'] or 0}</td>"
+            f"<td>{esc(ts(r['created_at'], 10))}</td>"
+            f"<td>{aligned_pair(wdam, abbr(r['defender_damages']), abbr(r['attacker_damages']))}</td>"
+            f"<td>{lr_pair(r)}</td><td>{bounty_pair(r)}</td></tr>"
+            for r in rows)
     type_opts = "".join(
         f'<option value="{t}"{" selected" if t == btype else ""}>{t}</option>' for t in BATTLE_TYPES)
     nav = "".join(
@@ -82,7 +135,5 @@ def page_battles(q: dict) -> str:
           <button>Filter</button>
           <span class="muted">{total:,} battles, page {page + 1}/{pages}</span>
         </form>
-        <table><tr><th>Battle</th><th>Date</th><th>Type</th><th>Rounds won A</th>
-        <th>Att. dmg</th><th>Rounds won D</th><th>Def. dmg</th><th>Att bounty</th><th>Def bounty</th>
-        </tr>{rows_html}</table>
+        <table style="width:max-content">{head}{rows_html}</table>
         <p>{nav}</p>""")
