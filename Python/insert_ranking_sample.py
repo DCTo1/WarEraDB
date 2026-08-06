@@ -69,6 +69,13 @@ DATATYPES = ("damage", "points", "money")
 TYPES = ("user", "country", "mu")
 SIDES = ("attacker", "defender")
 
+# The battle-end fetch must land AFTER the ranking doc settles, or it stores
+# mid-settle values that nothing would ever correct. This is the re-pick
+# window in needs_fetch_sql AND the minimum fetch-to-ended_at distance for
+# battles.ranking_verified_at (a fetch inside the window cannot verify).
+VERIFY_AFTER = "5 minutes"
+
+
 def recent_era(months: int = 2) -> str:
     """'YYYY-MM' era gate for the user_weekly_damage rebuild: battles ended
     within the last *months* months get their weeks rebuilt in finish()
@@ -135,6 +142,10 @@ def cleanup_stmts(battle):
       - delete stale LIVE-phase side rows (live sync wrote them mid-battle;
         the final ranking no longer carries them — they double-count users
         who showed on both sides)
+      - delete stale LIVE-phase merged (side=3) rows (added 2026-08-06: the
+        live sync walks the merged side too, and partial mid-battle merged
+        rows never equal the derivable sums, so they survived as fake
+        "exceptions" — 1.09M rows swept from 08-03/04 battles)
       - delete battle/round merged (side=3) rows that EQUAL the derivable
         sums (sum damage/points/money, max loot of the cleaned sides). Kept
         side=3 rows are the API-fetched official values that differ from the
@@ -172,6 +183,25 @@ WHERE r.battle_id = (SELECT id FROM battles WHERE battle_id = {uuid})
   AND r.side IN (1,2)
   AND r.created_at < rd.ended_at - interval '2 minutes'
   AND r.created_at > now() - interval '7 days';""",
+        # stale LIVE-phase merged (side=3) rows (2026-08-06): the live sync
+        # also walks the merged side, writing partial mid-battle merged rows
+        # whose created_at is spread across the battle's live window. The
+        # "== derivable sums" cleanup below can't remove them (partial values
+        # never equal the final sums), so they survived as fake "exceptions"
+        # (measured: 1.17M battle rows, e.g. 29989: 29,898; 49740: 277,717).
+        # Same 2-minute stale margin as the sides; final-doc merged rows land
+        # within seconds of ended_at. Must run before the equality cleanup.
+        f"""DELETE FROM battle_ranking_entries
+WHERE battle_id = (SELECT id FROM battles WHERE battle_id = {uuid})
+  AND side = 3 AND created_at < (SELECT ended_at FROM battles WHERE battle_id = {uuid}) - interval '2 minutes'
+  AND created_at > now() - interval '7 days';""",
+        f"""DELETE FROM round_ranking_entries r USING rounds rd
+WHERE r.battle_id = (SELECT id FROM battles WHERE battle_id = {uuid})
+  AND rd.battle_id = (SELECT battle_id FROM battles WHERE id = r.battle_id)
+  AND rd.number = r.round_number
+  AND r.side = 3
+  AND r.created_at < rd.ended_at - interval '2 minutes'
+  AND r.created_at > now() - interval '7 days';""",
         f"""WITH s AS (
     SELECT battle_id, entity_type, entity_id,
            sum(damage) d, sum(points) p, sum(money) mo, max(loot_item_id) l
@@ -201,6 +231,38 @@ WHERE r.side = 3 AND r.battle_id = s.battle_id AND r.round_number = s.round_numb
     ]
 
 
+def verify_stmts(battle):
+    """The API-review stamp: battles.ranking_verified_at (see migration_13).
+
+    The UPDATE only fires when the fetch was a real battle-end review:
+      - the battle is ended
+      - it ran at least VERIFY_AFTER after ended_at — a fetch inside the
+        settling window stores possibly-mid-settle values; the settle-window
+        re-pick keeps re-fetching the battle until one lands after it, and
+        only that one may verify
+      - every damage-bearing round has round-ranking rows (0-damage rounds
+        are excluded: the API serves empty docs for them, e.g. tournaments
+        1906/8368, so they verify as empty; battles without damage-bearing
+        rounds likewise have nothing to confirm)
+    Runs in the SAME flush/transaction as the ranking upserts, so the
+    coverage check sees this fetch's rows. NEVER set by derivation — only
+    this fetch path may stamp it, so a wrong value can't be marked verified.
+    """
+    uuid = f"objectid_to_uuid('{esc(battle)}')"
+    return [f"""UPDATE battles b
+SET ranking_verified_at = now()
+WHERE b.battle_id = {uuid}
+  AND b.ended_at IS NOT NULL
+  AND b.ended_at < now() - interval '{VERIFY_AFTER}'
+  AND NOT EXISTS (
+      SELECT 1 FROM rounds r
+      WHERE r.battle_id = {uuid}
+        AND (r.attacker_damages > 0 OR r.defender_damages > 0)
+        AND NOT EXISTS (
+            SELECT 1 FROM round_ranking_entries rre
+            WHERE rre.battle_id = b.id AND rre.round_number = r.number));"""]
+
+
 def finish(battle, items, weekly=True):
     """items: {combo: [ranking items]} for one battle → insert stmts (sides +
     fetched merged) + merged cleanup stmts + the ranking_verified_at stamp +
@@ -228,6 +290,8 @@ def finish(battle, items, weekly=True):
     # user_battle_stats for this battle, in the SAME flush as the upserts +
     # cleanup deletes (exact by construction — the /user page reads it).
     blk.extend(battle_summary_stmts([battle]))
+    # API-review stamp: the fetch just confirmed the battle end-to-end.
+    blk.extend(verify_stmts(battle))
     # user_weekly_damage: rebuild the weeks this battle's rounds fall in
     # (whole-week rebuild — same flush, exact by construction). Battle-end
     # only: round rows exist solely for ended battles.
@@ -262,15 +326,30 @@ def battle_eras(battles, dbname):
 def needs_fetch_sql(refetch=False):
     """Battles needing a ranking fetch.
 
-    A battle needs fetching when it has NO ranking rows, OR (when not
-    refetching) it is a leftover from the live sync:
-      - ended within the last 5 minutes → re-pick every run so the final
-        fetch lands AFTER the API's ranking doc settles (a fetch during the
-        settling window stores wrong values that nothing would ever correct)
-      - all its rows predate ended_at - 15 min → live-written partials whose
-        end-of-battle fetch never ran (reconciliation missed them)
-    Re-fetching is idempotent (ON CONFLICT upserts + derivation), so the
-    over-fetching in the settle window is harmless.
+    A battle needs fetching when it is NOT yet verified (ranking_verified_at
+    IS NULL — see verify_stmts) AND it has NO ranking rows, OR it is a
+    leftover from the live sync:
+      - ended within the last VERIFY_AFTER (5 min) → re-pick every run so
+        the final fetch lands AFTER the API's ranking doc settles (a fetch
+        during the settling window stores wrong values that nothing would
+        ever correct — and only a post-settle fetch can set
+        ranking_verified_at). NOTE (2026-08-06): the STATE_FILE done-set
+        filter was removed because it silently defeated this re-pick — a
+        battle fetched once landed in the done-set and was never re-fetched,
+        so battles fetched pre-settle stayed mid-settle forever.
+      - all its rows predate ended_at - 1 min → live-written partials whose
+        end-of-battle fetch never ran (reconciliation missed them). The
+        margin was 15 min until 2026-08-06, but live rows stop only ~2-12
+        min before battle end (last live walk before the end), so gaps like
+        15650/15668/29989/127890 slipped through it; complete battles'
+        final rows land within ~2 s of ended_at, so 1 min is a clean
+        discriminator (verified: flags exactly the known gaps, nothing
+        else). Rows landing in the final minute before end are re-fetched
+        idempotently anyway.
+    Verified battles (ranking_verified_at IS NOT NULL) are never re-picked
+    unless --refetch (which returns TRUE). Re-fetching is idempotent (ON
+    CONFLICT upserts + derivation), so the over-fetching in the settle
+    window is harmless.
 
     NOTE (2026-08-04): the checks are a SINGLE-PASS GROUP BY over the
     hypertable (max(created_at) per battle), then a LEFT JOIN to battles —
@@ -285,9 +364,10 @@ def needs_fetch_sql(refetch=False):
             "  LEFT JOIN (SELECT battle_id, max(created_at) max_c"
             "             FROM battle_ranking_entries GROUP BY 1) m"
             "  ON m.battle_id = b2.id"
-            "  WHERE m.battle_id IS NULL"
-            "     OR b2.ended_at > now() - interval '5 minutes'"
-            "     OR m.max_c < b2.ended_at - interval '15 minutes')")
+            "  WHERE b2.ranking_verified_at IS NULL"
+            "    AND (m.battle_id IS NULL"
+            "     OR b2.ended_at > now() - interval '" + VERIFY_AFTER + "'"
+            "     OR m.max_c < b2.ended_at - interval '1 minute'))")
 
 
 def pick_battles(n, refetch, dbname):
@@ -406,7 +486,15 @@ def verify(dbname):
               GROUP BY 1) lastr
         JOIN (SELECT battle_id, max(round_number) n FROM round_ranking_entries GROUP BY 1) stored
         ON lastr.id = stored.battle_id
-        WHERE stored.battle_id IN (SELECT DISTINCT battle_id FROM battle_ranking_entries);
+        WHERE stored.battle_id IN (SELECT DISTINCT battle_id FROM battle_ranking_entries)
+        UNION ALL
+        -- ranking_verified_at: 0 recent unverified battles = every battle that
+        -- ended in the last 7 days was fetched post-settle and confirmed
+        -- complete. The 'pairs' total is the pre-column backlog (all battles
+        -- fetched before migration_13) — they only get reviewed by a future
+        -- recheck pass, never by derivation.
+        SELECT 'ended battles unverified (7d window)', count(*) FILTER (WHERE ended_at > now() - interval '7 days'), count(*)
+        FROM battles WHERE ended_at IS NOT NULL AND ranking_verified_at IS NULL;
     """, dbname)
     print(f"{'check':32} {'diff':>8} {'pairs':>10}")
     for label, diff, pairs in out:
@@ -496,9 +584,14 @@ def main():
         battles = pick_battles(args.battles, refetch=args.refetch, dbname=dbname)
     else:
         ap.error("need --battles N, --latest N, --ids, --verify or --estimate")
-    if not args.refetch:
-        done = set(read_json(STATE_FILE, []))
-        battles = [b for b in battles if b not in done]
+    # NOTE (2026-08-06): no STATE_FILE done-set filter here. It used to skip
+    # battles already fetched — which silently defeated the settle-window
+    # re-pick (a battle fetched once landed in the done-set and was never
+    # re-fetched, so pre-settle fetches stayed mid-settle forever, and the
+    # ranking_verified_at stamp could never be set). needs_fetch_sql now
+    # excludes VERIFIED battles itself, and unverified ones stay pickable
+    # until a post-settle fetch verifies them; the state file remains an
+    # audit trail only.
     print(f"picked {len(battles)} battles")
     if not battles:
         return
