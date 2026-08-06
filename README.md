@@ -26,6 +26,51 @@ TimescaleDB hypertables.
 | Users (API lifetime stats + username/level/MU detail) | ~100K |
 | Transactions (seeded from examples; scrape blocked on the 3-day API window) | ~700 |
 
+## Easy setup (for everyone)
+
+The easiest way to run the whole project on your own computer is the control
+panel: one command sets everything up, then a small GUI (Tkinter, no extra
+dependencies) manages the website and backups.
+
+```bash
+# 1. prerequisites (once):
+#    Python >= 3.10 with Tkinter (Linux: `sudo apt install python3-tk`)
+#    Docker (Docker Desktop on Windows/macOS, the docker engine on Linux)
+#    Git
+# 2. get the project:
+git clone https://github.com/DCTo1/WarEraDB
+cd WarEraDB
+# 3. one-command setup — venv + database container + schema + latest data
+#    backup from GitHub Releases (idempotent, safe to re-run):
+python warera_gui.py --setup
+# 4. open the control panel (buttons: setup, start/stop/restart website,
+#    save/download backups, set API token, open backup folder):
+python warera_gui.py
+```
+
+What the setup does automatically — **no manual steps**:
+
+| Step | What happens |
+|---|---|
+| Python libraries | `.venv` created, `requirements.txt` installed into it |
+| TimescaleDB | `timescale/timescaledb-ha:pg17` container `wareradb-timescaledb` (port 5432 → 5432, persistent named volume — the DB survives container recreates) |
+| Schema | `base_data/` applied in order: `create_tables` → `functions` → `item_codes` → `create_views` |
+| Data | the latest backup is downloaded from the GitHub Releases backup repo and restored — a complete database in minutes, **no API token needed** |
+
+That's the whole prerequisite list: Python (+ Tkinter), Docker, Git. The
+postgres client tools (`pg_dump`/`pg_restore`/`psql`) are **not** needed on
+the host anymore — backup commands run inside the container
+(`backups.py --docker`), so tool versions always match the server.
+
+Optional flags: `--setup --db NAME --pg-port 5432 --web-port 8765
+--container NAME` (also configurable in the GUI's Settings bar; state is
+persisted in `~/.config/warera/gui.json`). The WarEra API token is only
+required for live auto-updates — store it with the GUI's "Set API token"
+button or as `~/.config/warera/api_key.txt` (see Authentication below).
+
+Advanced users can skip the GUI's setup entirely and bring up the same
+container with `docker compose up -d` (`docker-compose.yml`).
+
 ## Quick start
 
 ### 1. Database
@@ -297,6 +342,8 @@ ORDER BY r.rank LIMIT 20;
 
 | Path | Purpose |
 |---|---|
+| `warera_gui.py` | Control panel (stdlib-only Tkinter GUI + `--setup` headless mode): one-command first-time setup (venv, TimescaleDB container, schema, latest backup), start/stop/restart the web viewer, local backups + backup restore, API token storage |
+| `docker-compose.yml` | Manual alternative to the GUI's container setup (`docker compose up -d` — same image/port/volume) |
 | `base_data/` | Schema DDL (`create_tables.sql`), PL/pgSQL functions (`functions.sql`), indexes, views |
 | `Python/` | Battle tooling: shared modules (`api.py` WarEra API client, `db.py` SQLAlchemy DB access + SQL helpers, `utils.py` time/state/constants + `prepare_transaction()`, `endpoint_log.py`) + the CLI scripts (`update_battles.py`, `update_live.py`, `update_countries.py`, `insert_ranking_sample.py`, `update_users.py`, `update_users_lite.py`, `update_weekly_ranking.py`, `seed_endpoints.py`) + the web viewer (`db_web.py` entry point and the `viewer/` package with its pages, incl. the `/tracker` damage tracker and the `/weekly` rankings) |
 | `data/battle_timestamps.json` | Battle timestamp index for batched pagination (oldest-first, append-only) |
