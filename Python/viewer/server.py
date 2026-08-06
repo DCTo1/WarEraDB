@@ -11,7 +11,7 @@ from urllib.parse import parse_qs
 
 from .pages import (
     page_battle, page_battles, page_bounties, page_countries, page_overview,
-    page_sql, page_stats, page_user, page_users,
+    page_sql, page_stats, page_tracker, page_user, page_users, page_weekly,
 )
 from .updater import page_update_status, timer_state
 
@@ -22,6 +22,8 @@ ROUTES = {
     "/battle": page_battle,
     "/users": page_users,
     "/user": page_user,
+    "/tracker": page_tracker,
+    "/weekly": page_weekly,
     "/bounties": page_bounties,
     "/countries": page_countries,
     "/stats": page_stats,

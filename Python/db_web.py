@@ -20,6 +20,11 @@ Pages
     /user?name=  user detail: API lifetime stats + MU + battle history (top 50
     /user?hex=   battles by damage from battle_ranking_entries, side A/D, LIVE tag)
     /bounties    battles with bounties, filterable by country
+    /weekly      weekly rankings (prototype): current week = official snapshot
+                 copies, past weeks = retained finals + derived totals
+    /tracker     damage tracker (HISTORIC_RANKING.md §6): entity (user/country/
+                 MU) + 1-2 dates → per-battle damage (deduped ranking rows),
+                 for/against countries, weekly totals
     /countries   bounty money per country (total vs ended-battles pools)
     /stats       endpoint usage analytics (endpoints / endpoints_used tables)
     /sql         read-only SQL console (SELECT/EXPLAIN only, capped at 1000 rows)
@@ -36,7 +41,9 @@ rankings for the newest N battles not yet in the ranking tables (N =
 --ranking, default 1000; 0 disables the ranking pass), then
 Python/update_users_lite.py fetches user.getUserLite for up to
 --user-lite (default 100) unchecked users, wealth/damage rankings first (0
-disables the user pass). The header timer shows the seconds until the next
+disables the user pass), and Python/update_weekly_ranking.py stores hourly
+official weekly-ranking snapshots (--weekly 1, self-throttled to xx:01; 0
+disables). The header timer shows the seconds until the next
 run and switches to "updating…" while a run is in progress.
 
 Stdlib only for the viewer itself (the spawned pipeline scripts use
@@ -72,11 +79,16 @@ def main() -> int:
     p.add_argument("--user-lite", type=int, default=config.settings.user_lite_limit,
                    help="unchecked users to fetch user.getUserLite for after the "
                         "ranking pass (default 100, 0 disables the user pass)")
+    p.add_argument("--weekly", type=int, default=int(config.settings.weekly_enabled),
+                   help="hourly weekly-ranking snapshot fetch (weeklyUserDamages/"
+                        "weeklyCountryDamages/muWeeklyDamages, self-throttled to "
+                        "xx:01; default 1, 0 disables)")
     args = p.parse_args()
 
     config.settings.db = args.db
     config.settings.ranking_latest = args.ranking
     config.settings.user_lite_limit = args.user_lite
+    config.settings.weekly_enabled = args.weekly != 0
 
     threading.Thread(target=updater.scheduler_loop, daemon=True).start()
     srv = ThreadingHTTPServer(("127.0.0.1", args.port), server.Handler)

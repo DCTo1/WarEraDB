@@ -71,7 +71,9 @@ def page_user(q: dict) -> str:
         for r in top)
     title = u.get("username") or f"…{hexid[-8:]}"
     return layout(f"User: {title}", f"""
-        <h2>{esc(title)} <span class="muted">· {hexid}</span></h2>
+        <h2>{esc(title)} <span class="muted">· {hexid}</span>
+        <a class="muted" href="/tracker?{urlencode({'name': u.get('username') or '', 'hex': hexid})}"
+           title="damage tracker: per-battle + weekly damage over a date range">tracker →</a></h2>
         <table>
         {kv("MU", f"<a href='/user?{urlencode({'hex': u['mu']})}'>{u['mu']}</a>" if u.get("mu") else "—")}
         {kv("Military rank", u.get("military_rank") or "—")}

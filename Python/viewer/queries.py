@@ -7,17 +7,35 @@ return error_page(err)`. Underneath, queries run through Python/db.py
 (WARERA_DB_URL, BATTLE_DB / --db).
 """
 
-from db import query_dicts as _db_query_dicts
+from db import engine, query_dicts as _db_query_dicts
 
 from .config import settings
 
-__all__ = ["query_dicts", "first_val", "country_where"]
+__all__ = ["query_dicts", "query_dicts_nopar", "first_val", "country_where"]
 
 
 def query_dicts(sql: str) -> tuple[list, str | None]:
     """Run a SELECT against the configured DB; return (rows, error)."""
     try:
         return _db_query_dicts(sql, settings.db), None
+    except RuntimeError as exc:
+        return [], str(exc)
+
+
+def query_dicts_nopar(sql: str) -> tuple[list, str | None]:
+    """Like query_dicts, but with max_parallel_workers_per_gather = 0
+    (SET LOCAL in the same transaction, separate executions — psycopg only
+    surfaces the first result set of a multi-statement string).
+
+    For ranking-hypertable scans: a parallel scan/hash of the compressed
+    chunks fails on this machine with "could not resize shared memory
+    segment ... No space left on device" (the container's shared memory is
+    small), while the sequential plan is fine (the tracker page relies on
+    this)."""
+    try:
+        with engine(settings.db).begin() as conn:
+            conn.exec_driver_sql("SET LOCAL max_parallel_workers_per_gather = 0;")
+            return [dict(row) for row in conn.exec_driver_sql(sql).mappings()], None
     except RuntimeError as exc:
         return [], str(exc)
 

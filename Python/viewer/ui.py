@@ -26,7 +26,9 @@ TIMER_JS = """<script>
 </script>"""
 
 THEME_INIT = """<script>
-try { if (localStorage.getItem('warera_theme') === 'light') document.documentElement.className = 'light'; } catch (e) {}
+try { document.documentElement.classList.add('js');
+  if (localStorage.getItem('warera_theme') === 'light') document.documentElement.classList.add('light');
+} catch (e) {}
 </script>"""
 
 THEME_JS = """<script>
@@ -34,15 +36,30 @@ THEME_JS = """<script>
   var btn = document.getElementById('theme_btn');
   if (!btn) return;
   function icon() {
-    btn.textContent = document.documentElement.className === 'light' ? '\\u2600' : '\\u263E';
+    btn.textContent = document.documentElement.classList.contains('light') ? '\\u2600' : '\\u263E';
   }
   btn.addEventListener('click', function () {
-    var light = document.documentElement.className === 'light';
-    document.documentElement.className = light ? '' : 'light';
+    var light = document.documentElement.classList.contains('light');
+    document.documentElement.classList.toggle('light', !light);
     try { localStorage.setItem('warera_theme', light ? 'dark' : 'light'); } catch (e) {}
     icon();
   });
   icon();
+})();
+</script>"""
+
+MORE_JS = """<script>
+(function () {
+  // "show all" buttons (tracker tables): reveal the rows hidden by the
+  // top-20 cap (CSS .js tr.more { display: none }) and remove the button.
+  // Delegated on document so it survives pjax main swaps.
+  document.addEventListener('click', function (e) {
+    var b = e.target && e.target.closest ? e.target.closest('button.more-btn') : null;
+    if (!b) return;
+    var rows = b.parentNode.querySelectorAll('tr.more');
+    for (var i = 0; i < rows.length; i++) rows[i].classList.remove('more');
+    b.parentNode.removeChild(b);
+  });
 })();
 </script>"""
 
@@ -144,10 +161,18 @@ STYLES = """
   table { border-collapse: collapse; width: 100%; font-size: 13px; margin-top: 8px; }
   th, td { border: 1px solid var(--border); padding: 4px 8px; text-align: left; white-space: nowrap; }
   th { background: var(--th-bg); } td.k { font-weight: bold; width: 180px; background: var(--th-bg); }
+  th.n, td.n { width: 26px; padding: 4px 2px; text-align: right; color: var(--muted); }
   .cards { display: flex; gap: 12px; flex-wrap: wrap; margin: 12px 0; }
   .cards a { color: inherit; } .cards a:hover { text-decoration: none; }
   .card { background: var(--panel); border: 1px solid var(--border); border-radius: 6px; padding: 10px 16px; }
   .num { font-size: 22px; font-weight: bold; } .lbl { color: var(--muted); font-size: 12px; }
+  .split { display: grid; grid-template-columns: 1fr 1fr; gap: 0 24px; align-items: start; }
+  .split h4 { margin: 16px 0 2px; }
+  @media (max-width: 860px) { .split { grid-template-columns: 1fr; } }
+  .tblwrap { margin-bottom: 8px; }
+  .more-btn { display: none; margin: 6px 0 10px; cursor: pointer; }
+  .js tr.more { display: none; }
+  .js .more-btn { display: inline-block; }
   .tabs { margin: 14px 0 0; } .tabs a { padding: 4px 10px; border: 1px solid var(--border);
          border-radius: 4px 4px 0 0; background: var(--panel); }
   .tabs a.on { background: var(--bg); border-bottom: 1px solid var(--bg); color: var(--text);
@@ -203,9 +228,10 @@ def layout(title: str, body: str, refresh: bool = False) -> str:
 <a class="timer" href="/update-status" title="updater log"><span id="upd_lbl">next update in</span>
 <b id="upd_sec">…</b>s</a></div></div>
 <nav><a href="/">Overview</a><a href="/battles">Battles</a>
-<a href="/users">Users</a><a href="/bounties">Bounties</a><a href="/countries">Countries</a>
+<a href="/users">Users</a><a href="/weekly">Weekly</a><a href="/tracker">Tracker</a><a href="/bounties">Bounties</a><a href="/countries">Countries</a>
 <a href="/stats">Stats</a><a href="/sql">SQL</a></nav>
 <hr><main id="main">{body}</main>
 {TIMER_JS}
 {THEME_JS}
+{MORE_JS}
 {NAV_JS}</body></html>"""

@@ -31,6 +31,7 @@ import os
 import random
 import sys
 import time
+from datetime import datetime, timezone
 
 import requests
 
@@ -44,6 +45,7 @@ from db import (
     loot_sql,
     query,
     value_sql,
+    weekly_damage_stmts,
 )
 from utils import (
     BASE_DIR,
@@ -66,6 +68,19 @@ FLUSH = 20000
 DATATYPES = ("damage", "points", "money")
 TYPES = ("user", "country", "mu")
 SIDES = ("attacker", "defender")
+
+def recent_era(months: int = 2) -> str:
+    """'YYYY-MM' era gate for the user_weekly_damage rebuild: battles ended
+    within the last *months* months get their weeks rebuilt in finish()
+    (their round rows are still settling); older battles' weeks are
+    immutable and covered by update_weekly_ranking.py --backfill, so
+    historical backfill runs skip the ~1-2 s rebuild per battle."""
+    now = datetime.now(timezone.utc)
+    y, m = now.year, now.month - months
+    while m <= 0:
+        m += 12
+        y -= 1
+    return f"{y:04d}-{m:02d}"
 
 
 def batch_get(s: requests.Session, body: dict, requests_counter: list[int]) -> list:
@@ -186,9 +201,13 @@ WHERE r.side = 3 AND r.battle_id = s.battle_id AND r.round_number = s.round_numb
     ]
 
 
-def finish(battle, items):
+def finish(battle, items, weekly=True):
     """items: {combo: [ranking items]} for one battle → insert stmts (sides +
-    fetched merged) + merged cleanup stmts. Returns (entries, slots) for stats."""
+    fetched merged) + merged cleanup stmts + the ranking_verified_at stamp +
+    the user_weekly_damage week rebuild (weekly — battle-end only; the gate
+    is computed in main() so old battles skip it, their weeks are immutable
+    and covered by the one-time backfill).
+    Returns (entries, slots) for stats."""
     bcombos, rcombos = {}, {}
     slots = 0
     for (b, rid, num, dt, typ, side), its in items.items():
@@ -209,6 +228,11 @@ def finish(battle, items):
     # user_battle_stats for this battle, in the SAME flush as the upserts +
     # cleanup deletes (exact by construction — the /user page reads it).
     blk.extend(battle_summary_stmts([battle]))
+    # user_weekly_damage: rebuild the weeks this battle's rounds fall in
+    # (whole-week rebuild — same flush, exact by construction). Battle-end
+    # only: round rows exist solely for ended battles.
+    if weekly:
+        blk.extend(weekly_damage_stmts(battle))
     return blk, slots
 
 
@@ -560,7 +584,8 @@ def main():
                     for k in list(items):
                         if k[0] == c[0]:
                             del items[k]
-                    blk, bslots = finish(c[0], cb)
+                    blk, bslots = finish(c[0], cb,
+                                         weekly=era_of.get(c[0], "?") >= recent_era())
                     stmts.extend(blk)
                     if len(stmts) >= FLUSH:
                         flush()
