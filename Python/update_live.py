@@ -33,7 +33,11 @@ Per run:
      pipelined (WORKERS=16 requests in flight; the walk was sequential until
      2026-08-04 and one sync of the live battles took 30-60 s), upserted via
      insert_battle_ranking_entry on a background flusher thread (the DB
-     writes no longer stall the API walk). Pagination is capped at LIVE_PAGES
+     writes no longer stall the API walk). Since 2026-08-07 the requests are
+     MIXED: the slack slots (up to MAX_BATCH=50 total calls) carry
+     user.getUserLite calls from the users backfill queue
+     (update_users_lite.Filler) — the walk keeps its request count while the
+     queue drains at no extra cost. Pagination is capped at LIVE_PAGES
      (3) per combo: the rows are partial by design (the final end-of-battle
      fetch overwrites them) and the site only shows the top of each ranking,
      so deep pages would only buy discarded rows — the API takes ~25 s to
@@ -60,7 +64,7 @@ from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 import requests
 
 import endpoint_log
-from api import batched_fetch, make_session
+from api import batched_fetch, make_session, mixed_fetch
 from db import (
     active_battle_hexes,
     battle_summary_stmts,
@@ -82,6 +86,7 @@ from utils import (
     read_json,
     write_json,
 )
+from update_users_lite import Filler
 
 STATE_FILE = os.path.join(BASE_DIR, "live_state.json")
 
@@ -98,12 +103,18 @@ LIVE_PAGES = 3          # pagination depth cap per live combo (300 entries).
 DATA_TYPES = ("damage", "points")
 
 
-def fetch_live_battles(s: requests.Session) -> list[dict]:
-    """ALL active battles in one request."""
-    out = batched_fetch(s, "battle.getBattles",
-                        [{"isActive": True, "limit": 100, "cursor": FUTURE_CURSOR}])
+def fetch_live_battles(s: requests.Session, filler: Filler | None = None) -> list[dict]:
+    """ALL active battles in one request (filler tops up the slack slots)."""
+    calls = [("battle.getBattles", {"isActive": True, "limit": 100, "cursor": FUTURE_CURSOR})]
+    if filler is not None:
+        slots = filler.top_up(calls)
+    else:
+        slots = []
+    out = mixed_fetch(s, calls)
     if "error" in out[0]:
         raise RuntimeError(f"getBattles: {out[0]['error']}")
+    if filler is not None and slots:
+        filler.collect(out, slots)
     return out[0]["result"]["data"]["items"]
 
 
@@ -181,7 +192,8 @@ class EndpointDown(RuntimeError):
     """The ranking endpoint is failing wholesale (not a per-combo issue)."""
 
 
-def fetch_live_rankings(s: requests.Session, battles: list[dict], dbname: str) -> tuple[int, int]:
+def fetch_live_rankings(s: requests.Session, battles: list[dict], dbname: str,
+                        filler: Filler | None = None) -> tuple[int, int]:
     """Per-entity battle rankings for live battles (partial, growing).
 
     Battles whose DB ended_at is already set are skipped: they ended between
@@ -207,6 +219,11 @@ def fetch_live_rankings(s: requests.Session, battles: list[dict], dbname: str) -
         hexes = [b["_id"] for b in battles]
     if not hexes:
         return 0, 0
+    # created_at for live ranking rows = the BATTLE's createdAt, not each
+    # item's: the API regenerates ranking docs constantly and every item's
+    # createdAt shifts, which used to mint a NEW row per refresh instead of
+    # upserting (battle_ranking_entries duplicate rows for live battles).
+    battle_created = {b["_id"]: b.get("createdAt") for b in battles}
     stmts: list[str] = []
     buf_n = 0
     entries_n = 0
@@ -243,27 +260,32 @@ def fetch_live_rankings(s: requests.Session, battles: list[dict], dbname: str) -
         stmts = []
         buf_n = 0
 
-    def fetch_body(bodies: dict) -> tuple[list[dict], int]:
-        """One batched request. On batch failure, probe with a single call:
-        if the probe also fails the whole endpoint is down (it intermittently
-        400s for minutes at a time when ranking docs are rewritten at battle
-        end) — raise EndpointDown so the walk aborts fast. If the endpoint is
-        healthy the failure is per-combo; retry each call individually and
-        skip the bad ones (caught by the next cycle). Returns (responses
-        aligned to body keys, failed_count)."""
+    def fetch_body(calls: list[tuple[str, dict]]) -> tuple[list, int]:
+        """One batched request (ranking calls + user.getUserLite filler).
+
+        On batch failure, probe with a single ranking call: if the probe also
+        fails the whole endpoint is down (it intermittently 400s for minutes
+        at a time when ranking docs are rewritten at battle end) — raise
+        EndpointDown so the walk aborts fast. If the endpoint is healthy the
+        failure is per-combo; retry each ranking call individually and skip
+        the bad ones (caught by the next cycle); filler calls are dropped
+        (re-picked next cycle). Returns (responses aligned to calls,
+        failed_ranking_count)."""
         try:
-            return batched_fetch(s, "battleRanking.getRanking",
-                                 list(bodies.values()), retries=2), 0
+            return mixed_fetch(s, calls, retries=2), 0
         except RuntimeError as exc:
             try:
-                probe = next(iter(bodies.values()))
+                probe = next(p for ep, p in calls if ep == "battleRanking.getRanking")
                 batched_fetch(s, "battleRanking.getRanking", [probe], retries=1)
             except RuntimeError:
                 raise EndpointDown(exc)
             print(f"  batch failed ({exc}) — retrying individually", file=sys.stderr)
             out = []
             failed = 0
-            for p in bodies.values():
+            for ep, p in calls:
+                if ep != "battleRanking.getRanking":
+                    out.append({"error": {"message": "filler dropped after batch failure"}})
+                    continue
                 try:
                     out.append(batched_fetch(s, "battleRanking.getRanking", [p], retries=1)[0])
                 except RuntimeError as e2:
@@ -290,20 +312,29 @@ def fetch_live_rankings(s: requests.Session, battles: list[dict], dbname: str) -
     pool = ThreadPoolExecutor(max_workers=WORKERS)
 
     def fill() -> None:
-        """Submit batched bodies until the pool is full or no work is left."""
+        """Submit batched bodies until the pool is full or no work is left.
+        Each body = up to BODY_CAP ranking calls, topped up with getUserLite
+        filler calls (mixed batch) — the slack slots pay for the user-lite
+        backfill queue at no extra request cost."""
         nonlocal requests_n
         while pending and len(inflight) < WORKERS:
-            body: dict = {}
-            while pending and len(body) < BODY_CAP:
+            combos: list = []
+            calls: list[tuple[str, dict]] = []
+            while pending and len(calls) < BODY_CAP:
                 c = pending.popleft()
+                combos.append(c)
                 payload = {"battleId": c[0], "dataType": c[1], "type": c[2],
                            "side": c[3], "limit": PAGE_LIMIT}
                 if c in cursors:
                     payload["cursor"] = cursors[c]
-                body[c] = payload
-            if body:
-                inflight[pool.submit(fetch_body, body)] = body
-                requests_n += 1
+                calls.append(("battleRanking.getRanking", payload))
+            if not calls:
+                break
+            slots: list[int] = []
+            if filler is not None:
+                slots = filler.top_up(calls)
+            inflight[pool.submit(fetch_body, calls)] = (combos, slots)
+            requests_n += 1
 
     def drain() -> None:
         """Turn finished combos' accumulated items into upsert statements."""
@@ -320,7 +351,8 @@ def fetch_live_rankings(s: requests.Session, battles: list[dict], dbname: str) -
                     c[0], c[3], c[2], ent,
                     it.get("value") if c[1] == "damage" else None,
                     it.get("value") if c[1] == "points" else None,
-                    None, loot if loot.get("_id") else None, it.get("createdAt")))
+                    None, loot if loot.get("_id") else None,
+                    battle_created.get(c[0]) or it.get("createdAt")))
                 buf_n += 1
                 entries_n += 1
             del items[c]
@@ -332,7 +364,7 @@ def fetch_live_rankings(s: requests.Session, battles: list[dict], dbname: str) -
         while inflight:
             done, _ = wait(list(inflight), return_when=FIRST_COMPLETED)
             for fut in done:
-                body = inflight.pop(fut)
+                combos, slots = inflight.pop(fut)
                 try:
                     data, failed = fut.result()
                 except EndpointDown as exc:
@@ -342,7 +374,7 @@ def fetch_live_rankings(s: requests.Session, battles: list[dict], dbname: str) -
                     inflight.clear()
                     break
                 combo_failed += failed
-                for c, res in zip(body.keys(), data):
+                for c, res in zip(combos, data[:len(combos)]):
                     if "error" in res:
                         combo_failed += 1
                         continue
@@ -361,12 +393,15 @@ def fetch_live_rankings(s: requests.Session, battles: list[dict], dbname: str) -
                     else:
                         cursors.pop(c, None)
                         active.discard(c)
+                if filler is not None and slots:
+                    filler.collect(data, slots)
                 # The ranking endpoint intermittently 400s for minutes at a
-                # time (ranking docs rewritten at battle end). If most calls
-                # of a request fail, the endpoint is down — abort and let the
-                # next cycle retry.
-                if failed > len(body) / 2:
-                    print(f"  ranking endpoint flaky: {failed}/{len(body)} calls failed "
+                # time (ranking docs rewritten at battle end). If most RANKING
+                # calls of a request fail, the endpoint is down — abort and
+                # let the next cycle retry (filler calls don't count: their
+                # endpoint is independent).
+                if failed > len(combos) / 2:
+                    print(f"  ranking endpoint flaky: {failed}/{len(combos)} calls failed "
                           f"— aborting ranking sync (retry next cycle)", file=sys.stderr)
                     aborted = True
                     inflight.clear()
@@ -408,8 +443,9 @@ def main() -> int:
     dbname = args.db
 
     s = make_session(pool_size=16)
+    filler = Filler(dbname)
     try:
-        live = fetch_live_battles(s)
+        live = fetch_live_battles(s, filler)
     except RuntimeError as exc:
         print(f"API failure: {exc}", file=sys.stderr)
         _flush_safe(dbname)
@@ -417,18 +453,25 @@ def main() -> int:
     print(f"live battles from API: {len(live)}", flush=True)
 
     try:
-        _sync(s, live, args, dbname)
+        _sync(s, live, args, dbname, filler)
     except RuntimeError as exc:
         if str(exc).startswith("DB error"):
             print(f"DB failure: {exc}", file=sys.stderr)
             _flush_safe(dbname)
             return 2
         raise
+    # Flush filler upserts (user.getUserLite docs fetched as batch slack)
+    fs = filler.stmts()
+    if fs:
+        exec_many(fs, dbname)
+        print(f"  filler: {len(filler.fetched)} users upserted, "
+              f"{len(filler.dead)} dead marked", flush=True)
     _flush_safe(dbname)
     return 0
 
 
-def _sync(s: requests.Session, live: list[dict], args, dbname: str) -> None:
+def _sync(s: requests.Session, live: list[dict], args, dbname: str,
+          filler: Filler | None = None) -> None:
     """Reconciliation + battle-doc refresh + (throttled) live rankings."""
     db_active = active_battle_hexes(dbname)
 
@@ -447,7 +490,7 @@ def _sync(s: requests.Session, live: list[dict], args, dbname: str) -> None:
         state = read_json(STATE_FILE, {})
         last = state.get("last_ranking_at", 0)
         if time.time() - last >= args.ranking_interval:
-            reqs, entries = fetch_live_rankings(s, live, dbname)
+            reqs, entries = fetch_live_rankings(s, live, dbname, filler)
             print(f"rankings: {entries} live entries in {reqs} requests", flush=True)
             write_json(STATE_FILE, {**state, "last_ranking_at": int(time.time())})
         else:
