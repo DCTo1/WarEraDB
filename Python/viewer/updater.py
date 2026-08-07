@@ -121,7 +121,11 @@ def _run_updater() -> None:
     update_weekly_ranking.py (hourly self-throttled snapshot fetch), then
     update_users_lite.py."""
     db = settings.db
-    env = dict(os.environ, BATTLE_DB=db)
+    # WARERA_NO_RETRIES: the 15 s cycle must never block on API retries —
+    # a transient failure burns seconds × retries (up to ~50 s of backoff)
+    # and starves the other pipeline steps. Fail fast instead; the next
+    # cycle re-attempts the same work.
+    env = dict(os.environ, BATTLE_DB=db, WARERA_NO_RETRIES="1")
     rc2 = 0  # ranking step rc (0 = skipped when --ranking 0 disables it)
     rc5 = 0  # weekly snapshot step rc (0 = skipped when --weekly 0 disables it)
     try:

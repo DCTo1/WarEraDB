@@ -9,9 +9,22 @@ Usage:
     s = api.make_session()
     data = api.fetch_data(s, "battle.getById", {"battleId": hex_id})
     results = api.batched_fetch(s, "battle.getBattles", [{"limit": 100}, ...])
+    results = api.mixed_fetch(s, [("battle.getById", {"battleId": b}),
+                                  ("user.getUserLite", {"userId": u})])
 
-Both helpers log one endpoint usage per call via endpoint_log (batched
-requests log once per payload) — db.py flushes the queue on the next DB call.
+batched_fetch sends N calls of ONE endpoint; mixed_fetch sends (endpoint,
+payload) pairs, so different endpoints share one request (standard tRPC
+positional batching — verified 2026-08-07: mixed batches dispatch per
+position; 200 when all calls succeed, 207 with in-band per-call errors when
+some fail, 404 for the whole request when ALL fail). Both helpers log one
+endpoint usage per call via endpoint_log (batched requests log once per
+payload) — db.py flushes the queue on the next DB call.
+
+Both helpers retry by default (the API intermittently drops connections).
+Set WARERA_NO_RETRIES=1 to force a single attempt with no backoff sleeps —
+the web viewer's auto-updater (viewer/updater.py) sets this for every script
+it spawns, since its 15 s cycle must never block on retries; failures are
+simply re-attempted by the next cycle.
 """
 
 import json
@@ -27,6 +40,14 @@ from utils import API_KEY_FILE, MAX_BATCH
 # API tokens (x-api-key) are only accepted on api2.warera.io (api4/api5
 # reject them with 403 "API tokens are not allowed on this hostname").
 API_URL = "https://api2.warera.io/trpc"
+
+
+def _no_retries() -> bool:
+    """Updater mode: the viewer's 15 s cycle must never block on retries —
+    a failed call is simply re-attempted by the next cycle. The updater sets
+    WARERA_NO_RETRIES for every script it spawns; standalone runs keep the
+    retries (backfill over millions of rows)."""
+    return bool(os.environ.get("WARERA_NO_RETRIES"))
 
 
 def load_api_key() -> str:
@@ -52,15 +73,24 @@ def make_session(pool_size: int = 10) -> requests.Session:
     return s
 
 
-def _endpoint_url(endpoint: str, calls: int = 1) -> str:
-    """tRPC batch URL: the endpoint name is repeated once per call."""
-    return f"{API_URL}/{','.join([endpoint] * calls)}?batch=1"
+def _endpoint_url(endpoints: list[str]) -> str:
+    """tRPC batch URL: the endpoints joined in call order (an endpoint used
+    by several calls appears once per call)."""
+    return f"{API_URL}/{','.join(endpoints)}?batch=1"
 
 
 def _auth_error() -> RuntimeError:
     return RuntimeError(
         "API key rejected (401): check WARERA_API_KEY or ~/.config/warera/api_key.txt"
     )
+
+
+class NotFoundError(RuntimeError):
+    """HTTP 404 from the API: the referenced resource does not exist (e.g. a
+    deleted user). The server rejects the WHOLE request when EVERY call in it
+    fails (mixed batches return 207 with in-band per-call errors when only
+    some fail) — callers isolate the dead calls by splitting (see
+    update_users_lite.fetch_lite) instead of retrying them forever."""
 
 
 def fetch_data(session: requests.Session, endpoint: str, payload: dict,
@@ -70,19 +100,26 @@ def fetch_data(session: requests.Session, endpoint: str, payload: dict,
     The API intermittently accepts connections but never responds, so each
     attempt can burn the full read timeout; more retries with a short timeout
     is more robust than few retries with a long one. 401 raises (auth is
-    fatal everywhere); 429 retries with backoff.
+    fatal everywhere); 429 retries with backoff. WARERA_NO_RETRIES forces a
+    single attempt with no sleeps (the updater's 15 s cycle must not block).
     """
+    if _no_retries():
+        retries = 0
     last_err = None
-    for attempt in range(1, retries + 1):
+    for attempt in range(1, max(1, retries) + 1):
         try:
-            resp = session.post(_endpoint_url(endpoint), json={"0": payload}, timeout=timeout)
+            resp = session.post(_endpoint_url([endpoint]), json={"0": payload}, timeout=timeout)
             if resp.status_code == 401:
                 # raised (not sys.exit) so worker threads cannot kill the
                 # pool's map() and leave the main thread hanging forever
                 raise _auth_error()
             if resp.status_code == 429:
-                time.sleep(5 * attempt)
+                last_err = f"HTTP 429 (rate limited)"
+                if attempt < retries:
+                    time.sleep(5 * attempt)
                 continue
+            if resp.status_code == 404:
+                raise NotFoundError(f"HTTP 404: {endpoint} not found")
             resp.raise_for_status()
             return resp.json()[0]["result"]["data"]
         except RuntimeError:
@@ -94,35 +131,47 @@ def fetch_data(session: requests.Session, endpoint: str, payload: dict,
     raise RuntimeError(f"Failed after {retries} retries: {last_err}")
 
 
-def batched_fetch(session: requests.Session, endpoint: str, payloads: list[dict],
-                  retries: int = 6, timeout: float = 90) -> list:
-    """POST one tRPC batch call; return the per-call result objects.
+def mixed_fetch(session: requests.Session, calls: list[tuple[str, dict]],
+                retries: int = 6, timeout: float = 90) -> list:
+    """POST one tRPC batch of (endpoint, payload) calls; per-call results.
 
-    URL: <trpc>/endpoint,endpoint,...,endpoint?batch=1 (endpoint repeated),
-    body: {"0": payload0, "1": payload1, ...}. The response is a list aligned
-    with the call order. The server caps batches at 50 calls (413 otherwise).
+    The URL lists each call's endpoint at its position (standard tRPC batch
+    format — different endpoints may share one request; verified 2026-08-07:
+    per-position dispatch). Responses align positionally to ``calls``:
+      - 200 when every call succeeds;
+      - 207 when some fail — failing positions carry {"error": {...}} with
+        data.httpStatus (404 = dead entity), the rest carry results;
+      - 404 for the WHOLE request when every call fails (NotFoundError);
+      - 413 when more than MAX_BATCH calls (total, any endpoints).
     Logs one endpoint usage per call. 401 raises; 413/429 retry with backoff.
     """
-    if not payloads:
+    if not calls:
         return []
-    if len(payloads) > MAX_BATCH:
-        raise RuntimeError(f"batch too large: {len(payloads)} > {MAX_BATCH}")
-    for _ in payloads:
-        endpoint_log.log(endpoint)
-    url = _endpoint_url(endpoint, len(payloads))
-    body = {str(i): p for i, p in enumerate(payloads)}
+    if len(calls) > MAX_BATCH:
+        raise RuntimeError(f"batch too large: {len(calls)} > {MAX_BATCH}")
+    if _no_retries():
+        retries = 0
+    for ep, _ in calls:
+        endpoint_log.log(ep)
+    url = _endpoint_url([ep for ep, _ in calls])
+    body = {str(i): p for i, (_, p) in enumerate(calls)}
     last_err = None
-    for attempt in range(1, retries + 1):
+    for attempt in range(1, max(1, retries) + 1):
         try:
             resp = session.post(url, json=body, timeout=timeout)
             if resp.status_code == 401:
                 raise _auth_error()
             if resp.status_code in (413, 429):
-                time.sleep(5 * attempt)
+                last_err = f"HTTP {resp.status_code}"
+                if attempt < retries:
+                    time.sleep(5 * attempt)
                 continue
+            if resp.status_code == 404:
+                raise NotFoundError(f"HTTP 404: batch rejected "
+                                    "(every call references a dead entity)")
             resp.raise_for_status()
             data = resp.json()
-            if not isinstance(data, list) or len(data) != len(payloads):
+            if not isinstance(data, list) or len(data) != len(calls):
                 raise RuntimeError(f"unexpected batch response shape: {type(data).__name__}")
             return data
         except RuntimeError:
@@ -132,3 +181,10 @@ def batched_fetch(session: requests.Session, endpoint: str, payloads: list[dict]
             if attempt < retries:
                 time.sleep(min(2 ** attempt, 20))
     raise RuntimeError(f"Failed after {retries} retries: {last_err}")
+
+
+def batched_fetch(session: requests.Session, endpoint: str, payloads: list[dict],
+                  retries: int = 6, timeout: float = 90) -> list:
+    """POST one tRPC batch of N calls of ONE endpoint (see mixed_fetch)."""
+    return mixed_fetch(session, [(endpoint, p) for p in payloads],
+                       retries=retries, timeout=timeout)
