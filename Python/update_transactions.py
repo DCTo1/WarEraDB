@@ -31,7 +31,8 @@ created_at) DO NOTHING), so overlaps and re-fetches are idempotent. Endpoint
 usage is logged by batched_fetch (flushed inside the insert transaction).
 
 State: Python/transactions_state.json (atomic write per cycle):
-    live:     {prev_newest_ms}   — newest item stored last cycle (gap anchor)
+    live:     {prev_newest_ms, last_probe_ms}  — newest item stored last run
+              (gap anchor) + when the last probe round fired
     buckets:  [{top_ms, bottom_ms, cursor_ms, done}]  — pending walks
     done:     bool               — window fully stored (no buckets pending)
     window_hours: float
@@ -45,6 +46,15 @@ Usage:
         --probe-offset 5 --probe-depth 4                     # probe tiling
         --bucket-cap 46                                      # parallel buckets
         --verify                                             # coverage report
+
+The web viewer's 15 s cycle does NOT run this script anymore — the same
+work rides as FILLER in the mixed batches of update_battles.py /
+update_live.py / update_weekly_ranking.py (TransactionFiller class, see
+extra/FILLERS.md): pending bucket pages + live probes fill the scripts'
+slack slots until the window fill drains, then only the probes remain
+(once per PROBE_EVERY seconds). This script stays for standalone
+backfill/recovery runs and --verify; do not run it while a viewer cycle
+is filling (they share the state file).
 
 Exit: 0 ok / 1 API / 2 DB. WARERA_NO_RETRIES (set by the viewer's
 updater) forces single attempts — a failed cycle is re-attempted 15 s
@@ -102,8 +112,8 @@ def _make_buckets(bottom_ms: int, top_ms: int, n: int) -> list[dict]:
     return out
 
 
-def _store(items: list[dict], db: str) -> int:
-    """Dedupe by _id and pipe through insert_transaction() in one transaction."""
+def _store_stmts(items: list[dict]) -> list[str]:
+    """Dedupe by _id and build the insert_transaction statements."""
     seen: set[str] = set()
     uniq: list[dict] = []
     for it in items:
@@ -111,16 +121,21 @@ def _store(items: list[dict], db: str) -> int:
         if tid and tid not in seen:
             seen.add(tid)
             uniq.append(it)
-    if not uniq:
-        return 0
-    stmts = [
+    return [
         "SELECT insert_transaction($JSON$"
         + json.dumps(prepare_transaction(t), ensure_ascii=False, separators=(",", ":"))
         + "$JSON$);"
         for t in uniq
     ]
+
+
+def _store(items: list[dict], db: str) -> int:
+    """Dedupe by _id and pipe through insert_transaction() in one transaction."""
+    stmts = _store_stmts(items)
+    if not stmts:
+        return 0
     exec_batch(stmts, db, chunk=FLUSH_CHUNK)
-    return len(uniq)
+    return len(stmts)
 
 
 def _run_cycle(s, args, state: dict, now_ms: int, edge_ms: int) -> int:
@@ -215,7 +230,8 @@ def _run_cycle(s, args, state: dict, now_ms: int, edge_ms: int) -> int:
     bottoms: list[int] = [b for b in probe_bottoms if b is not None]
     if not args.skip_backfill and not args.backfill_only \
             and len(bottoms) == args.probe_depth:
-        prev_newest = live.get("prev_newest_ms")
+        prev_newest = max(live.get("prev_newest_ms") or 0,
+                          newest_ms or 0) or None
         # internal tile contiguity: tile i−1's bottom must reach tile i's top
         for i in range(1, args.probe_depth):
             tile_top = now_ms - int(i * args.probe_offset * 1000)
@@ -229,8 +245,14 @@ def _run_cycle(s, args, state: dict, now_ms: int, edge_ms: int) -> int:
             new_buckets += _make_buckets(edge_ms, now_ms - int(
                 (args.probe_depth - 1) * args.probe_offset * 1000), args.bucket_cap)
         elif prev_newest is not None and deepest > prev_newest + 1:
-            new_buckets += _make_buckets(prev_newest, deepest,
-                                         _page_span_hint(deepest - prev_newest, args.bucket_cap))
+            # spawn once per uncovered region (see the Filler's twin check —
+            # a stall re-detects the same gap every round otherwise)
+            if not any(b.get("top_ms", 0) >= deepest
+                       and b.get("bottom_ms", 0) <= prev_newest
+                       for b in buckets if not b.get("done")):
+                new_buckets += _make_buckets(prev_newest, deepest,
+                                             _page_span_hint(deepest - prev_newest,
+                                                             args.bucket_cap))
     if new_buckets:
         stats["gaps"] = stats.get("gaps", 0) + 1
         buckets.extend(new_buckets)
@@ -257,6 +279,196 @@ def _run_cycle(s, args, state: dict, now_ms: int, edge_ms: int) -> int:
         and live.get("prev_newest_ms") is not None
     write_json(STATE_FILE, state)
     return 0
+
+
+class TransactionFiller:
+    """Fills the slack slots of OTHER scripts' mixed batches with
+    transaction.getPaginatedTransactions calls — the rolling 72 h window
+    stays current (and the first fill drains) at zero extra request cost.
+
+    Work is demand-driven and self-limiting:
+      1. pending bucket pages (the finite window fill / gap repair) — one
+         page per bucket per script run; buckets drain and disappear;
+      2. live probes (no-cursor + now−offset tiling of the newest ~26 s) —
+         only when the last probe round is older than PROBE_EVERY seconds.
+    Both pools stop naturally: no pending buckets → no bucket calls; with
+    PROBE_EVERY = 0 the probes stop too and the window freezes at its
+    fill point (the default keeps a tiny probe presence because the window
+    always has a fresh top edge).
+
+    Results are collected per run and stored via insert_transaction
+    (idempotent ON CONFLICT, dedupe by _id): consumers flush
+    ``txn.stmts()`` through exec_batch and call ``txn.save_state()`` at the
+    end of the run. The shared state (Python/transactions_state.json) is
+    written atomically; the viewer's updater runs the consuming scripts
+    sequentially, so the file is never written concurrently — do NOT run
+    update_transactions.py standalone while a viewer cycle is filling.
+    """
+
+    PROBE_EVERY = 30  # min seconds between live probe rounds (0 = off)
+
+    def __init__(self, db: str) -> None:
+        self.db = db
+        self.state = read_json(STATE_FILE, DEFAULT_STATE)
+        self._slot_keys: dict[int, tuple[str, int]] = {}
+        self._offered: set[int] = set()
+        self._items: list[dict] = []
+        self._newest_ms: int | None = None
+        self._probe_bottoms: list[int | None] = []
+        self._probes_added = 0
+        self._dirty = False
+
+    def _probes_due(self, now_ms: int) -> bool:
+        if not self.PROBE_EVERY:
+            return False
+        last = self.state.get("live", {}).get("last_probe_ms")
+        return last is None or now_ms - last >= self.PROBE_EVERY * 1000
+
+    def top_up(self, calls: list[tuple[str, dict]]) -> list[int]:
+        """Append transaction.getPaginatedTransactions calls until the batch
+        holds MAX_BATCH: pending bucket pages first (the finite window-fill
+        work), then live probes when a round is due. Returns the indices
+        (into ``calls``) of the filler calls added."""
+        now_ms = int(time.time() * 1000)
+        edge_ms = int(now_ms - self.state.get("window_hours", DEFAULT_WINDOW_HOURS) * 3600_000)
+        buckets = self.state.setdefault("buckets", [])
+        if not buckets and not self.state.get("done"):
+            # fresh state → seed the edge-to-top window fill (rides the slack)
+            top = now_ms - int((DEFAULT_PROBE_DEPTH - 1) * DEFAULT_PROBE_OFFSET * 1000)
+            if top > edge_ms:
+                buckets.extend(_make_buckets(edge_ms, top, DEFAULT_BUCKET_CAP))
+                self._dirty = True
+        slots: list[int] = []
+        # Live probes get FIRST priority when a round is due: the top edge
+        # must stay covered even while a large bucket pile is draining —
+        # buckets first starve the probes (their gap detection is what keeps
+        # the newest data flowing, and the pile only shrinks by draining).
+        if self._probes_due(now_ms):
+            for i in range(DEFAULT_PROBE_DEPTH):
+                if len(calls) >= MAX_BATCH:
+                    break
+                off = int(i * DEFAULT_PROBE_OFFSET * 1000)
+                p = {"limit": PAGE_LIMIT, "direction": "forward"}
+                if off:
+                    p["cursor"] = str(now_ms - off)
+                pos = len(calls)
+                self._slot_keys[pos] = ("probe", i)
+                self._probes_added += 1
+                slots.append(pos)
+                calls.append(("transaction.getPaginatedTransactions", p))
+        for i, b in enumerate(buckets):
+            if len(calls) >= MAX_BATCH:
+                break
+            if b.get("done") or i in self._offered:
+                continue
+            cursor = b.get("cursor_ms") or b["top_ms"] + 1
+            pos = len(calls)
+            self._slot_keys[pos] = ("bucket", i)
+            self._offered.add(i)
+            slots.append(pos)
+            calls.append(("transaction.getPaginatedTransactions",
+                          {"limit": PAGE_LIMIT, "direction": "forward",
+                           "cursor": str(cursor)}))
+        return slots
+
+    def collect(self, results: list, slots: list[int]) -> None:
+        """Pick transaction results out of a mixed_fetch response (positions
+        ``slots``): advance bucket cursors, track probe bottoms for gap
+        detection, stash items for stmts(). Errors are skipped — retried by
+        the next run."""
+        now_ms = int(time.time() * 1000)
+        live = self.state.setdefault("live", {})
+        buckets = self.state.setdefault("buckets", [])
+        stats = self.state.setdefault("stats", {})
+        edge_ms = int(now_ms - self.state.get("window_hours", DEFAULT_WINDOW_HOURS) * 3600_000)
+        for pos in slots:
+            if pos >= len(results):
+                continue
+            res = results[pos]
+            kind, idx = self._slot_keys.get(pos, ("", -1))
+            if "error" in res:
+                stats["failed_calls"] = stats.get("failed_calls", 0) + 1
+                if kind == "probe":
+                    self._probe_bottoms.append(None)
+                continue
+            its = (res["result"]["data"].get("items")) or []
+            if kind == "probe":
+                self._probe_bottoms.append(to_unix_ms(its[-1]["createdAt"]) if its else None)
+            elif kind == "bucket" and 0 <= idx < len(buckets):
+                b = buckets[idx]
+                if its:
+                    b["cursor_ms"] = to_unix_ms(its[-1]["createdAt"]) + 1
+                    if b["cursor_ms"] - 1 <= b["bottom_ms"]:
+                        b["done"] = True
+                else:
+                    b["done"] = True  # empty page = below the rolling edge
+            if its:
+                m = to_unix_ms(its[0]["createdAt"])
+                if self._newest_ms is None or m > self._newest_ms:
+                    self._newest_ms = m
+                self._items.extend(its)
+            self._dirty = True
+        # probe round finished → gap detection + freshness stamp
+        if self._probes_added and len(self._probe_bottoms) == self._probes_added:
+            bottoms = [b for b in self._probe_bottoms if b is not None]
+            if len(bottoms) == len(self._probe_bottoms):
+                # anchor on what THIS instance has stored (it runs for minutes
+                # mid-cycle; the state's prev_newest_ms only refreshes at the
+                # run's end, so using it here mints phantom ~minute gaps and
+                # spawns a fresh batch of buckets every round — the 2026-08-07
+                # pile ballooned to 5K+ buckets that way)
+                prev_newest = max(live.get("prev_newest_ms") or 0,
+                                  self._newest_ms or 0) or None
+                new_buckets: list[dict] = []
+                for i in range(1, len(bottoms)):
+                    tile_top = now_ms - int(i * DEFAULT_PROBE_OFFSET * 1000)
+                    if bottoms[i - 1] > tile_top + 1:
+                        new_buckets += _make_buckets(
+                            tile_top, bottoms[i - 1],
+                            _page_span_hint(bottoms[i - 1] - tile_top, DEFAULT_BUCKET_CAP))
+                if prev_newest is None and not buckets:
+                    new_buckets += _make_buckets(
+                        edge_ms,
+                        now_ms - int((DEFAULT_PROBE_DEPTH - 1) * DEFAULT_PROBE_OFFSET * 1000),
+                        DEFAULT_BUCKET_CAP)
+                elif prev_newest is not None and bottoms[-1] > prev_newest + 1:
+                    # only spawn once per uncovered region: while the spawns
+                    # drain, every round would re-see the same lag and spawn
+                    # ~46 more buckets over the same window (measured: pile
+                    # ballooned to 2191 during the 2026-08-07 stall). The
+                    # overlap check is region-specific so genuine new gaps
+                    # (downtime) still spawn while old buckets drain.
+                    covered = any(
+                        b.get("top_ms", 0) >= bottoms[-1]
+                        and b.get("bottom_ms", 0) <= prev_newest
+                        for b in buckets if not b.get("done"))
+                    if not covered:
+                        new_buckets += _make_buckets(
+                            prev_newest, bottoms[-1],
+                            _page_span_hint(bottoms[-1] - prev_newest,
+                                            DEFAULT_BUCKET_CAP))
+                if new_buckets:
+                    stats["gaps"] = stats.get("gaps", 0) + 1
+                    buckets.extend(new_buckets)
+            live["last_probe_ms"] = now_ms
+            self._dirty = True
+        if self._newest_ms is not None:
+            live["prev_newest_ms"] = max(live.get("prev_newest_ms") or 0, self._newest_ms)
+
+    def stmts(self) -> list[str]:
+        """insert_transaction statements for the items collected this run
+        (deduped by _id; idempotent ON CONFLICT on insert)."""
+        return _store_stmts(self._items)
+
+    def save_state(self) -> None:
+        """Filter done buckets and persist the shared state (atomic write).
+        No-op when nothing was fetched or processed this run."""
+        if not self._dirty:
+            return
+        state = self.state
+        state["buckets"][:] = [b for b in state.get("buckets", []) if not b.get("done")]
+        state["done"] = not state["buckets"]
+        write_json(STATE_FILE, state)
 
 
 def verify(db: str) -> int:
