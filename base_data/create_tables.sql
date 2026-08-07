@@ -384,9 +384,13 @@ CREATE TABLE users (
                                                               -- entries; lower-bound approximation,
                                                               -- replaced by getUserLite dates.
                                                               -- lastConnectionAt when available);
-                                                              -- NULL = never fought (inactive).
-                                                              -- Refresh pool: within 4 days.
+                                                               -- NULL = never fought (inactive).
+                                                               -- Refresh pool: within 4 days.
 );
+
+-- viewer search: case-insensitive username prefix (search.py — /search)
+CREATE INDEX users_username_lower_idx ON users (lower(username));
+
 
 
 -- =============================================================================
