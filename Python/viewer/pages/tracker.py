@@ -1,4 +1,4 @@
-"""Damage Tracker (HISTORIC_RANKING.md §6): entity (user/country/MU) +
+"""Damage Tracker (extra/docs/HISTORIC_RANKING.md §6): entity (user/country/MU) +
 1-2 dates → per-battle damage, for which country/team, against which, plus
 per-week totals.
 
@@ -7,7 +7,7 @@ ENDED within [A, B]; the weekly view buckets by the WEEK OF THE ROUND'S
 START (user_weekly_damage — round-start approximation; a week's bucket is
 shown when its Monday falls inside the range). Any per-round damage in the
 UI must come from the ranking rows, never from rounds.damage (unreliable,
-HISTORIC_RANKING.md §6).
+extra/docs/HISTORIC_RANKING.md §6).
 
 Data: battle_ranking_entries sides 1/2, DEDUPED (DISTINCT ON battle+side,
 newest created_at — the live sync writes repeated rows and final-doc rows

@@ -1,5 +1,5 @@
 """Weekly rankings (prototype) — display is disposable; the data layer is
-the deliverable (see extra/HISTORIC_RANKING.md §3-4).
+the deliverable (see extra/docs/HISTORIC_RANKING.md §3-4).
 
 Current week: the latest official snapshot per entity_type — the game's own
 list (truncated floor and all). Past weeks: the retained per-week finals

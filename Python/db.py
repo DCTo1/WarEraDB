@@ -188,7 +188,7 @@ def user_battle_stats_rebuild_stmts() -> list[str]:
 
     The backups.py load() step: the table's DATA is excluded from backups
     (it is pure derivation over battle_ranking_entries — ~830 MB, see
-    BACKUPS.md §4) and this rebuilds it exactly, same SQL shape as
+    BACKUPS.md §4 — see extra/docs/BACKUPS.md) and this rebuilds it exactly, same SQL shape as
     battle_summary_stmts() but without the per-battle filter. ~85 s on the
     full table.
     """
@@ -216,7 +216,7 @@ def weekly_damage_stmts(battle_hex: str) -> list[str]:
     construction and self-healing. A battle's rounds span at most 2 weeks,
     so each rebuild is one small transaction. Appended to the battle-end
     flush (insert_ranking_sample.py finish()) — never run for active battles
-    (round rows exist only for ended battles by design, HISTORIC_RANKING.md
+    (round rows exist only for ended battles by design, HISTORIC_RANKING.md — see extra/docs/HISTORIC_RANKING.md
     §4). The rre.created_at window is a chunk-pruning over-approximation
     ONLY: a round STARTED in week W gets its ranking rows at the battle-end
     fetch — up to a full week + battle duration after the round start (the
