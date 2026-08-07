@@ -43,8 +43,11 @@ Python/update_users_lite.py fetches user.getUserLite for up to
 --user-lite (default 100) unchecked users, wealth/damage rankings first (0
 disables the user pass), and Python/update_weekly_ranking.py stores hourly
 official weekly-ranking snapshots (--weekly 1, self-throttled to xx:01; 0
-disables). The header timer shows the seconds until the next
-run and switches to "updating…" while a run is in progress.
+disables). Python/update_transactions.py keeps the transactions table
+current with the API's rolling 72 h window (4 cursor probes per cycle fill
+the newest ~26 s; the request's slack slots walk the window back toward
+the edge; --transactions 0 disables). The header timer shows the seconds
+until the next run and switches to "updating…" while a run is in progress.
 
 Stdlib only for the viewer itself (the spawned pipeline scripts use
 SQLAlchemy + requests, already in requirements.txt). All reads go through
@@ -83,12 +86,16 @@ def main() -> int:
                    help="hourly weekly-ranking snapshot fetch (weeklyUserDamages/"
                         "weeklyCountryDamages/muWeeklyDamages, self-throttled to "
                         "xx:01; default 1, 0 disables)")
+    p.add_argument("--transactions", type=int, default=int(config.settings.transactions_enabled),
+                   help="rolling-window transaction scrape (cursor probes + 72 h "
+                        "window backfill; default 1, 0 disables)")
     args = p.parse_args()
 
     config.settings.db = args.db
     config.settings.ranking_latest = args.ranking
     config.settings.user_lite_limit = args.user_lite
     config.settings.weekly_enabled = args.weekly != 0
+    config.settings.transactions_enabled = args.transactions != 0
 
     threading.Thread(target=updater.scheduler_loop, daemon=True).start()
     srv = ThreadingHTTPServer(("127.0.0.1", args.port), server.Handler)
