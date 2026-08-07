@@ -74,6 +74,7 @@ import requests
 
 from api import batched_fetch, make_session, mixed_fetch
 from db import esc, exec_batch, exec_many, flush_endpoint_log, query, scalar, value_sql
+from update_transactions import TransactionFiller
 from update_users_lite import Filler, upsert_stmts
 from utils import BASE_DIR, ENTITY, MAX_BATCH, read_json, to_unix_ms, write_json
 
@@ -564,6 +565,10 @@ def fetch(dbname: str, force: bool = False) -> int:
     max_week = scalar("SELECT MAX(week_start) FROM weekly_ranking_snapshots;", dbname)
     s = make_session(pool_size=4)
     filler = Filler(dbname)
+    # Transaction window filler rides the same mixed request (probes/bucket
+    # pages; the hourly cadence means it usually finds nothing due — the
+    # 15 s scripts cover it). WARERA_TX_FILLER=0 disables it.
+    txn = TransactionFiller(dbname) if os.environ.get("WARERA_TX_FILLER", "1") != "0" else None
     stmts: list[str] = []
     rollover_week: datetime | None = None
     api_failed = False
@@ -581,6 +586,7 @@ def fetch(dbname: str, force: bool = False) -> int:
     if due:
         calls = [("ranking.getRanking", {"rankingType": rt}) for rt, _, _, _ in due]
         slots = filler.top_up(calls)
+        tslots = txn.top_up(calls) if txn is not None else []
         try:
             results = mixed_fetch(s, calls, timeout=120)
         except RuntimeError as exc:
@@ -589,6 +595,8 @@ def fetch(dbname: str, force: bool = False) -> int:
             results = []
         if results and slots:
             filler.collect(results, slots)
+        if results and txn is not None and tslots:
+            txn.collect(results, tslots)
         for (ranking_type, key, etype, latest), res in zip(due, results):
             if "error" in res:
                 print(f"  {ranking_type}: API failure: {res['error']}", file=sys.stderr)
@@ -615,6 +623,12 @@ def fetch(dbname: str, force: bool = False) -> int:
         exec_many(fs, dbname)
         print(f"  filler: {len(filler.fetched)} users upserted, "
               f"{len(filler.dead)} dead marked", flush=True)
+    if txn is not None:
+        ts = txn.stmts()
+        if ts:
+            exec_batch(ts, dbname)
+            print(f"  txn filler: {len(ts)} transactions stored", flush=True)
+        txn.save_state()
     write_json(STATE_FILE, {**state, "last_attempt": time.time()})
     return 1 if api_failed else 0
 

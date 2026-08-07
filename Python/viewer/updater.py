@@ -2,10 +2,18 @@
 
 Every UPDATE_INTERVAL seconds (default 15) a scheduler thread runs
 Python/update_battles.py --force-active, then Python/update_live.py, then
-Python/insert_ranking_sample.py --latest N (skipped when N == 0). A run is
-skipped (retried half an interval later) if a previous run is still going.
-Output is tee'd into UPDATE_STATE and shown on /update-status; /timer serves
-the countdown for the header.
+Python/insert_ranking_sample.py --latest N (skipped when N == 0), then
+Python/update_weekly_ranking.py (hourly self-throttled snapshot fetch),
+then Python/update_users_lite.py. A run is skipped (retried half an
+interval later) if a previous run is still going. Output is tee'd into
+UPDATE_STATE and shown on /update-status; /timer serves the countdown for
+the header.
+
+The transaction window is NOT a dedicated step: update_battles /
+update_live / update_weekly_ranking carry transaction.getPaginatedTransactions
+calls (probes + pending window-bucket pages) in the slack of their mixed
+batches via update_transactions.TransactionFiller — disabled for every
+spawned script when --transactions 0 (WARERA_TX_FILLER=0 in their env).
 
 The FIRST run of a boot also does a one-shot completeness check (_boot_check,
 also skipped when --ranking 0 disables the ranking pass): battles ended in
@@ -22,7 +30,7 @@ import tempfile
 import threading
 import time
 
-from .config import (LIVE_SCRIPT, MAX_UPDATE_LINES, RANKING_SCRIPT, TRANSACTIONS_SCRIPT, UPDATE_INTERVAL, UPDATE_SCRIPT, USER_LITE_SCRIPT, WEEKLY_SCRIPT, settings)
+from .config import (LIVE_SCRIPT, MAX_UPDATE_LINES, RANKING_SCRIPT, UPDATE_INTERVAL, UPDATE_SCRIPT, USER_LITE_SCRIPT, WEEKLY_SCRIPT, settings)
 from .queries import query_dicts
 from .ui import esc, layout
 
@@ -126,6 +134,10 @@ def _run_updater() -> None:
     # and starves the other pipeline steps. Fail fast instead; the next
     # cycle re-attempts the same work.
     env = dict(os.environ, BATTLE_DB=db, WARERA_NO_RETRIES="1")
+    if not settings.transactions_enabled:
+        # --transactions 0: the transaction window filler (riding the mixed
+        # batches below) is disabled for every spawned script.
+        env["WARERA_TX_FILLER"] = "0"
     rc2 = 0  # ranking step rc (0 = skipped when --ranking 0 disables it)
     rc4 = 0  # user-lite step rc (0 = skipped when --user-lite 0 disables it)
     rc5 = 0  # weekly snapshot step rc (0 = skipped when --weekly 0 disables it)
@@ -175,16 +187,6 @@ def _run_updater() -> None:
                 text=True, bufsize=1, env=env))
             with UPDATE_LOCK:
                 UPDATE_STATE["rc"] = _first_nonzero(rc0, rc, rc3, rc2, rc5, rc4)
-        if settings.transactions_enabled:
-            with UPDATE_LOCK:
-                UPDATE_STATE["output"].append(
-                    "\n=== transactions: update_transactions.py ===")
-            rc6 = _tee_output(subprocess.Popen(
-                [sys.executable, TRANSACTIONS_SCRIPT, "--db", db],
-                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                text=True, bufsize=1, env=env))
-            with UPDATE_LOCK:
-                UPDATE_STATE["rc"] = _first_nonzero(rc0, rc, rc3, rc2, rc5, rc4, rc6)
     except Exception as exc:
         with UPDATE_LOCK:
             UPDATE_STATE["rc"] = -1

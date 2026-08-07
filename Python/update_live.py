@@ -86,6 +86,7 @@ from utils import (
     read_json,
     write_json,
 )
+from update_transactions import TransactionFiller
 from update_users_lite import Filler
 
 STATE_FILE = os.path.join(BASE_DIR, "live_state.json")
@@ -103,18 +104,25 @@ LIVE_PAGES = 3          # pagination depth cap per live combo (300 entries).
 DATA_TYPES = ("damage", "points")
 
 
-def fetch_live_battles(s: requests.Session, filler: Filler | None = None) -> list[dict]:
-    """ALL active battles in one request (filler tops up the slack slots)."""
+def fetch_live_battles(s: requests.Session, filler: Filler | None = None,
+                       txn: TransactionFiller | None = None) -> list[dict]:
+    """ALL active battles in one request (fillers top up the slack slots)."""
     calls = [("battle.getBattles", {"isActive": True, "limit": 100, "cursor": FUTURE_CURSOR})]
     if filler is not None:
         slots = filler.top_up(calls)
     else:
         slots = []
+    if txn is not None:
+        tslots = txn.top_up(calls)
+    else:
+        tslots = []
     out = mixed_fetch(s, calls)
     if "error" in out[0]:
         raise RuntimeError(f"getBattles: {out[0]['error']}")
     if filler is not None and slots:
         filler.collect(out, slots)
+    if txn is not None and tslots:
+        txn.collect(out, tslots)
     return out[0]["result"]["data"]["items"]
 
 
@@ -193,7 +201,8 @@ class EndpointDown(RuntimeError):
 
 
 def fetch_live_rankings(s: requests.Session, battles: list[dict], dbname: str,
-                        filler: Filler | None = None) -> tuple[int, int]:
+                        filler: Filler | None = None,
+                        txn: TransactionFiller | None = None) -> tuple[int, int]:
     """Per-entity battle rankings for live battles (partial, growing).
 
     Battles whose DB ended_at is already set are skipped: they ended between
@@ -314,8 +323,9 @@ def fetch_live_rankings(s: requests.Session, battles: list[dict], dbname: str,
     def fill() -> None:
         """Submit batched bodies until the pool is full or no work is left.
         Each body = up to BODY_CAP ranking calls, topped up with getUserLite
-        filler calls (mixed batch) — the slack slots pay for the user-lite
-        backfill queue at no extra request cost."""
+        + transaction-window filler calls (mixed batch) — the slack slots pay
+        for the user-lite backfill queue and the transaction window at no
+        extra request cost."""
         nonlocal requests_n
         while pending and len(inflight) < WORKERS:
             combos: list = []
@@ -333,7 +343,10 @@ def fetch_live_rankings(s: requests.Session, battles: list[dict], dbname: str,
             slots: list[int] = []
             if filler is not None:
                 slots = filler.top_up(calls)
-            inflight[pool.submit(fetch_body, calls)] = (combos, slots)
+            tslots: list[int] = []
+            if txn is not None:
+                tslots = txn.top_up(calls)
+            inflight[pool.submit(fetch_body, calls)] = (combos, slots, tslots)
             requests_n += 1
 
     def drain() -> None:
@@ -364,7 +377,7 @@ def fetch_live_rankings(s: requests.Session, battles: list[dict], dbname: str,
         while inflight:
             done, _ = wait(list(inflight), return_when=FIRST_COMPLETED)
             for fut in done:
-                combos, slots = inflight.pop(fut)
+                combos, slots, tslots = inflight.pop(fut)
                 try:
                     data, failed = fut.result()
                 except EndpointDown as exc:
@@ -395,6 +408,8 @@ def fetch_live_rankings(s: requests.Session, battles: list[dict], dbname: str,
                         active.discard(c)
                 if filler is not None and slots:
                     filler.collect(data, slots)
+                if txn is not None and tslots:
+                    txn.collect(data, tslots)
                 # The ranking endpoint intermittently 400s for minutes at a
                 # time (ranking docs rewritten at battle end). If most RANKING
                 # calls of a request fail, the endpoint is down — abort and
@@ -444,8 +459,11 @@ def main() -> int:
 
     s = make_session(pool_size=16)
     filler = Filler(dbname)
+    # Transaction window filler (probes + bucket pages) rides the same slack;
+    # WARERA_TX_FILLER=0 (viewer --transactions 0) disables it.
+    txn = TransactionFiller(dbname) if os.environ.get("WARERA_TX_FILLER", "1") != "0" else None
     try:
-        live = fetch_live_battles(s, filler)
+        live = fetch_live_battles(s, filler, txn)
     except RuntimeError as exc:
         print(f"API failure: {exc}", file=sys.stderr)
         _flush_safe(dbname)
@@ -453,7 +471,7 @@ def main() -> int:
     print(f"live battles from API: {len(live)}", flush=True)
 
     try:
-        _sync(s, live, args, dbname, filler)
+        _sync(s, live, args, dbname, filler, txn)
     except RuntimeError as exc:
         if str(exc).startswith("DB error"):
             print(f"DB failure: {exc}", file=sys.stderr)
@@ -466,12 +484,20 @@ def main() -> int:
         exec_many(fs, dbname)
         print(f"  filler: {len(filler.fetched)} users upserted, "
               f"{len(filler.dead)} dead marked", flush=True)
+    # Flush transaction filler (window probes + bucket pages) + shared state
+    if txn is not None:
+        ts = txn.stmts()
+        if ts:
+            exec_batch(ts, dbname)
+            print(f"  txn filler: {len(ts)} transactions stored", flush=True)
+        txn.save_state()
     _flush_safe(dbname)
     return 0
 
 
 def _sync(s: requests.Session, live: list[dict], args, dbname: str,
-          filler: Filler | None = None) -> None:
+          filler: Filler | None = None,
+          txn: TransactionFiller | None = None) -> None:
     """Reconciliation + battle-doc refresh + (throttled) live rankings."""
     db_active = active_battle_hexes(dbname)
 
@@ -490,7 +516,7 @@ def _sync(s: requests.Session, live: list[dict], args, dbname: str,
         state = read_json(STATE_FILE, {})
         last = state.get("last_ranking_at", 0)
         if time.time() - last >= args.ranking_interval:
-            reqs, entries = fetch_live_rankings(s, live, dbname, filler)
+            reqs, entries = fetch_live_rankings(s, live, dbname, filler, txn)
             print(f"rankings: {entries} live entries in {reqs} requests", flush=True)
             write_json(STATE_FILE, {**state, "last_ranking_at": int(time.time())})
         else:
