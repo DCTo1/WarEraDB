@@ -480,6 +480,9 @@ SELECT add_compression_policy('weekly_ranking_snapshots', INTERVAL '7 days', if_
 -- display query: week + latest snapshot per entity_type, ordered by rank
 CREATE INDEX weekly_ranking_snapshots_week_idx
     ON weekly_ranking_snapshots (week_start, snapshot_at, rank);
+-- latest-snapshot seek per entity_type (MAX(snapshot_at) per week+type)
+CREATE INDEX weekly_ranking_snapshots_latest_idx
+    ON weekly_ranking_snapshots (week_start, entity_type, snapshot_at);
 
 CREATE TABLE user_weekly_damage (
     -- 8-byte aligned
