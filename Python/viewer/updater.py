@@ -22,7 +22,7 @@ import tempfile
 import threading
 import time
 
-from .config import (LIVE_SCRIPT, MAX_UPDATE_LINES, RANKING_SCRIPT, UPDATE_INTERVAL, UPDATE_SCRIPT, USER_LITE_SCRIPT, WEEKLY_SCRIPT, settings)
+from .config import (LIVE_SCRIPT, MAX_UPDATE_LINES, RANKING_SCRIPT, TRANSACTIONS_SCRIPT, UPDATE_INTERVAL, UPDATE_SCRIPT, USER_LITE_SCRIPT, WEEKLY_SCRIPT, settings)
 from .queries import query_dicts
 from .ui import esc, layout
 
@@ -127,6 +127,7 @@ def _run_updater() -> None:
     # cycle re-attempts the same work.
     env = dict(os.environ, BATTLE_DB=db, WARERA_NO_RETRIES="1")
     rc2 = 0  # ranking step rc (0 = skipped when --ranking 0 disables it)
+    rc4 = 0  # user-lite step rc (0 = skipped when --user-lite 0 disables it)
     rc5 = 0  # weekly snapshot step rc (0 = skipped when --weekly 0 disables it)
     try:
         rc0 = _boot_check(db, env) if settings.ranking_latest else 0
@@ -174,6 +175,16 @@ def _run_updater() -> None:
                 text=True, bufsize=1, env=env))
             with UPDATE_LOCK:
                 UPDATE_STATE["rc"] = _first_nonzero(rc0, rc, rc3, rc2, rc5, rc4)
+        if settings.transactions_enabled:
+            with UPDATE_LOCK:
+                UPDATE_STATE["output"].append(
+                    "\n=== transactions: update_transactions.py ===")
+            rc6 = _tee_output(subprocess.Popen(
+                [sys.executable, TRANSACTIONS_SCRIPT, "--db", db],
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, bufsize=1, env=env))
+            with UPDATE_LOCK:
+                UPDATE_STATE["rc"] = _first_nonzero(rc0, rc, rc3, rc2, rc5, rc4, rc6)
     except Exception as exc:
         with UPDATE_LOCK:
             UPDATE_STATE["rc"] = -1
