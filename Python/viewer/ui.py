@@ -112,6 +112,82 @@ MORE_JS = """<script>
 })();
 </script>"""
 
+SEARCH_JS = """<script>
+(function () {
+  // Live suggestions for any <input data-search>: debounced (250 ms after
+  // the last keystroke — no compute while typing) GET /search?q=…, results
+  // rendered as a dropdown of <a> links under the input. Clicks navigate
+  // through the pjax handler (NAV_JS); Escape/blur/typing close the box.
+  // Delegated on document so it survives pjax main swaps.
+  var MIN = 2, DEBOUNCE = 250;
+  document.addEventListener('input', function (e) {
+    var inp = e.target;
+    if (!inp || !inp.getAttribute || inp.getAttribute('data-search') === null) return;
+    var wrap = inp.parentNode;
+    if (!wrap || !wrap.classList.contains('suggest-wrap')) {
+      wrap = document.createElement('span');
+      wrap.className = 'suggest-wrap';
+      inp.parentNode.insertBefore(wrap, inp);
+      wrap.appendChild(inp);
+    }
+    var dd = wrap.querySelector('.suggest');
+    if (!dd) {
+      dd = document.createElement('div');
+      dd.className = 'suggest';
+      dd.style.display = 'none';
+      wrap.appendChild(dd);
+    }
+    if (inp._deb) { clearTimeout(inp._deb); inp._deb = null; }
+    if (inp._ac) { inp._ac.abort(); inp._ac = null; }
+    dd.style.display = 'none';
+    var v = inp.value.trim();
+    if (v.length < MIN) return;
+    inp._deb = setTimeout(function () {
+      var ac = new AbortController();
+      inp._ac = ac;
+      fetch('/search?q=' + encodeURIComponent(v), { signal: ac.signal })
+        .then(function (r) { return r.ok ? r.json() : []; })
+        .then(function (sections) {
+          if (ac.signal.aborted) return;
+          dd.textContent = '';
+          var any = false;
+          sections.forEach(function (sec) {
+            var h = document.createElement('div');
+            h.className = 'suggest-head';
+            h.textContent = sec.label;
+            dd.appendChild(h);
+            sec.items.forEach(function (it) {
+              var a = document.createElement('a');
+              a.href = it.url;
+              a.textContent = it.name;
+              dd.appendChild(a);
+              any = true;
+            });
+          });
+          dd.style.display = any ? 'block' : 'none';
+        }).catch(function () {});
+    }, DEBOUNCE);
+  });
+  document.addEventListener('keydown', function (e) {
+    if (e.key !== 'Escape') return;
+    var dd = document.querySelector('.suggest');
+    if (dd && dd.style.display !== 'none') {
+      dd.style.display = 'none';
+      var inp = dd.parentNode.querySelector('input');
+      if (inp && inp._ac) { inp._ac.abort(); inp._ac = null; }
+    }
+  });
+  document.addEventListener('blur', function (e) {
+    var inp = e.target;
+    if (!inp || !inp.getAttribute || inp.getAttribute('data-search') === null) return;
+    setTimeout(function () {
+      var dd = inp.parentNode && inp.parentNode.querySelector('.suggest');
+      if (dd) dd.style.display = 'none';
+    }, 120);
+  }, true);
+})();
+</script>"""
+
 NAV_JS = """<script>
 (function () {
   // Pjax-style navigation (2026-08-04): internal link clicks and GET form
@@ -237,6 +313,13 @@ STYLES = """
   .muted { color: var(--muted); font-size: 12px; }
   .status-live { color: var(--ok); font-weight: bold; }
   .status-end { color: var(--muted); }
+  .suggest-wrap { position: relative; display: inline-block; }
+  .suggest { position: absolute; left: 0; top: calc(100% + 2px); min-width: 240px;
+             max-height: 300px; overflow-y: auto; background: var(--panel);
+             border: 1px solid var(--border); border-radius: 4px; z-index: 10; }
+  .suggest-head { padding: 4px 8px; color: var(--muted); font-size: 11px; }
+  .suggest a { display: block; padding: 4px 8px; white-space: nowrap; }
+  .suggest a:hover { background: var(--th-bg); }
 """
 
 
@@ -283,4 +366,5 @@ def layout(title: str, body: str, refresh: bool = False) -> str:
 {TIMER_JS}
 {THEME_JS}
 {MORE_JS}
+{SEARCH_JS}
 {NAV_JS}</body></html>"""

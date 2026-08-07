@@ -78,9 +78,22 @@ def page_tracker(q: dict) -> str:
         return error_page("?from= must be before ?to=")
 
     label = ""
+    form = f"""
+<form method='get'>
+<select name='type'><option value='user' {'selected' if etype=='user' else ''}>User</option>
+<option value='country' {'selected' if etype=='country' else ''}>Country</option>
+<option value='mu' {'selected' if etype=='mu' else ''}>MU</option></select>
+<input name='name' value='{esc(name)}' placeholder='username or country' size='20' data-search autocomplete='off'>
+<input name='hex' value='{esc(hexid)}' placeholder='or 24-hex id' size='26'>
+<input name='from' value='{esc(fr)}' placeholder='from DD-MM-YY' size='12'>
+<input name='to' value='{esc(to)}' placeholder='to DD-MM-YY' size='12'>
+<button>Track</button></form>"""
+    if not (hexid and HEX_RE.match(hexid)) and not (name and et != 3):
+        return layout("Tracker", form + "<p class='muted'>Enter a username, "
+                      "country name, or 24-hex ObjectID (MUs have no names) "
+                      "and optionally a date range — leave the dates empty "
+                      "for all time.</p>")
     if et == 1:
-        if not (name or (hexid and HEX_RE.match(hexid))):
-            return error_page("pass ?name=username or ?hex=24-hex-user-id")
         where = (f"username = '{name.replace(chr(39), chr(39) + chr(39))}'"
                  if name else f"user_id = objectid_to_uuid('{hexid}')")
         rows, err = query_dicts(
@@ -93,8 +106,6 @@ def page_tracker(q: dict) -> str:
             return error_page("user not found")
         uid, label = rows[0]["id"], rows[0]["username"] or rows[0]["hex"][-8:]
     elif et == 2:
-        if not (name or (hexid and HEX_RE.match(hexid))):
-            return error_page("pass ?name=country-name or ?hex=24-hex-id")
         where = (f"c.name = '{name.replace(chr(39), chr(39) + chr(39))}'"
                  if name else f"i.external_id = objectid_to_uuid('{hexid}')")
         rows, err = query_dicts(
@@ -106,8 +117,6 @@ def page_tracker(q: dict) -> str:
             return error_page("country not found")
         uid, label = rows[0]["id"], rows[0]["name"]
     else:
-        if not (hexid and HEX_RE.match(hexid)):
-            return error_page("MUs have no names — pass ?hex=24-hex-id&type=mu")
         rows, err = query_dicts(
             f"SELECT id FROM inventory_ids"
             f" WHERE external_id = objectid_to_uuid('{hexid}')")
@@ -265,16 +274,7 @@ def page_tracker(q: dict) -> str:
             f"<td style='text-align:right'>{r['damage'] or 0:,}</td></tr>")
     capped = (f"<p class='muted'>showing the newest 500 of {s['n']} battles</p>"
               if s["n"] > 500 else "")
-    body = f"""
-<form method='get'>
-<select name='type'><option value='user' {'selected' if etype=='user' else ''}>User</option>
-<option value='country' {'selected' if etype=='country' else ''}>Country</option>
-<option value='mu' {'selected' if etype=='mu' else ''}>MU</option></select>
-<input name='name' value='{esc(name)}' placeholder='username or country' size='20'>
-<input name='hex' value='{esc(hexid)}' placeholder='or 24-hex id' size='26'>
-<input name='from' value='{esc(fr)}' placeholder='from DD-MM-YY' size='12'>
-<input name='to' value='{esc(to)}' placeholder='to DD-MM-YY' size='12'>
-<button>Track</button></form>
+    body = f"""{form}
 <p class='muted'>{esc(label)} · {esc(range_txt)} · battles ENDED within the
 range · weekly buckets by round start · bounty money informational only
 (bounty attribution not exact)</p>

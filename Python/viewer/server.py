@@ -1,7 +1,8 @@
 """HTTP handler + route table for the viewer.
 
 Routing is a dict mapping path → page function (all pages take a parsed
-query-params dict and return an HTML string). /timer is the only JSON route.
+query-params dict and return an HTML string). /timer and /search are the
+only JSON routes (handled before the page lookup).
 """
 
 import json
@@ -13,6 +14,7 @@ from .pages import (
     page_battle, page_battles, page_bounties, page_countries, page_overview,
     page_sql, page_stats, page_tracker, page_user, page_users, page_weekly,
 )
+from .search import search
 from .updater import page_update_status, timer_state
 
 ROUTES = {
@@ -39,6 +41,14 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if path == "/timer":
                 payload = json.dumps(timer_state()).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+                return
+            if path == "/search":
+                payload = json.dumps(search(q.get("q", [""])[0])).encode()
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(payload)))
