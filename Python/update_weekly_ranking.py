@@ -50,7 +50,7 @@ Standalone modes:
               Passing users get verified_at stamped (never re-checked);
               failures stay unverified and are re-checked after 6 h.
   --verify    report snapshot stats per week + derived-vs-official weekly
-              totals (the 08-10 rollover validation tool, HISTORIC_RANKING.md
+              totals (the 08-10 rollover validation tool, extra/docs/HISTORIC_RANKING.md
               §7.3)
 
 Exit codes (pipeline convention): 0 ok / 1 API / 2 DB.
@@ -672,7 +672,7 @@ ON CONFLICT (user_id, week_start) DO NOTHING;""",
 
 def verify(dbname: str) -> int:
     """Snapshot stats per week + derived-vs-official totals for user weeks
-    with both (the 08-10 rollover validation, HISTORIC_RANKING.md §7.3)."""
+    with both (the 08-10 rollover validation, extra/docs/HISTORIC_RANKING.md §7.3)."""
     rows = query("""
         WITH s AS (
           SELECT week_start, entity_type, count(*) total,

@@ -50,7 +50,7 @@ Usage:
 The web viewer's 15 s cycle does NOT run this script anymore — the same
 work rides as FILLER in the mixed batches of update_battles.py /
 update_live.py / update_weekly_ranking.py (TransactionFiller class, see
-extra/FILLERS.md): pending bucket pages + live probes fill the scripts'
+extra/docs/FILLERS.md): pending bucket pages + live probes fill the scripts'
 slack slots until the window fill drains, then only the probes remain
 (once per PROBE_EVERY seconds). This script stays for standalone
 backfill/recovery runs and --verify; do not run it while a viewer cycle

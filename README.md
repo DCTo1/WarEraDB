@@ -245,7 +245,7 @@ battles, rounds, bounties, countries, transactions, weekly snapshots +
 corrections) while leaving the rebuildable parts out of the dump —
 `user_battle_stats` (830 MB), `user_weekly_damage` and `endpoints_used` are
 excluded by data (`pg_dump --exclude-table-data`), so their DDL/PKs restore
-but their rows are rebuilt on load (see `extra/BACKUPS.md` for the full
+but their rows are rebuilt on load (see `extra/docs/BACKUPS.md` for the full
 derivable-vs-core decision table). Backups land in `extra/db_backups/`
 (timestamped `.dump`, sha256 printed) and can optionally be pushed to GitHub
 Releases — every release carries the fixed asset name `tsdb_backup.dump`, so

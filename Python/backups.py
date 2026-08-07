@@ -42,7 +42,7 @@ never overwrite or delete the cloud copies.
 
 What's in the dump
 ------------------
-Derivable data is left out (BACKUPS.md): the DATA of user_battle_stats
+Derivable data is left out (extra/docs/BACKUPS.md): the DATA of user_battle_stats
 (830 MB), user_weekly_damage and endpoints_used is excluded via
 pg_dump --exclude-table-data — their DDL/PKs/hypertable metadata still
 restore, which is exactly what the load() rebuild steps need. Everything
@@ -70,7 +70,7 @@ from utils import BASE_DIR, write_json
 BACKUP_DIR = os.path.abspath(os.path.join(BASE_DIR, "..", "extra", "db_backups"))
 ROOT = os.path.abspath(os.path.join(BASE_DIR, ".."))
 
-# Rebuildable tables whose DATA is excluded from the dump (BACKUPS.md §4).
+# Rebuildable tables whose DATA is excluded from the dump (extra/docs/BACKUPS.md §4).
 EXCLUDED_DATA = ("user_battle_stats", "user_weekly_damage", "endpoints_used")
 
 # Tables reported in the release body (row counts).

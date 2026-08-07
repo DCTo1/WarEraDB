@@ -22,7 +22,7 @@ Pages
     /bounties    battles with bounties, filterable by country
     /weekly      weekly rankings (prototype): current week = official snapshot
                  copies, past weeks = retained finals + derived totals
-    /tracker     damage tracker (HISTORIC_RANKING.md §6): entity (user/country/
+    /tracker     damage tracker (extra/docs/HISTORIC_RANKING.md §6): entity (user/country/
                  MU) + 1-2 dates → per-battle damage (deduped ranking rows),
                  for/against countries, weekly totals
     /countries   bounty money per country (total vs ended-battles pools)
