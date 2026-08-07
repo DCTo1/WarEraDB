@@ -2,14 +2,21 @@
 
 A scraper + TimescaleDB warehouse for [WarEra](https://warera.io) game data. It pulls
 battles, rounds, battle bounties, per-battle rankings with item loot, countries and
-(planned) all transaction types from the WarEra API, normalizes them into a compact
+all transaction types from the WarEra API, normalizes them into a compact
 star-schema (MongoDB ObjectIDs → integer IDs), and stores them in PostgreSQL with
 TimescaleDB hypertables.
 
-> Transactions: the API currently serves only ~3 days of transaction history
-> (verified 2026-08-04), so the 70M-row transaction scrape is blocked until the
-> API exposes older data. The transaction pipeline (schema, functions, examples)
-> is ready and seeded.
+> Transactions: the API serves only the rolling **72 h window** of transaction
+> history unfiltered (verified 2026-08-07 — the edge is exactly now − 72.00 h
+> and moves with the clock; older rows are reachable only via per-entity
+> filters like `userId`/`itemCode`, whose full-history backfill is planned but
+> not yet run). `update_transactions.py` keeps the DB current with the window:
+> on the web viewer's 15 s cycle it sends 4 cursor probes (no-cursor, now − 5s,
+> − 10s, − 15s) that tile the newest ~26 s, and rides the batch's slack slots
+> with a time-bucketed walk that fills the window back to the edge (~1.5M rows
+> on first run). The full 72 h window is stored continuously from the moment
+> the scraper runs; anything older than 72 h at that point is unreachable
+> until the per-entity backfill lands.
 
 **What's in the DB today** *(rough counts — they grow with every incremental update run)*
 
@@ -24,7 +31,7 @@ TimescaleDB hypertables.
 | Loot items (upserted from ranking loot) | ~1.4M |
 | Inventory ids (users, countries, MUs — global ObjectID → int map) | ~100K |
 | Users (API lifetime stats + username/level/MU detail) | ~100K |
-| Transactions (seeded from examples; scrape blocked on the 3-day API window) | ~700 |
+| Transactions (rolling 72 h window, kept live by update_transactions.py) | ~1.5M |
 
 ## Easy setup (for everyone)
 
@@ -156,6 +163,10 @@ done
 .venv/bin/python Python/update_weekly_ranking.py
 .venv/bin/python Python/update_weekly_ranking.py --backfill
 
+# Live transaction sync (rolling 72 h window, runs on the web viewer's cycle)
+.venv/bin/python Python/update_transactions.py --db tsdb
+.venv/bin/python Python/update_transactions.py --verify   # coverage report
+
 # Seed the endpoint registry (idempotent; new endpoints auto-register anyway)
 .venv/bin/python Python/seed_endpoints.py
 ```
@@ -274,12 +285,13 @@ this link always resolves to the newest backup:
 | `item_codes` | Item code strings → smallint ids | `id PK`, `code` (`"sniper"`, `"case1"`, …) |
 | `transaction_types` | Transaction type strings → smallint ids | `id PK`, `type` |
 | `items` | Item instances with skills | `item_uuid`, `item_code_id`, `primary/secondary_skill`, `first_seen_at` |
-| `transactions` | All trades/payments (hypertable, 1-day chunks) | `created_at`, `money`, `quantity`, `seller/buyer_id`, `item_id`, `transaction_type_id` |
+| `transactions` | All trades/payments (hypertable, 1-day chunks) | `created_at`, `money`, `quantity`, `seller/buyer_id`, `secondary_seller/buyer_id` (MU/country), `seller_party_id` (donations), `item_id`, `transaction_type_id` |
 | `battle_types` | Battle kind | `code` (`war`, `resistance`, `tournament`, `revolution`) |
 | `battles` | Battle headers | `id SERIAL PK`, `battle_id UUID` (API id), `created_at`, `ended_at` (NULL = active), damages/hit counts, won rounds, country/region/team refs, `is_big_battle` |
 | `rounds` | Round results per battle | `id SERIAL PK`, `round_id UUID`, `battle_id`, `number`, points/damages/hits, `won_by_country_id`, UNIQUE `(battle_id, number)` |
 | `battle_bounties` | Per-side bounty pool (row exists only when a side has a bounty) | `battle_id`, `side` (1/2), `money_pool`, `money_per_1k_damages`, `bounty_effective_at`, `bounty_is_national` |
 | `countries` | Current-state country snapshot (no history) | `country_id` (= `inventory_ids.id`), `name`, `code`, population, development, taxes |
+| `parties` | Donation parties (bare id markers on the global map; no API detail) | `party_id` (= `inventory_ids.id`), populated by the transaction scraper |
 | `battle_ranking_entries` | Battle-level rankings (attacker/defender since 2025-05, merged since 2026-03-29) | `battle_id` (int FK), `side` (1=attacker, 2=defender, **3=merged — exceptions only**, the API-official values that differ from the side sums), `entity_type` (1=user, 2=country, 3=mu), `entity_id` (FK `inventory_ids`), `damage`, `points`, `money`, `loot_item_id` (FK `items`), `created_at` |
 | `round_ranking_entries` | Round-level rankings | same + `round_number`; PK `(created_at, battle_id, round_number, side, entity_type, entity_id)` (hypertable partition col in the unique index); side=3 = exceptions only |
 | `user_battle_stats` | Per (user, battle, side) ranking totals — the /user page reads this instead of scanning the compressed hypertable per entity | PK `(user_id, battle_id, side)`, damage/points/money/entries sums; maintained by the ranking writers (rebuild per touched battle, exact) |
@@ -345,5 +357,5 @@ ORDER BY r.rank LIMIT 20;
 | `warera_gui.py` | Control panel (stdlib-only Tkinter GUI + `--setup` headless mode): one-command first-time setup (venv, TimescaleDB container, schema, latest backup), start/stop/restart the web viewer, local backups + backup restore, API token storage |
 | `docker-compose.yml` | Manual alternative to the GUI's container setup (`docker compose up -d` — same image/port/volume) |
 | `base_data/` | Schema DDL (`create_tables.sql`), PL/pgSQL functions (`functions.sql`), indexes, views |
-| `Python/` | Battle tooling: shared modules (`api.py` WarEra API client, `db.py` SQLAlchemy DB access + SQL helpers, `utils.py` time/state/constants + `prepare_transaction()`, `endpoint_log.py`) + the CLI scripts (`update_battles.py`, `update_live.py`, `update_countries.py`, `insert_ranking_sample.py`, `update_users.py`, `update_users_lite.py`, `update_weekly_ranking.py`, `seed_endpoints.py`) + the web viewer (`db_web.py` entry point and the `viewer/` package with its pages, incl. the `/tracker` damage tracker and the `/weekly` rankings) |
+| `Python/` | Battle tooling: shared modules (`api.py` WarEra API client, `db.py` SQLAlchemy DB access + SQL helpers, `utils.py` time/state/constants + `prepare_transaction()`, `endpoint_log.py`) + the CLI scripts (`update_battles.py`, `update_live.py`, `update_countries.py`, `insert_ranking_sample.py`, `update_users.py`, `update_users_lite.py`, `update_weekly_ranking.py`, `update_transactions.py`, `seed_endpoints.py`) + the web viewer (`db_web.py` entry point and the `viewer/` package with its pages, incl. the `/tracker` damage tracker and the `/weekly` rankings) |
 | `data/battle_timestamps.json` | Battle timestamp index for batched pagination (oldest-first, append-only) |
