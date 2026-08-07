@@ -14,8 +14,7 @@ from ..queries import query_dicts
 from ..ui import esc, error_page, layout, user_link
 
 WEEKS_SQL = """
-    SELECT DISTINCT week_start,
-           count(*) OVER (PARTITION BY week_start) AS rows
+    SELECT DISTINCT week_start
     FROM weekly_ranking_snapshots
     ORDER BY week_start DESC;
 """
@@ -61,14 +60,18 @@ def page_weekly(q: dict) -> str:
     _, et_id, label, extra_join, name_expr, derived_expr = next(
         o for o in ENTITY_OPTS if o[0] == etype)
     # Current week: filter to the latest snapshot per entity_type (each of
-    # the three docs regens seconds apart). Past weeks: the retained finals
-    # already hold one row per entity — no filter (per-entity final rows can
-    # carry different snapshot_at, the doc regen varies within the week).
-    snap_filter = ("AND s.snapshot_at = (SELECT MAX(snapshot_at)"
-                   " FROM weekly_ranking_snapshots s2"
-                   " WHERE s2.week_start = s.week_start"
-                   " AND s2.entity_type = s.entity_type)" if sel == cur else "")
+    # the three docs regens seconds apart, so each latest snapshot_at is
+    # type-pure). Past weeks: the retained finals already hold one row per
+    # entity — no filter (per-entity final rows can carry different
+    # snapshot_at, the doc regen varies within the week). The MAX is an
+    # uncorrelated scalar subquery (InitPlan): the planner turns it into a
+    # single backward index seek — a correlated subquery or GROUP BY in
+    # WHERE/joins walks every snapshot row (~200K, ~13-30 ms).
     lit = _week_lit(sel)
+    snap_filter = (f"AND s.snapshot_at = (SELECT MAX(snapshot_at)"
+                   f" FROM weekly_ranking_snapshots"
+                   f" WHERE week_start = {lit} AND entity_type = {et_id})"
+                   if sel == cur else "")
     rows, err = query_dicts(f"""
         SELECT s.rank, s.value AS official, s.tier,
                lower(uuid_to_objectid(i.external_id)) AS user_id,
@@ -77,6 +80,7 @@ def page_weekly(q: dict) -> str:
         JOIN inventory_ids i ON i.id = s.entity_id
         {extra_join}
         WHERE s.week_start = {lit} AND s.entity_type = {et_id}
+          AND s.rank <= 1000
           {snap_filter}
         ORDER BY s.rank NULLS LAST, s.value DESC
         LIMIT 1000;""")
@@ -84,9 +88,8 @@ def page_weekly(q: dict) -> str:
         return error_page(err)
     week_opts = "".join(
         f"<option value='{esc(w['week_start'].date())}'"
-        f"{' selected' if w['week_start'] == sel else ''}>"
-        f"{esc(w['week_start'].date())} "
-        f"({int(w['rows']):,} rows)</option>" for w in weeks)
+        f"{' selected' if w['week_start'] == sel else ''}'>"
+        f"{esc(w['week_start'].date())}</option>" for w in weeks)
     type_opts = "".join(
         f"<option value='{t}'{' selected' if t == etype else ''}'>{lbl}</option>"
         for t, _, lbl, *_ in ENTITY_OPTS)
