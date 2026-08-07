@@ -13,6 +13,8 @@ from .overview import page_overview
 from .sql import page_sql
 from .stats import page_stats
 from .tracker import page_tracker
+from .transactions import page_transactions
+from .transactions_coverage import page_transactions_coverage
 from .user import page_user
 from .users import page_users
 from .weekly import page_weekly
@@ -20,5 +22,6 @@ from .weekly import page_weekly
 __all__ = [
     "page_overview", "page_battles", "page_battle", "page_users", "page_user",
     "page_bounties", "page_countries", "page_stats", "page_sql", "page_weekly",
-    "page_tracker",
+    "page_tracker", "page_transactions",
+    "page_transactions_coverage",
 ]

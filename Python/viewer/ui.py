@@ -311,6 +311,7 @@ STYLES = """
   .err { color: var(--err); font-weight: bold; }
   .ok { color: var(--ok); font-weight: bold; }
   .muted { color: var(--muted); font-size: 12px; }
+  .warn { color: #e0a93c; font-weight: bold; }
   .status-live { color: var(--ok); font-weight: bold; }
   .status-end { color: var(--muted); }
   .suggest-wrap { position: relative; display: inline-block; }
@@ -360,7 +361,7 @@ def layout(title: str, body: str, refresh: bool = False) -> str:
 <a class="timer" href="/update-status" title="updater log"><span id="upd_lbl">next update in</span>
 <b id="upd_sec">…</b>s</a></div></div>
 <nav><a href="/">Overview</a><a href="/battles">Battles</a>
-<a href="/users">Users</a><a href="/weekly">Weekly</a><a href="/tracker">Tracker</a><a href="/bounties">Bounties</a><a href="/countries">Countries</a>
+<a href="/users">Users</a><a href="/weekly">Weekly</a><a href="/tracker">Tracker</a><a href="/transactions">Transactions</a><a href="/bounties">Bounties</a><a href="/countries">Countries</a>
 <a href="/stats">Stats</a><a href="/sql">SQL</a></nav>
 <hr><main id="main">{body}</main>
 {TIMER_JS}
