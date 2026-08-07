@@ -323,6 +323,16 @@ BEGIN
     ON CONFLICT (transaction_id, created_at) DO NOTHING;
 
     IF FOUND THEN
+        -- Primary seller/buyer are user accounts: keep a placeholder row in
+        -- `users` (username/lite_checked_at NULL) so the user-lite backfill
+        -- (pick_hexes -> user.getUserLite) discovers and fills transaction-
+        -- only users (migration_18). Secondary seller/buyer (MU/country ids)
+        -- and parties are separate entities — no users row for them.
+        INSERT INTO users (user_id)
+        SELECT objectid_to_uuid(v) FROM (VALUES (payload->>'sellerId'),
+                                               (payload->>'buyerId')) AS x(v)
+        WHERE v IS NOT NULL
+        ON CONFLICT (user_id) DO NOTHING;
         RETURN 1;
     ELSE
         RETURN NULL;
