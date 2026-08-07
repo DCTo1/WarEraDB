@@ -3,10 +3,11 @@
 The web viewer's auto-updater runs this every cycle. Two phases:
 
 1. BACKFILL — while the unchecked queue is full: pick up to N users from the
-   `users` table that were never checked (username IS NULL AND
-   lite_checked_at IS NULL), prioritized by the top of the wealth and damage
-   rankings (user_wealth DESC, then user_damages DESC), fetch
-   user.getUserLite (batched 50/request) and upsert their basic info.
+   `users` table that were never checked (lite_checked_at IS NULL — includes
+   legacy rows with a username that predate the column), prioritized by the
+   top of the wealth and damage rankings (user_wealth DESC, then
+   user_damages DESC), fetch user.getUserLite (batched 50/request) and
+   upsert their basic info.
 
 2. ACTIVE REFRESH — once the backfill queue drains below the batch size (or
    with --force-active): only users who are still active get re-fetched.
@@ -45,8 +46,20 @@ username, militaryRank, mu, leveling.totalXp, dates.lastConnectionAt and the
 exact API lifetime rankings (userDamages / userBounty / userWealth) — so
 fetched users get their derived sums replaced by the API's exact values (same
 semantics as update_users.py: exact API values win). Success sets
-lite_checked_at, so backfill users are only picked once; users whose
-getUserLite errors (deleted) stay unchecked and are retried.
+lite_checked_at, so backfill users are only picked once.
+
+Dead users: the API answers HTTP 404 for the WHOLE request only when EVERY
+call in it fails (deleted users; countries/MUs that leaked into the users
+table via the deprecated migration_07 backfill) — such batches are split in
+half recursively until the dead hexes are isolated, and the dead hexes get
+lite_checked_at stamped WITHOUT a username — checked + NULL username reads
+as "dead", and pick_hexes never picks them again. When only SOME calls fail
+the server answers 207 with in-band per-call errors: those users are skipped
+and retried next cycle. The Filler class exposes both queues (backfill +
+active, see pick_active_hexes) to other scripts (update_battles.py,
+update_live.py, update_weekly_ranking.py) to fill the slack of their mixed
+batches — the backfill queue drains and active users stay fresh outside this
+script's --limit.
 
 Usage:
     .venv/bin/python Python/update_users_lite.py                 # 100 users
@@ -61,7 +74,7 @@ import time
 
 import requests
 
-from api import batched_fetch, make_session
+from api import NotFoundError, make_session, mixed_fetch
 from db import esc, exec_many, flush_endpoint_log, query
 from utils import BASE_DIR, MAX_BATCH, read_json, write_json
 
@@ -77,11 +90,14 @@ STATE_FILE = os.path.join(BASE_DIR, "users_lite_state.json")
 
 
 def pick_hexes(db: str, limit: int) -> list[str]:
-    """Up to *limit* hex user ids that were never getUserLite'd, wealth and
-    damage rankings first."""
+    """Up to *limit* hex user ids that were never getUserLite'd — the true
+    "unchecked" set is lite_checked_at IS NULL, username or not: rows
+    backfilled by the OLD update_users.py era have a username but no
+    lite_checked_at (the column did not exist then), and a username-only
+    filter would skip them forever. Wealth and damage rankings first."""
     return [r[0] for r in query(
         "SELECT lower(uuid_to_objectid(user_id)) AS hex FROM users\n"
-        "WHERE username IS NULL AND lite_checked_at IS NULL\n"
+        "WHERE lite_checked_at IS NULL\n"
         "ORDER BY user_wealth DESC NULLS LAST, user_damages DESC NULLS LAST\n"
         f"LIMIT {limit};", db)]
 
@@ -103,18 +119,147 @@ def pick_active_hexes(db: str, limit: int) -> list[str]:
         f"LIMIT {limit};", db)]
 
 
-def fetch_lite(s: requests.Session, hexs: list[str]) -> dict:
-    """{hex: getUserLite doc} — users that errored are skipped (retried
-    next cycle)."""
+def _fetch_chunk(s: requests.Session, chunk: list[str]) -> tuple[dict, list[str]]:
+    """Fetch one batch of user.getUserLite; returns ({hex: doc}, dead hexes).
+
+    The API answers HTTP 404 for the WHOLE request only when EVERY call in it
+    fails (deleted users; countries/MUs that leaked into the users table via
+    the deprecated migration_07 backfill); when some calls fail it answers
+    207 with in-band per-call errors — those users are skipped silently
+    (retried next cycle). A whole-404'd chunk is therefore split in half
+    recursively until the dead hexes are isolated (each dead hex costs ~2
+    requests); other failures (5xx/timeouts) raise — the next cycle
+    re-attempts the whole chunk."""
+    try:
+        data = mixed_fetch(s, [("user.getUserLite", {"userId": h}) for h in chunk])
+    except NotFoundError:
+        if len(chunk) == 1:
+            return {}, chunk
+        mid = len(chunk) // 2
+        left, d_left = _fetch_chunk(s, chunk[:mid])
+        right, d_right = _fetch_chunk(s, chunk[mid:])
+        left.update(right)
+        return left, d_left + d_right
     out = {}
+    for i, h in enumerate(chunk):
+        if "error" in data[i]:
+            continue
+        out[h] = data[i]["result"]["data"]
+    return out, []
+
+
+def fetch_lite(s: requests.Session, hexs: list[str]) -> tuple[dict, list[str]]:
+    """({hex: getUserLite doc}, hexes the API says don't exist — 404s).
+    Users that error per-call are skipped (retried next cycle)."""
+    out: dict = {}
+    dead: list[str] = []
     for off in range(0, len(hexs), BATCH_CAP):
         chunk = hexs[off:off + BATCH_CAP]
-        data = batched_fetch(s, "user.getUserLite", [{"userId": h} for h in chunk])
-        for i, h in enumerate(chunk):
-            if "error" in data[i]:
+        fetched, dead_chunk = _fetch_chunk(s, chunk)
+        out.update(fetched)
+        dead.extend(dead_chunk)
+    return out, dead
+
+
+def mark_dead_stmts(dead: list[str]) -> list[str]:
+    """One UPDATE per 404'd hex: stamp lite_checked_at = NOW() so the user
+    leaves the fetch pools (pick_hexes only sees lite_checked_at IS NULL).
+    For never-checked users (username IS NULL) the row keeps username NULL —
+    checked + NULL username reads as "dead". For known users (username set —
+    e.g. a deleted account) the stamp defers their next check by STALE_HOURS,
+    so a dead user costs one slot per ~48 h instead of one per cycle."""
+    return [f"UPDATE users SET lite_checked_at = NOW()\n"
+            f"WHERE user_id = objectid_to_uuid('{h}')\n"
+            f"  AND lite_checked_at IS NULL"
+            for h in dead]
+
+
+class Filler:
+    """Fills the slack slots of OTHER scripts' batches with getUserLite calls.
+
+    Every mixed batch that isn't full (the 50-call cap) carries users from
+    TWO pools instead of empty slots, OUTSIDE update_users_lite's own
+    --limit/50-per-run steps — the whole pipeline drains them at no extra
+    request cost:
+      1. backfill — never-checked users (pick_hexes, wealth/damage first);
+      2. active — users who connected in the last ACTIVE_WINDOW_HOURS (4 d)
+         whose last check is older than STALE_HOURS (48 h) or never
+         (pick_active_hexes, same gate/ordering as the script's active
+         refresh, but consumed by every batched request).
+    Both pools are refilled in bulk only when empty, so no user is picked
+    twice within one run; backfill always beats active.
+
+    Results are collected per run: docs go to upsert_stmts (idempotent, sets
+    lite_checked_at); in-band 404s (dead users — a partial-fail mixed batch
+    answers 207 with per-call errors, so a single dead filler never kills the
+    batch) go to mark_dead_stmts (backfill users leave the queue for good;
+    active users' next check is deferred).
+    """
+
+    REFILL = 200  # bulk pick size when a pool runs out
+
+    def __init__(self, db: str) -> None:
+        self.db = db
+        self.backfill: list[str] = []
+        self.active: list[str] = []
+        self.fetched: dict = {}
+        self.dead: list[str] = []
+        self._seen: set[str] = set()
+        self._slot_hexes: dict[int, str] = {}
+        self._backfill_exhausted = False
+        self._active_exhausted = False
+
+    def _next_hex(self) -> str | None:
+        """One hex from the pools (backfill first), refilling a pool only
+        when empty; an exhausted pool is not re-queried within the run."""
+        if not self.backfill and not self._backfill_exhausted:
+            self.backfill = [h for h in pick_hexes(self.db, self.REFILL)
+                             if h not in self._seen]
+            if not self.backfill:
+                self._backfill_exhausted = True
+        if self.backfill:
+            return self.backfill.pop(0)
+        if not self.active and not self._active_exhausted:
+            self.active = [h for h in pick_active_hexes(self.db, self.REFILL)
+                           if h not in self._seen]
+            if not self.active:
+                self._active_exhausted = True
+        if self.active:
+            return self.active.pop(0)
+        return None
+
+    def top_up(self, calls: list[tuple[str, dict]]) -> list[int]:
+        """Append user.getUserLite calls until the batch holds MAX_BATCH;
+        returns the indices (into ``calls``) of the filler calls added."""
+        slots: list[int] = []
+        while len(calls) < MAX_BATCH:
+            h = self._next_hex()
+            if h is None:
+                break
+            self._seen.add(h)
+            pos = len(calls)
+            self._slot_hexes[pos] = h
+            slots.append(pos)
+            calls.append(("user.getUserLite", {"userId": h}))
+        return slots
+
+    def collect(self, results: list, slots: list[int]) -> None:
+        """Pick filler results out of a mixed_fetch response (positions
+        ``slots``); in-band 404s are collected as dead."""
+        for pos in slots:
+            if pos >= len(results):
                 continue
-            out[h] = data[i]["result"]["data"]
-    return out
+            res = results[pos]
+            if "error" in res:
+                err = res["error"]
+                if (err.get("data") or {}).get("httpStatus") == 404:
+                    self.dead.append(self._slot_hexes[pos])
+                continue
+            self.fetched[self._slot_hexes[pos]] = res["result"]["data"]
+
+    def stmts(self) -> list[str]:
+        """Upsert statements for the fetched fillers + dead markers."""
+        return upsert_stmts(self.fetched) + mark_dead_stmts(self.dead)
 
 
 def check_due(interval: int) -> bool:
@@ -245,14 +390,16 @@ def main() -> int:
     t0 = time.time()
     s: requests.Session | None = None
     fetched: dict = {}
+    dead: list[str] = []
     if hexs:
         s = make_session(pool_size=8)
         try:
-            fetched = fetch_lite(s, hexs)
+            fetched, dead = fetch_lite(s, hexs)
         except RuntimeError as exc:
             print(f"API failure: {exc}", file=sys.stderr)
             return 1
-        print(f"  getUserLite (backfill): {len(fetched)}/{len(hexs)} filled")
+        print(f"  getUserLite (backfill): {len(fetched)}/{len(hexs)} filled, "
+              f"{len(dead)} dead (404)")
     if do_active:
         interval = max(args.check_interval, CHECK_INTERVAL_MIN)
         if args.force_active or check_due(interval):
@@ -274,22 +421,27 @@ def main() -> int:
             if s is None:
                 s = make_session(pool_size=8)
             try:
-                ref = fetch_lite(s, active_hexs)
+                ref, ref_dead = fetch_lite(s, active_hexs)
             except RuntimeError as exc:
                 print(f"API failure: {exc}", file=sys.stderr)
                 return 1
-            print(f"  getUserLite (active refresh): {len(ref)}/{len(active_hexs)} filled")
+            print(f"  getUserLite (active refresh): {len(ref)}/{len(active_hexs)} "
+                  f"filled, {len(ref_dead)} dead (404)")
             fetched.update(ref)
+            dead.extend(ref_dead)
         else:
             print("  active refresh: no stale active users — nothing to fetch")
 
-    if fetched:
+    if fetched or dead:
+        stmts = upsert_stmts(fetched) + mark_dead_stmts(dead)
         try:
-            exec_many(upsert_stmts(fetched), args.db)
+            exec_many(stmts, args.db)
             flush_endpoint_log(args.db)
         except RuntimeError as exc:
             print(str(exc), file=sys.stderr)
             return 2
+        if dead:
+            print(f"  {len(dead)} dead users marked checked (never picked again)")
     print(f"  done in {time.time() - t0:.0f}s")
     return 0
 
