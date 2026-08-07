@@ -73,6 +73,7 @@
             "buyerId": "buyer_id",
             "sellerMuId": "secondary_seller_id",
             "sellerCountryId": "secondary_seller_id",
+            "sellerPartyId": "seller_party_id",
             "transactionType": "transaction_type_id",
             "updatedAt": null,
             "→ resultItemCode": null

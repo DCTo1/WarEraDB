@@ -35,6 +35,16 @@ CREATE TABLE inventory_ids (
     external_id UUID UNIQUE NOT NULL  -- MongoDB ObjectID encoded as UUID (12 bytes + 4 zero bytes)
 );
 
+-- Donation "parties" (donation.sellerPartyId). The API exposes only the
+-- ObjectID — no name/detail — so the table is a bare membership marker on
+-- the global inventory_ids map (same pattern as countries.country_id):
+-- get_party_id() adds the row when a party id first appears in a
+-- transaction. Populated by the transaction scraper.
+CREATE TABLE parties (
+    -- 4-byte aligned
+    party_id INT PRIMARY KEY REFERENCES inventory_ids(id)
+);
+
 
 -- 2. Items (normalized instances with skills)
 --
@@ -73,6 +83,7 @@ CREATE TABLE transactions (
     buyer_id            INT NULL REFERENCES inventory_ids(id),
     secondary_seller_id INT NULL REFERENCES inventory_ids(id),  -- MU/Country when a user acts for them
     secondary_buyer_id  INT NULL REFERENCES inventory_ids(id),
+    seller_party_id     INT NULL REFERENCES parties(party_id),  -- donation-only (sellerPartyId)
 
     -- 2-byte aligned
     item_code_id        SMALLINT NULL REFERENCES item_codes(id),  -- what was traded / the case / the input
