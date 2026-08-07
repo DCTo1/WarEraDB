@@ -362,7 +362,7 @@ def layout(title: str, body: str, refresh: bool = False) -> str:
 <b id="upd_sec">…</b>s</a></div></div>
 <nav><a href="/">Overview</a><a href="/battles">Battles</a>
 <a href="/users">Users</a><a href="/weekly">Weekly</a><a href="/tracker">Tracker</a><a href="/transactions">Transactions</a><a href="/bounties">Bounties</a><a href="/countries">Countries</a>
-<a href="/stats">Stats</a><a href="/sql">SQL</a></nav>
+<a href="/stats">Stats</a><a href="/usage">Usage</a><a href="/sql">SQL</a></nav>
 <hr><main id="main">{body}</main>
 {TIMER_JS}
 {THEME_JS}
