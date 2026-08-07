@@ -53,6 +53,26 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
+CREATE OR REPLACE FUNCTION get_party_id(p_external_id TEXT)
+RETURNS INT AS $$
+DECLARE
+    v_id INT;
+BEGIN
+    IF p_external_id IS NULL THEN
+        RETURN NULL;
+    END IF;
+    -- inventory_ids is the global ObjectID → int map; parties adds a
+    -- membership row (donation-only entity, no detail fields). SELECT-first
+    -- so the parties row exists exactly once per party id.
+    v_id := get_inventory_id(p_external_id);
+    IF v_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM parties WHERE party_id = v_id) THEN
+        INSERT INTO parties (party_id) VALUES (v_id)
+        ON CONFLICT (party_id) DO NOTHING;
+    END IF;
+    RETURN v_id;
+END;
+$$ LANGUAGE plpgsql;
+
 CREATE OR REPLACE FUNCTION get_item_code_id(p_code TEXT)
 RETURNS SMALLINT AS $$
 DECLARE
@@ -196,6 +216,7 @@ DECLARE
     v_buyer_id INT;
     v_secondary_seller_id INT;
     v_secondary_buyer_id INT;
+    v_seller_party_id INT;
     v_item_code_id SMALLINT;
     v_transaction_type_id SMALLINT;
     v_money DOUBLE PRECISION;
@@ -235,6 +256,14 @@ BEGIN
         v_secondary_buyer_id := NULL;
     END IF;
 
+    -- Donation-only: sellerPartyId lives in its own column (coexists with
+    -- the MU/country secondary ids above).
+    IF payload ? 'sellerPartyId' THEN
+        v_seller_party_id := get_party_id(payload->>'sellerPartyId');
+    ELSE
+        v_seller_party_id := NULL;
+    END IF;
+
     -- 3. Item codes and item instance resolution
     -- item_code_id stores what was traded / the case / the input material.
     v_item_code_id := get_item_code_id(payload->>'itemCode');
@@ -270,6 +299,7 @@ BEGIN
         buyer_id,
         secondary_seller_id,
         secondary_buyer_id,
+        seller_party_id,
         item_code_id,
         item_id,
         transaction_type_id,
@@ -283,6 +313,7 @@ BEGIN
         v_buyer_id,
         v_secondary_seller_id,
         v_secondary_buyer_id,
+        v_seller_party_id,
         v_item_code_id,
         v_item_id,
         v_transaction_type_id,
