@@ -316,6 +316,20 @@ def round_hexes_for(battle_hexes: list[str], db: str | None = None) -> set[str]:
         f"SELECT uuid_to_objectid(round_id) FROM rounds WHERE battle_id IN ({ids});", db)}
 
 
+def unfinalized_round_hexes_for(battle_hexes: list[str], db: str | None = None) -> set[str]:
+    """Hex ObjectIDs of rounds of the given battles whose stored row has no
+    ended_at — still live, or ended since their last stored fetch. Rounds
+    stored with ended_at are final (the API never changes ended round data),
+    so only these may still change."""
+    hexes = [h for h in battle_hexes if OBJECTID_RE.match(h)]
+    if not hexes:
+        return set()
+    ids = ",".join(f"objectid_to_uuid('{h}')" for h in hexes)
+    return {r[0] for r in query(
+        f"SELECT uuid_to_objectid(round_id) FROM rounds\n"
+        f"WHERE ended_at IS NULL AND battle_id IN ({ids});", db)}
+
+
 def battles_without_rounds(db: str | None = None, limit: int = 1000) -> list[str]:
     """Hex ObjectIDs of battles with no stored rounds (backfill targets)."""
     return [r[0] for r in query(
