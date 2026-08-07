@@ -72,10 +72,9 @@ from datetime import datetime, timedelta, timezone
 
 import requests
 
-import endpoint_log
-from api import batched_fetch, fetch_data, make_session
+from api import batched_fetch, make_session, mixed_fetch
 from db import esc, exec_batch, exec_many, flush_endpoint_log, query, scalar, value_sql
-from update_users_lite import upsert_stmts
+from update_users_lite import Filler, upsert_stmts
 from utils import BASE_DIR, ENTITY, MAX_BATCH, read_json, to_unix_ms, write_json
 
 STATE_FILE = os.path.join(BASE_DIR, "weekly_ranking_state.json")
@@ -111,15 +110,13 @@ def epoch_hour(dt: datetime) -> int:
     return int(dt.astimezone(timezone.utc).timestamp()) // 3600
 
 
-def fetch_one(s: requests.Session, ranking_type: str, key: str, etype: int,
-              latest) -> tuple[datetime, datetime, list[str]] | None:
-    """Fetch one weekly ranking doc; return (week_start, snapshot_at, stmts)
-    or None when the regen produced nothing new (duplicate hour / lagged
-    regen). Statements are INSERT ... ON CONFLICT DO NOTHING, one per item;
-    get_inventory_id() guarantees the inventory_ids row (brand-new entities
-    get added)."""
-    endpoint_log.log("ranking.getRanking")
-    d = fetch_data(s, "ranking.getRanking", {"rankingType": ranking_type}, timeout=120)
+def parse_weekly_doc(ranking_type: str, d: dict, key: str, etype: int,
+                     latest) -> tuple[datetime, datetime, list[str]] | None:
+    """Parse one weekly ranking doc (no API call); return
+    (week_start, snapshot_at, stmts) or None when the regen produced nothing
+    new (duplicate hour / lagged regen). Statements are INSERT ... ON
+    CONFLICT DO NOTHING, one per item; get_inventory_id() guarantees the
+    inventory_ids row (brand-new entities get added)."""
     items = d.get("items", [])
     if not items:
         print(f"  {ranking_type}: empty doc")
@@ -489,9 +486,9 @@ def audit(dbname: str, limit: int = AUDIT_LIMIT, user_hex: str | None = None) ->
             continue  # data in motion — not failed, retried when settled
         w_prev_sql = w_prev[week]
         official = vals[0][1]
-        c1 = derived.get((user_id, week)) == (roundsum.get((user_id, week), 0) + post)
-        c2 = derived.get((user_id, w_prev_sql)) == (roundsum.get((user_id, w_prev_sql), 0) - post)
-        c3 = official == (derived.get((user_id, week), 0) + active.get(user_id, 0))
+        c1 = (derived.get((user_id, week)) or 0) == (roundsum.get((user_id, week), 0) + post)
+        c2 = (derived.get((user_id, w_prev_sql)) or 0) == (roundsum.get((user_id, w_prev_sql), 0) - post)
+        c3 = official == ((derived.get((user_id, week)) or 0) + (active.get(user_id) or 0))
         if c1 and c2 and c3:
             n_ok += 1
             stmts.append(
@@ -503,7 +500,7 @@ def audit(dbname: str, limit: int = AUDIT_LIMIT, user_hex: str | None = None) ->
             failed[str(user_id)] = now_ts
             print(f"  audit FAIL: user {user_id} — applied(W)={c1}"
                   f" applied(W-1)={c2} complete={c3}")
-        elif official < derived.get((user_id, week), 0) + active.get(user_id, 0):
+        elif official < (derived.get((user_id, week)) or 0) + (active.get(user_id) or 0):
             # the official snapshot lags the live rows by up to an hour:
             # damage done after the last regen shows in the active rows but
             # not yet in the snapshot — the user is "in motion", not broken.
@@ -566,36 +563,58 @@ def fetch(dbname: str, force: bool = False) -> int:
         return 0
     max_week = scalar("SELECT MAX(week_start) FROM weekly_ranking_snapshots;", dbname)
     s = make_session(pool_size=4)
+    filler = Filler(dbname)
     stmts: list[str] = []
     rollover_week: datetime | None = None
     api_failed = False
+    # The due types (throttle exclusions applied per type) go in ONE mixed
+    # request — the three ranking.getRanking calls are independent; the slack
+    # slots carry user.getUserLite filler (backfill + active pools).
+    due: list[tuple[str, str, int, datetime | None]] = []
     for ranking_type, key, etype in WEEKLY_TYPES:
         latest = scalar(f"SELECT MAX(snapshot_at) FROM weekly_ranking_snapshots"
                         f" WHERE entity_type = {etype};", dbname)
         if not force and latest is not None and epoch_hour(latest) == now_h:
             print(f"  {ranking_type}: latest snapshot is from this hour — skipping")
             continue
+        due.append((ranking_type, key, etype, latest))
+    if due:
+        calls = [("ranking.getRanking", {"rankingType": rt}) for rt, _, _, _ in due]
+        slots = filler.top_up(calls)
         try:
-            res = fetch_one(s, ranking_type, key, etype, latest)
+            results = mixed_fetch(s, calls, timeout=120)
         except RuntimeError as exc:
-            print(f"  {ranking_type}: API failure: {exc}", file=sys.stderr)
+            print(f"weekly snapshots: API failure: {exc}", file=sys.stderr)
             api_failed = True
-            continue
-        if res is None:
-            continue
-        week, snap, its = res
-        print(f"  {ranking_type}: {len(its)} items, regen {snap.isoformat()},"
-              f" week {week.isoformat()[:10]}")
-        stmts.extend(its)
-        if max_week is None or week > max_week:
-            rollover_week = week
-            max_week = week
+            results = []
+        if results and slots:
+            filler.collect(results, slots)
+        for (ranking_type, key, etype, latest), res in zip(due, results):
+            if "error" in res:
+                print(f"  {ranking_type}: API failure: {res['error']}", file=sys.stderr)
+                api_failed = True
+                continue
+            parsed = parse_weekly_doc(ranking_type, res["result"]["data"], key, etype, latest)
+            if parsed is None:
+                continue
+            week, snap, its = parsed
+            print(f"  {ranking_type}: {len(its)} items, regen {snap.isoformat()},"
+                  f" week {week.isoformat()[:10]}")
+            stmts.extend(its)
+            if max_week is None or week > max_week:
+                rollover_week = week
+                max_week = week
     if stmts:
         exec_batch(stmts + prune_sql(rollover_week), dbname,
                    pre="SET LOCAL timescaledb.max_tuples_decompressed_per_dml_transaction = 0")
         flush_endpoint_log(dbname)
         print(f"  stored {len(stmts)} snapshot rows"
               + ("; pruned finished weeks to their finals" if rollover_week is not None else ""))
+    fs = filler.stmts()
+    if fs:
+        exec_many(fs, dbname)
+        print(f"  filler: {len(filler.fetched)} users upserted, "
+              f"{len(filler.dead)} dead marked", flush=True)
     write_json(STATE_FILE, {**state, "last_attempt": time.time()})
     return 1 if api_failed else 0
 
