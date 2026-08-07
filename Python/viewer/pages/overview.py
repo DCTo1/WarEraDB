@@ -40,7 +40,8 @@ def page_overview(q: dict) -> str:
 
     cards = "".join(
         f'<div class="card"><div class="num">{c[k]:,}</div><div class="lbl">{k}</div></div>'
-        for k in ("battles", "rounds", "bounty_sides", "countries", "users", "transactions"))
+        for k in ("battles", "rounds", "bounty_sides", "countries", "users"))
+    cards += f'<a href="/transactions"><div class="card"><div class="num">{c["transactions"]:,}</div><div class="lbl">transactions →</div></div></a>'
     cards += (f'<div class="card" title="users backfilled via user.getUserLite">'
               f'<div class="num">{c.get("users_lite", 0):,}</div>'
               f'<div class="lbl">users lite</div></div>')

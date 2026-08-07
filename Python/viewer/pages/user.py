@@ -10,7 +10,7 @@ from urllib.parse import urlencode
 
 from ..config import HEX_RE
 from ..queries import query_dicts
-from ..ui import abbr, aligned_pair, battle_link, esc, error_page, layout, ts
+from ..ui import abbr, aligned_pair, battle_link, esc, error_page, layout, ts, user_link
 
 
 def page_user(q: dict) -> str:
@@ -63,6 +63,47 @@ def page_user(q: dict) -> str:
         "points": sum(r["points"] or 0 for r in history),
         "money": sum(r["money"] or 0 for r in history),
     }
+    txns, err = query_dicts(
+        "SELECT t.created_at, tt.type AS transaction_type,"
+        " ic.code AS item_code, it.code AS result_item_code,"
+        " t.money, t.quantity,"
+        " lower(uuid_to_objectid(oi.external_id)) AS other_hex,"
+        " ou.username AS other_username,"
+        " t.seller_id = x.uid AS other_is_buyer"
+        " FROM (SELECT id AS uid FROM inventory_ids"
+        f"  WHERE external_id = objectid_to_uuid('{hexid}')) x"
+        " JOIN transactions t ON t.seller_id = x.uid OR t.buyer_id = x.uid"
+        " JOIN transaction_types tt ON tt.id = t.transaction_type_id"
+        " LEFT JOIN item_codes ic ON ic.id = t.item_code_id"
+        " LEFT JOIN items i ON i.id = t.item_id"
+        " LEFT JOIN item_codes it ON it.id = i.item_code_id"
+        " LEFT JOIN inventory_ids oi ON oi.id = CASE"
+        "   WHEN t.seller_id = x.uid THEN t.buyer_id ELSE t.seller_id END"
+        " LEFT JOIN users ou ON ou.user_id = oi.external_id"
+        " ORDER BY t.created_at DESC LIMIT 20")
+    if err:
+        return error_page(err)
+    def item_cell(r: dict) -> str:
+        if not r.get("item_code"):
+            return "—"
+        out = f"<b>{esc(r['item_code'])}</b>"
+        if r.get("result_item_code") and r["result_item_code"] != r.get("item_code"):
+            out += f" <span class='muted'>→ {esc(r['result_item_code'])}</span>"
+        return out
+
+    def counterpart(r: dict) -> str:
+        if not r["other_hex"]:
+            return "—"
+        return (f"{'← from' if not r['other_is_buyer'] else '→ to'}"
+                f" {user_link({'username': r['other_username'], 'user_id': r['other_hex']})}")
+
+    txn_rows = "".join(
+        f"<tr><td>{esc(ts(r['created_at'], 19))}</td>"
+        f"<td>{esc(r['transaction_type'])}</td>"
+        f"<td>{item_cell(r)}</td>"
+        f"<td>{r['quantity'] or 0:,.0f}</td><td>{r['money'] or 0:,.2f}</td>"
+        f"<td>{counterpart(r)}</td></tr>"
+        for r in txns)
     top = history[:50]
     wlr = max((len(abbr(r.get("lr_defender_damages") or 0)) for r in top), default=1)
 
@@ -101,4 +142,9 @@ def page_user(q: dict) -> str:
         <h2>Top battles ({len(top)} of {a.get('battles') or 0:,} by damage)</h2>
         <table style="width:max-content"><tr><th>Battle (Defender vs Attacker)</th>
         <th style='width:40px'>Rounds</th><th>Date</th><th>Side</th>
-        <th>Damage</th><th>Points</th><th>Last Round Damage</th></tr>{hist_rows}</table>""")
+        <th>Damage</th><th>Points</th><th>Last Round Damage</th></tr>{hist_rows}</table>
+        <h2>Recent transactions <small class="muted">(72 h window ·
+            <a href="/transactions?{urlencode({'user': hexid})}">all →</a>)</small></h2>
+        <table style="width:max-content"><tr><th>Time</th><th>Type</th><th>Item</th>
+        <th>Qty</th><th>Money</th><th>Counterpart</th></tr>
+        {txn_rows or "<tr><td colspan='6' class='muted'>none in the stored window</td></tr>"}</table>""")
