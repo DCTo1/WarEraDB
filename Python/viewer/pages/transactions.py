@@ -3,12 +3,20 @@
 The DB only holds the API's rolling 72 h window (kept current by the
 transaction filler riding the pipeline's mixed batches). Filters: type
 (dropdown), item code (input), user (hex or username), hours back.
+
+Performance: the window scan + sort is chunk-pruned by the created_at bound
+and hits only the recent uncompressed chunks — the hypertable is natively
+compressed (segmentby transaction_type_id, orderby created_at, see
+create_tables.sql) and carries no query indexes besides the unique upsert
+index; the 11 lookup joins run AFTER the LIMIT so they touch only the
+displayed rows, never the whole window. COUNT and the per-type histogram
+share one GROUP BY pass (total = sum of the histogram).
 """
 
 from urllib.parse import urlencode
 
 from ..config import HEX_RE
-from ..queries import first_val, query_dicts
+from ..queries import query_dicts
 from ..ui import esc, error_page, layout, ts, user_link
 
 
@@ -56,13 +64,16 @@ def page_transactions(q: dict) -> str:
             name = user.replace(chr(39), chr(39) + chr(39))
             uid = ("(SELECT i.id FROM users u"
                    " JOIN inventory_ids i ON i.external_id = u.user_id"
-                   f" WHERE u.username = '{name}' LIMIT 1)")
+                   f" WHERE lower(u.username) = lower('{name}') LIMIT 1)")
         conds.append(f"(t.seller_id = {uid} OR t.buyer_id = {uid})")
         params["user"] = user
     where = " WHERE " + " AND ".join(conds)
 
+    # Window rows FIRST (indexed created_at scan + limit), then the lookup
+    # joins on the displayed rows only — the old shape joined 600K+ rows
+    # before sorting and took seconds on the 72 h window.
     select = (
-        "SELECT t.transaction_id, t.created_at, t.money, t.quantity,"
+        "SELECT q.transaction_id, q.created_at, q.money, q.quantity,"
         " tt.type AS transaction_type,"
         " ic.code AS item_code,"
         " it.code AS result_item_code,"
@@ -73,30 +84,37 @@ def page_transactions(q: dict) -> str:
         " lower(uuid_to_objectid(ss.external_id)) AS sec_seller_hex,"
         " lower(uuid_to_objectid(sb.external_id)) AS sec_buyer_hex,"
         " lower(uuid_to_objectid(p.external_id)) AS party_hex"
+        " FROM (SELECT t.transaction_id, t.created_at, t.money, t.quantity,"
+        " t.item_code_id, t.item_id, t.seller_id, t.buyer_id,"
+        " t.secondary_seller_id, t.secondary_buyer_id, t.seller_party_id,"
+        " t.transaction_type_id"
         " FROM transactions t"
-        " JOIN transaction_types tt ON tt.id = t.transaction_type_id"
-        " LEFT JOIN item_codes ic ON ic.id = t.item_code_id"
-        " LEFT JOIN items i ON i.id = t.item_id"
+        f"{where} ORDER BY t.created_at DESC LIMIT 100 OFFSET {page * 100}) q"
+        " JOIN transaction_types tt ON tt.id = q.transaction_type_id"
+        " LEFT JOIN item_codes ic ON ic.id = q.item_code_id"
+        " LEFT JOIN items i ON i.id = q.item_id"
         " LEFT JOIN item_codes it ON it.id = i.item_code_id"
-        " LEFT JOIN inventory_ids si ON si.id = t.seller_id"
+        " LEFT JOIN inventory_ids si ON si.id = q.seller_id"
         " LEFT JOIN users us ON us.user_id = si.external_id"
-        " LEFT JOIN inventory_ids bi ON bi.id = t.buyer_id"
+        " LEFT JOIN inventory_ids bi ON bi.id = q.buyer_id"
         " LEFT JOIN users ub ON ub.user_id = bi.external_id"
-        " LEFT JOIN inventory_ids ss ON ss.id = t.secondary_seller_id"
-        " LEFT JOIN inventory_ids sb ON sb.id = t.secondary_buyer_id"
-        " LEFT JOIN inventory_ids p ON p.id = t.seller_party_id")
-    rows, err = query_dicts(f"{select}{where} ORDER BY t.created_at DESC"
-                            f" LIMIT 100 OFFSET {page * 100}")
+        " LEFT JOIN inventory_ids ss ON ss.id = q.secondary_seller_id"
+        " LEFT JOIN inventory_ids sb ON sb.id = q.secondary_buyer_id"
+        " LEFT JOIN inventory_ids p ON p.id = q.seller_party_id"
+        " ORDER BY q.created_at DESC")
+    rows, err = query_dicts(select)
     if err:
         return error_page(err)
-    total_rows, _ = query_dicts(
-        f"SELECT COUNT(*) AS n FROM transactions t{where}")
-    total = first_val(total_rows or [], "n") or 0
-    pages = max(1, (total + 99) // 100)
-    counts, _ = query_dicts(
+    # Total count + per-type histogram in ONE pass over the filtered window;
+    # total = sum of the histogram rows.
+    counts, err = query_dicts(
         "SELECT tt.type, COUNT(*)::int AS n FROM transactions t"
         " JOIN transaction_types tt ON tt.id = t.transaction_type_id"
         f"{where} GROUP BY tt.type ORDER BY COUNT(*) DESC")
+    if err:
+        return error_page(err)
+    total = sum(r["n"] for r in counts)
+    pages = max(1, (total + 99) // 100)
     crows = "".join(
         f"<span class='muted'>{esc(r['type'])}: {r['n']:,}</span>"
         for r in counts) or "<span class='muted'>no transactions stored</span>"

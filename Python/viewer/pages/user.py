@@ -63,26 +63,44 @@ def page_user(q: dict) -> str:
         "points": sum(r["points"] or 0 for r in history),
         "money": sum(r["money"] or 0 for r in history),
     }
-    txns, err = query_dicts(
-        "SELECT t.created_at, tt.type AS transaction_type,"
-        " ic.code AS item_code, it.code AS result_item_code,"
-        " t.money, t.quantity,"
-        " lower(uuid_to_objectid(oi.external_id)) AS other_hex,"
-        " ou.username AS other_username,"
-        " t.seller_id = x.uid AS other_is_buyer"
-        " FROM (SELECT id AS uid FROM inventory_ids"
-        f"  WHERE external_id = objectid_to_uuid('{hexid}')) x"
-        " JOIN transactions t ON t.seller_id = x.uid OR t.buyer_id = x.uid"
-        " JOIN transaction_types tt ON tt.id = t.transaction_type_id"
-        " LEFT JOIN item_codes ic ON ic.id = t.item_code_id"
-        " LEFT JOIN items i ON i.id = t.item_id"
-        " LEFT JOIN item_codes it ON it.id = i.item_code_id"
-        " LEFT JOIN inventory_ids oi ON oi.id = CASE"
-        "   WHEN t.seller_id = x.uid THEN t.buyer_id ELSE t.seller_id END"
-        " LEFT JOIN users ou ON ou.user_id = oi.external_id"
-        " ORDER BY t.created_at DESC LIMIT 20")
+    uid_rows, err = query_dicts(
+        "SELECT id FROM inventory_ids"
+        f" WHERE external_id = objectid_to_uuid('{hexid}')")
     if err:
         return error_page(err)
+    txns = []
+    if uid_rows:
+        # Window FIRST, joins after: the seller/buyer filter + ORDER BY +
+        # LIMIT live inside the subquery, so the scan stops at the first
+        # chunk with matches (~2 ms). The old shape (JOIN transactions ON
+        # t.seller_id = x.uid OR t.buyer_id = x.uid before the limit) made
+        # the planner scan every chunk decompressed — 25 ms on uncompressed
+        # data, ~350 ms on compressed (the OR-join defeats the early stop).
+        uid = uid_rows[0]["id"]
+        txns, err = query_dicts(
+            "SELECT q.created_at, tt.type AS transaction_type,"
+            " ic.code AS item_code, it.code AS result_item_code,"
+            " q.money, q.quantity,"
+            " lower(uuid_to_objectid(oi.external_id)) AS other_hex,"
+            " ou.username AS other_username,"
+            " q.other_is_buyer"
+            " FROM (SELECT t.created_at, t.money, t.quantity, t.item_code_id,"
+            "   t.item_id, t.transaction_type_id,"
+            f"   (t.seller_id = {uid}) AS other_is_buyer,"
+            f"   CASE WHEN t.seller_id = {uid} THEN t.buyer_id"
+            f"   ELSE t.seller_id END AS other_id"
+            "  FROM transactions t"
+            f"  WHERE t.seller_id = {uid} OR t.buyer_id = {uid}"
+            "  ORDER BY t.created_at DESC LIMIT 20) q"
+            " JOIN transaction_types tt ON tt.id = q.transaction_type_id"
+            " LEFT JOIN item_codes ic ON ic.id = q.item_code_id"
+            " LEFT JOIN items i ON i.id = q.item_id"
+            " LEFT JOIN item_codes it ON it.id = i.item_code_id"
+            " LEFT JOIN inventory_ids oi ON oi.id = q.other_id"
+            " LEFT JOIN users ou ON ou.user_id = oi.external_id"
+            " ORDER BY q.created_at DESC")
+        if err:
+            return error_page(err)
     def item_cell(r: dict) -> str:
         if not r.get("item_code"):
             return "—"
