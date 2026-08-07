@@ -105,3 +105,31 @@
 -- CREATE INDEX IF NOT EXISTS idx_users_last_active
 --     ON users (last_active_at);
 
+-- =============================================================================
+--  Transactions
+--
+--  NO INDEXES NEEDED (2026-08-07, migration_19): the transactions hypertable
+--  is natively compressed (segmentby transaction_type_id, orderby created_at
+--  — see create_tables.sql), and compressed chunks drop their per-chunk
+--  indexes anyway. The /transactions page always filters a 1-72 h window, so
+--  the created_at orderby + chunk pruning serve the sort, and the window scan
+--  over the few recent uncompressed chunks is sub-millisecond. The only index
+--  is the unique (transaction_id, created_at) ON CONFLICT target in
+--  create_tables.sql. Measured (2026-08-07, 2M-row DB): every page filter is
+--  equal or FASTER without these five indexes (browse 0.5 → 1.0 ms, +type
+--  0.4 → 0.4 ms, +item 0.4 → 0.7 ms, +user 3.4 → 2.5 ms, histogram 27.6 →
+--  37.5 ms — all for a 24 h window on the full history).
+--
+--  Historic (do NOT re-enable): these used to be per-chunk query indexes —
+--  CREATE INDEX IF NOT EXISTS idx_transactions_created_at
+--      ON transactions (created_at DESC);
+--  CREATE INDEX IF NOT EXISTS idx_transactions_type
+--      ON transactions (transaction_type_id, created_at DESC);
+--  CREATE INDEX IF NOT EXISTS idx_transactions_item
+--      ON transactions (item_code_id, created_at DESC);
+--  CREATE INDEX IF NOT EXISTS idx_transactions_seller
+--      ON transactions (seller_id, created_at DESC);
+--  CREATE INDEX IF NOT EXISTS idx_transactions_buyer
+--      ON transactions (buyer_id, created_at DESC);
+-- =============================================================================
+

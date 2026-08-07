@@ -103,6 +103,25 @@ DROP INDEX IF EXISTS transactions_created_at_idx;
 CREATE UNIQUE INDEX idx_transactions_transaction_id
     ON transactions (transaction_id, created_at);
 
+-- Native compression (migration_19, 2026-08-07): segmentby
+-- transaction_type_id (the /transactions page's type filter; ~11 segments)
+-- + orderby created_at (the page's default sort + time-window chunk
+-- pruning). NO query indexes beyond the unique upsert index (see
+-- create_indexes.sql): compressed chunks drop their indexes anyway, and the
+-- viewer's 1-72 h window scans hit only the recent uncompressed chunks,
+-- where a seq scan + top-N sort is sub-millisecond. Measured on a 2M-row
+-- DB (2026-08-07): every /transactions and /user filter is equal or faster
+-- with compression and without the five per-chunk indexes (94 B/row heap +
+-- 201 B/row indexes → 8 B/row total).
+-- The 7-day policy keeps the rolling 72 h window + a day of chunk slack
+-- uncompressed while the transaction filler writes into it.
+ALTER TABLE transactions SET (
+    timescaledb.compress,
+    timescaledb.compress_segmentby = 'transaction_type_id',
+    timescaledb.compress_orderby = 'created_at');
+
+SELECT add_compression_policy('transactions', INTERVAL '7 days', if_not_exists => TRUE);
+
 
 -- =============================================================================
 -- 4. Battle tables
