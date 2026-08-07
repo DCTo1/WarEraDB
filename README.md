@@ -10,11 +10,17 @@ TimescaleDB hypertables.
 > history unfiltered (verified 2026-08-07 — the edge is exactly now − 72.00 h
 > and moves with the clock; older rows are reachable only via per-entity
 > filters like `userId`/`itemCode`, whose full-history backfill is planned but
-> not yet run). `update_transactions.py` keeps the DB current with the window:
-> on the web viewer's 15 s cycle it sends 4 cursor probes (no-cursor, now − 5s,
-> − 10s, − 15s) that tile the newest ~26 s, and rides the batch's slack slots
-> with a time-bucketed walk that fills the window back to the edge (~1.5M rows
-> on first run). The full 72 h window is stored continuously from the moment
+> not yet run). The window is kept current by a **filler** riding the web
+> viewer's mixed batches (no dedicated step since 2026-08-07): on every
+> cycle the slack slots of update_battles / update_live / update_weekly_ranking
+> carry `transaction.getPaginatedTransactions` calls from
+> `update_transactions.TransactionFiller` — a time-bucketed walk that fills
+> the window back to the edge (~1.5M rows on the first fill) plus 4 live
+> probes (no-cursor + now−5s/−10s/−15s) every `PROBE_EVERY` seconds that
+> tile the newest ~26 s and detect gaps. Both pools stop naturally when the
+> work is drained (`done=True` in
+> `Python/transactions_state.json` → no more calls until a probe finds
+> something new). The full 72 h window is stored continuously from the moment
 > the scraper runs; anything older than 72 h at that point is unreachable
 > until the per-entity backfill lands.
 
@@ -31,7 +37,7 @@ TimescaleDB hypertables.
 | Loot items (upserted from ranking loot) | ~1.4M |
 | Inventory ids (users, countries, MUs — global ObjectID → int map) | ~100K |
 | Users (API lifetime stats + username/level/MU detail) | ~100K |
-| Transactions (rolling 72 h window, kept live by update_transactions.py) | ~1.5M |
+| Transactions (rolling 72 h window, kept live by the mixed-batch filler) | ~1.5M |
 
 ## Easy setup (for everyone)
 
@@ -163,8 +169,11 @@ done
 .venv/bin/python Python/update_weekly_ranking.py
 .venv/bin/python Python/update_weekly_ranking.py --backfill
 
-# Live transaction sync (rolling 72 h window, runs on the web viewer's cycle)
-.venv/bin/python Python/update_transactions.py --db tsdb
+# Live transaction window — NO dedicated step (2026-08-07): the rolling 72 h
+# window is filled/kept live by TransactionFiller (update_transactions.py)
+# riding the slack of update_battles/update_live/update_weekly_ranking mixed
+# batches on the web viewer's cycle; WARERA_TX_FILLER=0 disables it.
+# Coverage report (no API calls) still works standalone:
 .venv/bin/python Python/update_transactions.py --verify   # coverage report
 
 # Seed the endpoint registry (idempotent; new endpoints auto-register anyway)
@@ -203,11 +212,13 @@ WARERA_DB_URL='postgresql+psycopg://postgres:postgres@localhost:5433/{db}' \
 ### Web viewer (optional)
 
 Local read-only web viewer + auto-updater (battles/rounds/countries, live
-battle sync, rankings, users, bounties — every 15 s; the cycle also runs
-update_users_lite.py: backfills user.getUserLite basic info for up to 100
-unchecked users per run, wealth/damage rankings first, then re-checks users
-active within 4 days only — users.last_active_at, ≤50 per cycle, ≥48 h
-apart, real lastConnectionAt stored on fetch, activity check every 2 h):
+battle sync, rankings, users, bounties, **transactions** — every 15 s; the
+cycle also runs update_users_lite.py: backfills user.getUserLite basic info
+for up to 100 unchecked users per run, wealth/damage rankings first, then
+re-checks users active within 4 days only — users.last_active_at, ≤50 per
+cycle, ≥48 h apart, real lastConnectionAt stored on fetch, activity check
+every 2 h; the transaction 72 h window rides the mixed batches' slack via
+`update_transactions.TransactionFiller` — `--transactions 0` disables):
 
 ```bash
 # WARERA_DB_URL must be set in the viewer's environment: the auto-updater
@@ -357,5 +368,5 @@ ORDER BY r.rank LIMIT 20;
 | `warera_gui.py` | Control panel (stdlib-only Tkinter GUI + `--setup` headless mode): one-command first-time setup (venv, TimescaleDB container, schema, latest backup), start/stop/restart the web viewer, local backups + backup restore, API token storage |
 | `docker-compose.yml` | Manual alternative to the GUI's container setup (`docker compose up -d` — same image/port/volume) |
 | `base_data/` | Schema DDL (`create_tables.sql`), PL/pgSQL functions (`functions.sql`), indexes, views |
-| `Python/` | Battle tooling: shared modules (`api.py` WarEra API client, `db.py` SQLAlchemy DB access + SQL helpers, `utils.py` time/state/constants + `prepare_transaction()`, `endpoint_log.py`) + the CLI scripts (`update_battles.py`, `update_live.py`, `update_countries.py`, `insert_ranking_sample.py`, `update_users.py`, `update_users_lite.py`, `update_weekly_ranking.py`, `update_transactions.py`, `seed_endpoints.py`) + the web viewer (`db_web.py` entry point and the `viewer/` package with its pages, incl. the `/tracker` damage tracker and the `/weekly` rankings) |
+| `Python/` | Battle tooling: shared modules (`api.py` WarEra API client, `db.py` SQLAlchemy DB access + SQL helpers, `utils.py` time/state/constants + `prepare_transaction()`, `endpoint_log.py`) + the CLI scripts (`update_battles.py`, `update_live.py`, `update_countries.py`, `insert_ranking_sample.py`, `update_users.py`, `update_users_lite.py`, `update_weekly_ranking.py`, `update_transactions.py` (TransactionFiller — the transaction-window filler riding the mixed batches), `seed_endpoints.py`) + the web viewer (`db_web.py` entry point and the `viewer/` package with its pages, incl. the `/tracker` damage tracker, the `/weekly` rankings and the `/transactions` window browser) |
 | `data/battle_timestamps.json` | Battle timestamp index for batched pagination (oldest-first, append-only) |
