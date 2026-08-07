@@ -43,11 +43,12 @@ Python/update_users_lite.py fetches user.getUserLite for up to
 --user-lite (default 100) unchecked users, wealth/damage rankings first (0
 disables the user pass), and Python/update_weekly_ranking.py stores hourly
 official weekly-ranking snapshots (--weekly 1, self-throttled to xx:01; 0
-disables). Python/update_transactions.py keeps the transactions table
-current with the API's rolling 72 h window (4 cursor probes per cycle fill
-the newest ~26 s; the request's slack slots walk the window back toward
-the edge; --transactions 0 disables). The header timer shows the seconds
-until the next run and switches to "updating…" while a run is in progress.
+disables). The transactions table stays current with the API's rolling
+72 h window through the transaction filler: the mixed batches of the first
+three scripts carry transaction.getPaginatedTransactions probes + pending
+window-backfill pages in their slack slots (--transactions 0 disables it).
+The header timer shows the seconds until the next run and switches to
+"updating…" while a run is in progress.
 
 Stdlib only for the viewer itself (the spawned pipeline scripts use
 SQLAlchemy + requests, already in requirements.txt). All reads go through
@@ -87,8 +88,9 @@ def main() -> int:
                         "weeklyCountryDamages/muWeeklyDamages, self-throttled to "
                         "xx:01; default 1, 0 disables)")
     p.add_argument("--transactions", type=int, default=int(config.settings.transactions_enabled),
-                   help="rolling-window transaction scrape (cursor probes + 72 h "
-                        "window backfill; default 1, 0 disables)")
+                   help="transaction window filler (transaction probes + 72 h "
+                        "window backfill riding the pipeline's mixed batches; "
+                        "default 1, 0 disables)")
     args = p.parse_args()
 
     config.settings.db = args.db
