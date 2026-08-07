@@ -8,7 +8,7 @@ alarming — the API will never serve them again.
 
 from datetime import datetime, timedelta, timezone
 
-from ..queries import first_val, query_dicts
+from ..queries import query_dicts
 from ..ui import esc, error_page, layout
 
 HOURS = 72
@@ -27,44 +27,40 @@ def _cell(n: int, inside: bool, med: int, *, title: str) -> str:
 
 
 def page_transactions_coverage(q: dict) -> str:
+    # ONE pass over the table instead of the old three (hourly, daily,
+    # min/max/count): per-hour counts + per-hour MIN/MAX; days, total and
+    # overall min/max are derived in Python from the same rows.
     hour_rows, err = query_dicts(
-        "SELECT date_trunc('hour', created_at) AS h, COUNT(*)::int AS n"
+        "SELECT date_trunc('hour', created_at) AS h, COUNT(*)::int AS n,"
+        " MIN(created_at) AS mn, MAX(created_at) AS mx"
         " FROM transactions GROUP BY 1")
-    if err:
-        return error_page(err)
-    day_rows, err = query_dicts(
-        "SELECT date_trunc('day', created_at) AS d, COUNT(*)::int AS n"
-        " FROM transactions GROUP BY 1")
-    if err:
-        return error_page(err)
-    info, err = query_dicts(
-        "SELECT MIN(created_at) AS mn, MAX(created_at) AS mx,"
-        " COUNT(*)::int AS total FROM transactions")
     if err:
         return error_page(err)
 
-    mn = first_val(info or [], "mn")
-    mx = first_val(info or [], "mx")
-    total = first_val(info or [], "total") or 0
-    if mn is not None and mn.tzinfo is None:
-        mn = mn.replace(tzinfo=timezone.utc)
-    if mx is not None and mx.tzinfo is None:
-        mx = mx.replace(tzinfo=timezone.utc)
     now = datetime.now(timezone.utc)
     window_edge = now - timedelta(hours=HOURS)  # the API serves ~72 h only
 
     hours: dict[datetime, int] = {}
+    days: dict[datetime, int] = {}
+    mn = mx = None
+    total = 0
     for r in hour_rows:
         h = r["h"]
         if h.tzinfo is None:
             h = h.replace(tzinfo=timezone.utc)
-        hours[h] = r["n"] or 0
-    days: dict[datetime, int] = {}
-    for r in day_rows:
-        d = r["d"]
-        if d.tzinfo is None:
-            d = d.replace(tzinfo=timezone.utc)
-        days[d] = r["n"] or 0
+        n = r["n"] or 0
+        hours[h] = n
+        total += n
+        d = h.replace(hour=0, minute=0, second=0, microsecond=0)
+        days[d] = days.get(d, 0) + n
+        if r["mn"] is not None and (mn is None or r["mn"] < mn):
+            mn = r["mn"]
+        if r["mx"] is not None and (mx is None or r["mx"] > mx):
+            mx = r["mx"]
+    if mn is not None and mn.tzinfo is None:
+        mn = mn.replace(tzinfo=timezone.utc)
+    if mx is not None and mx.tzinfo is None:
+        mx = mx.replace(tzinfo=timezone.utc)
 
     in_window = sorted(h for h in hours if h >= window_edge)
     nonzero = [hours[h] for h in in_window if hours[h] > 0]
