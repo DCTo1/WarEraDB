@@ -18,7 +18,10 @@ positional batching — verified 2026-08-07: mixed batches dispatch per
 position; 200 when all calls succeed, 207 with in-band per-call errors when
 some fail, 404 for the whole request when ALL fail). Both helpers log one
 endpoint usage per call via endpoint_log (batched requests log once per
-payload) — db.py flushes the queue on the next DB call.
+payload) — db.py flushes the queue on the next DB call. Since 2026-08-08
+every call carries the HTTP request's id (endpoint_log.log(name, request_id)),
+so count(DISTINCT request_id) on endpoints_used = the exact request count
+(a 50-call batch counts as ONE request, not 50).
 
 Both helpers retry by default (the API intermittently drops connections).
 Set WARERA_NO_RETRIES=1 to force a single attempt with no backoff sleeps —
@@ -30,6 +33,7 @@ simply re-attempted by the next cycle.
 import json
 import os
 import time
+from itertools import count
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -40,6 +44,16 @@ from utils import API_KEY_FILE, MAX_BATCH
 # API tokens (x-api-key) are only accepted on api2.warera.io (api4/api5
 # reject them with 403 "API tokens are not allowed on this hostname").
 API_URL = "https://api2.warera.io/trpc"
+
+# Per-process request id counter: (pid & 0x7FFF) << 48 | seq fits the
+# BIGINT column (15 pid bits + 48 seq bits ≤ 2^63−1) and is unique across
+# all pipeline processes and threads (the GIL makes next() atomic), so
+# every HTTP request logged through mixed_fetch gets a globally distinct id.
+_request_seq = count(1)
+
+
+def _request_id() -> int:
+    return ((os.getpid() & 0x7FFF) << 48) | (next(_request_seq) & 0xFFFFFFFFFFFF)
 
 
 def _no_retries() -> bool:
@@ -151,8 +165,9 @@ def mixed_fetch(session: requests.Session, calls: list[tuple[str, dict]],
         raise RuntimeError(f"batch too large: {len(calls)} > {MAX_BATCH}")
     if _no_retries():
         retries = 0
+    rid = _request_id()
     for ep, _ in calls:
-        endpoint_log.log(ep)
+        endpoint_log.log(ep, rid)
     url = _endpoint_url([ep for ep, _ in calls])
     body = {str(i): p for i, (_, p) in enumerate(calls)}
     last_err = None
