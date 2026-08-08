@@ -33,7 +33,7 @@ Auth
 
 State
 -----
-    Python/battles_state.json  {"last_ms": ..., "active_refreshed_at": ...}
+    state/battles_state.json  {"last_ms": ..., "active_refreshed_at": ...}
     Written atomically at the end of each run. First run falls back to
     MAX(created_at) from the battles table, then to epoch (full backfill).
     A flock on the state file prevents overlapping cron runs.
@@ -101,13 +101,14 @@ from update_users_lite import Filler
 from utils import (
     BASE_DIR,
     MAX_BATCH,
+    STATE_DIR,
     parse_until_ms,
     read_json,
     to_unix_ms,
     write_json,
 )
 
-STATE_FILE = os.path.join(BASE_DIR, "battles_state.json")
+STATE_FILE = os.path.join(STATE_DIR, "battles_state.json")
 INDEX_FILE = os.path.join(BASE_DIR, "..", "data", "battle_timestamps.json")
 
 # The battle index stores the createdAt of every 100th battle, OLDEST-first

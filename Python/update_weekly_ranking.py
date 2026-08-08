@@ -76,10 +76,10 @@ from api import batched_fetch, make_session, mixed_fetch
 from db import esc, exec_batch, exec_many, flush_endpoint_log, query, scalar, value_sql
 from update_transactions import TransactionFiller
 from update_users_lite import Filler, upsert_stmts
-from utils import BASE_DIR, ENTITY, MAX_BATCH, read_json, to_unix_ms, write_json
+from utils import ENTITY, MAX_BATCH, STATE_DIR, read_json, to_unix_ms, write_json
 
-STATE_FILE = os.path.join(BASE_DIR, "weekly_ranking_state.json")
-RECONCILE_STATE = os.path.join(BASE_DIR, "weekly_reconcile_state.json")
+STATE_FILE = os.path.join(STATE_DIR, "weekly_ranking_state.json")
+RECONCILE_STATE = os.path.join(STATE_DIR, "weekly_reconcile_state.json")
 
 # Straddler reconciliation: per-run getUserLite budget (the web viewer's 15 s
 # cycle drains the candidate queue at this rate), and the inactivity gates.

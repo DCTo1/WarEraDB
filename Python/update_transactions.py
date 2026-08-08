@@ -30,7 +30,7 @@ All inserts go through insert_transaction() (ON CONFLICT (transaction_id,
 created_at) DO NOTHING), so overlaps and re-fetches are idempotent. Endpoint
 usage is logged by batched_fetch (flushed inside the insert transaction).
 
-State: Python/transactions_state.json (atomic write per cycle):
+State: state/transactions_state.json (atomic write per cycle):
     live:     {prev_newest_ms, last_probe_ms}  — newest item stored last run
               (gap anchor) + when the last probe round fired
     buckets:  [{top_ms, bottom_ms, cursor_ms, done}]  — pending walks
@@ -70,10 +70,10 @@ from datetime import datetime, timezone
 
 from api import NotFoundError, batched_fetch, make_session
 from db import exec_batch, query
-from utils import BASE_DIR, MAX_BATCH, PAGE_LIMIT, prepare_transaction, read_json, to_unix_ms, write_json
+from utils import MAX_BATCH, PAGE_LIMIT, STATE_DIR, prepare_transaction, read_json, to_unix_ms, write_json
 
 ENDPOINT = "transaction.getPaginatedTransactions"
-STATE_FILE = os.path.join(BASE_DIR, "transactions_state.json")
+STATE_FILE = os.path.join(STATE_DIR, "transactions_state.json")
 
 DEFAULT_WINDOW_HOURS = 72
 DEFAULT_PROBE_OFFSET = 5      # seconds between probe cursors
@@ -299,7 +299,7 @@ class TransactionFiller:
     Results are collected per run and stored via insert_transaction
     (idempotent ON CONFLICT, dedupe by _id): consumers flush
     ``txn.stmts()`` through exec_batch and call ``txn.save_state()`` at the
-    end of the run. The shared state (Python/transactions_state.json) is
+    end of the run. The shared state (state/transactions_state.json) is
     written atomically; the viewer's updater runs the consuming scripts
     sequentially, so the file is never written concurrently — do NOT run
     update_transactions.py standalone while a viewer cycle is filling.

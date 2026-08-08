@@ -9,7 +9,7 @@ Commands
               token (see Secrets); without it the dump is kept local only.
   load        Restore a dump into an EMPTY database: pg_restore, rebuild
               user_battle_stats / user_weekly_damage, regenerate the battle
-              timestamp index + Python/*.json state files, verify. Source:
+              timestamp index + state/*.json state files, verify. Source:
               --file PATH / --url URL / --latest (default).
   list        --local: dump files in extra/db_backups/ (default); --remote:
               GitHub releases (anonymous).
@@ -65,7 +65,7 @@ from glob import glob
 
 import db
 import github_releases
-from utils import BASE_DIR, write_json
+from utils import BASE_DIR, STATE_DIR, write_json
 
 BACKUP_DIR = os.path.abspath(os.path.join(BASE_DIR, "..", "extra", "db_backups"))
 ROOT = os.path.abspath(os.path.join(BASE_DIR, ".."))
@@ -306,12 +306,13 @@ def cmd_load(args) -> int:
     from update_battles import build_index
     build_index(args.db)
 
-    print("  regenerating Python/*.json state files …")
+    print("  regenerating state/*.json state files …")
+    os.makedirs(STATE_DIR, exist_ok=True)
     for name, default in _STATE_DEFAULTS.items():
-        write_json(os.path.join(BASE_DIR, name), default)
+        write_json(os.path.join(STATE_DIR, name), default)
         print(f"    {name}")
     max_ms = db.max_battle_created_at_ms(args.db)
-    write_json(os.path.join(BASE_DIR, "battles_state.json"),
+    write_json(os.path.join(STATE_DIR, "battles_state.json"),
                {"last_ms": max_ms, "active_refreshed_at": 0,
                 "updated_at": datetime.now(timezone.utc).isoformat()})
 
