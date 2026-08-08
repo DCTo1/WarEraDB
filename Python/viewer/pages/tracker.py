@@ -94,23 +94,29 @@ def page_tracker(q: dict) -> str:
                       "and optionally a date range — leave the dates empty "
                       "for all time.</p>")
     if et == 1:
-        where = (f"username = '{name.replace(chr(39), chr(39) + chr(39))}'"
-                 if name else f"user_id = objectid_to_uuid('{hexid}')")
+        if name:
+            where, params = "username = %s", (name,)
+        else:
+            where, params = "user_id = objectid_to_uuid(%s)", (hexid,)
         rows, err = query_dicts(
             "SELECT i.id, lower(uuid_to_objectid(i.external_id)) AS hex,"
             " u.username FROM users u"
-            f" JOIN inventory_ids i ON i.external_id = u.user_id WHERE {where}")
+            f" JOIN inventory_ids i ON i.external_id = u.user_id WHERE {where}",
+            params)
         if err:
             return error_page(err)
         if not rows:
             return error_page("user not found")
         uid, label = rows[0]["id"], rows[0]["username"] or rows[0]["hex"][-8:]
     elif et == 2:
-        where = (f"c.name = '{name.replace(chr(39), chr(39) + chr(39))}'"
-                 if name else f"i.external_id = objectid_to_uuid('{hexid}')")
+        if name:
+            where, params = "c.name = %s", (name,)
+        else:
+            where, params = "i.external_id = objectid_to_uuid(%s)", (hexid,)
         rows, err = query_dicts(
-            f"SELECT c.country_id AS id, c.name FROM countries c"
-            f" JOIN inventory_ids i ON i.id = c.country_id WHERE {where}")
+            "SELECT c.country_id AS id, c.name FROM countries c"
+            f" JOIN inventory_ids i ON i.id = c.country_id WHERE {where}",
+            params)
         if err:
             return error_page(err)
         if not rows:
@@ -118,8 +124,8 @@ def page_tracker(q: dict) -> str:
         uid, label = rows[0]["id"], rows[0]["name"]
     else:
         rows, err = query_dicts(
-            f"SELECT id FROM inventory_ids"
-            f" WHERE external_id = objectid_to_uuid('{hexid}')")
+            "SELECT id FROM inventory_ids"
+            " WHERE external_id = objectid_to_uuid(%s)", (hexid,))
         if err:
             return error_page(err)
         if not rows:

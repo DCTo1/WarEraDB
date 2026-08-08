@@ -25,19 +25,19 @@ LIMIT = 3  # per section
 
 _USER_SQL = """
     SELECT lower(uuid_to_objectid(u.user_id)) AS hex, u.username,
-           u.last_active_at > NOW() - INTERVAL '{hours} hours' AS active
+           u.last_active_at > NOW() - make_interval(hours => %s) AS active
     FROM users u
     WHERE u.username IS NOT NULL
-      AND lower(u.username) LIKE lower('{q}%%')
+      AND lower(u.username) LIKE lower(%s)
     ORDER BY lower(u.username)
-    LIMIT {limit}"""
+    LIMIT %s"""
 
 _COUNTRY_SQL = """
     SELECT c.name
     FROM countries c
-    WHERE lower(c.name) LIKE lower('{q}%%')
+    WHERE lower(c.name) LIKE lower(%s)
     ORDER BY lower(c.name)
-    LIMIT {limit}"""
+    LIMIT %s"""
 
 
 def search(q: str, limit: int = LIMIT) -> list[dict]:
@@ -50,11 +50,10 @@ def search(q: str, limit: int = LIMIT) -> list[dict]:
     q = (q or "").strip()[:60]
     if not q:
         return []
-    esc_q = q.replace(chr(39), chr(39) + chr(39))
     sections: list[dict] = []
 
-    users, err = query_dicts(_USER_SQL.format(q=esc_q, limit=limit,
-                                              hours=ACTIVE_WINDOW_HOURS))
+    users, err = query_dicts(_USER_SQL,
+                             (ACTIVE_WINDOW_HOURS, q + "%", limit))
     if not err and users:
         for group, label, rows in (
             ("active", "Active users",
@@ -70,7 +69,7 @@ def search(q: str, limit: int = LIMIT) -> list[dict]:
                 sections.append({"group": group, "label": label,
                                  "items": items})
 
-    countries, err = query_dicts(_COUNTRY_SQL.format(q=esc_q, limit=limit))
+    countries, err = query_dicts(_COUNTRY_SQL, (q + "%", limit))
     if not err and countries:
         sections.append({
             "group": "countries", "label": "Countries",

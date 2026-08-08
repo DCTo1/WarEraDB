@@ -1,6 +1,6 @@
 """Bounties page: battles with bounties, filterable by country."""
 
-from ..queries import country_where, query_dicts
+from ..queries import country_cond, query_dicts
 from ..ui import aligned_pair, battle_link, esc, error_page, fmt_bounty, layout, ts
 
 
@@ -12,17 +12,20 @@ def _nat_sides(att_nat, def_nat) -> str:
 
 def page_bounties(q: dict) -> str:
     country = q.get("country", [""])[0][:60]
-    where = []
+    conds = []
+    params: list = []
     if country:
-        where.append(country_where(country))
-    where.append("(attacker_money_pool > 0 OR defender_money_pool > 0)")
-    wsql = " WHERE " + " AND ".join(where)
+        conds.append(country_cond())
+        params.extend((country, country))
+    conds.append("(attacker_money_pool > 0 OR defender_money_pool > 0)")
+    wsql = " WHERE " + " AND ".join(conds)
     rows, err = query_dicts(
         "SELECT uuid_to_objectid(battle_id) AS battle_id, created_at, battle_type,"
         " attacker_country_name, attacker_money_pool, attacker_money_per_1k_damages,"
         " attacker_bounty_is_national, defender_country_name, defender_money_pool,"
         " defender_money_per_1k_damages, defender_bounty_is_national"
-        f" FROM battle_bounty_details{wsql} ORDER BY created_at DESC LIMIT 200")
+        f" FROM battle_bounty_details{wsql} ORDER BY created_at DESC LIMIT 200",
+        tuple(params))
     if err:
         return error_page(err)
     wboun = max((len(fmt_bounty(r.get("defender_money_per_1k_damages"),

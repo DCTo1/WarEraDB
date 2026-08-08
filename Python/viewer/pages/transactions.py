@@ -5,19 +5,25 @@ transaction filler riding the pipeline's mixed batches). Filters: type
 (dropdown), item code (input), user (hex or username), hours back.
 
 Performance: the window scan + sort is chunk-pruned by the created_at bound
-and hits only the recent uncompressed chunks — the hypertable is natively
-compressed (segmentby transaction_type_id, orderby created_at, see
-create_tables.sql) and carries no query indexes besides the unique upsert
-index; the 11 lookup joins run AFTER the LIMIT so they touch only the
-displayed rows, never the whole window. COUNT and the per-type histogram
-share one GROUP BY pass (total = sum of the histogram).
+and served by the four query indexes on the uncompressed day-chunks
+(created_at DESC / type / seller / buyer — migration_20, see
+create_indexes.sql; compressed chunks drop them and use the segmentby /
+orderby instead); the 11 lookup joins run AFTER the LIMIT so they touch only
+the displayed rows, never the whole window. COUNT and the per-type histogram
+share one GROUP BY pass (total = sum of the histogram), TTL-cached per
+filter combo (HIST_TTL).
 """
 
 from urllib.parse import urlencode
 
 from ..config import HEX_RE
-from ..queries import query_dicts
+from ..queries import cached_query_dicts, query_dicts
 from ..ui import esc, error_page, layout, ts, user_link
+
+# The per-type histogram (also the pagination total) is an aggregate over the
+# filtered window — it changes every minute, so a 45 s TTL cache serves
+# repeat views without a second window scan.
+HIST_TTL = 45.0
 
 
 def _hex_suffix(hexv) -> str:
@@ -46,27 +52,35 @@ def page_transactions(q: dict) -> str:
     if ttype not in ttypes:
         ttype = ""
 
-    conds = [f"t.created_at > NOW() - INTERVAL '{hours} hours'"]
-    params = {"hours": hours}
+    # URL params (pagination links) — kept separate from the SQL bind params.
+    url_params = {"hours": hours}
+    if ttype:
+        url_params["type"] = ttype
+    if item:
+        url_params["item"] = item
+    if user:
+        url_params["user"] = user
+
+    conds = ["t.created_at > NOW() - make_interval(hours => %s)"]
+    params: list = [hours]
     if ttype:
         conds.append("t.transaction_type_id = (SELECT id FROM transaction_types"
-                     f" WHERE type = '{ttype.replace(chr(39), chr(39) + chr(39))}')")
-        params["type"] = ttype
+                     " WHERE type = %s)")
+        params.append(ttype)
     if item:
         conds.append("t.item_code_id = (SELECT id FROM item_codes"
-                     f" WHERE code = '{item.replace(chr(39), chr(39) + chr(39))}')")
-        params["item"] = item
+                     " WHERE code = %s)")
+        params.append(item)
     if user:
         if HEX_RE.match(user):
-            uid = (f"(SELECT id FROM inventory_ids"
-                   f" WHERE external_id = objectid_to_uuid('{user}'))")
+            uid = ("(SELECT id FROM inventory_ids"
+                   " WHERE external_id = objectid_to_uuid(%s))")
         else:
-            name = user.replace(chr(39), chr(39) + chr(39))
             uid = ("(SELECT i.id FROM users u"
                    " JOIN inventory_ids i ON i.external_id = u.user_id"
-                   f" WHERE lower(u.username) = lower('{name}') LIMIT 1)")
+                   " WHERE lower(u.username) = lower(%s) LIMIT 1)")
         conds.append(f"(t.seller_id = {uid} OR t.buyer_id = {uid})")
-        params["user"] = user
+        params.extend((user, user))
     where = " WHERE " + " AND ".join(conds)
 
     # Window rows FIRST (indexed created_at scan + limit), then the lookup
@@ -89,7 +103,7 @@ def page_transactions(q: dict) -> str:
         " t.secondary_seller_id, t.secondary_buyer_id, t.seller_party_id,"
         " t.transaction_type_id"
         " FROM transactions t"
-        f"{where} ORDER BY t.created_at DESC LIMIT 100 OFFSET {page * 100}) q"
+        f"{where} ORDER BY t.created_at DESC LIMIT 100 OFFSET %s) q"
         " JOIN transaction_types tt ON tt.id = q.transaction_type_id"
         " LEFT JOIN item_codes ic ON ic.id = q.item_code_id"
         " LEFT JOIN items i ON i.id = q.item_id"
@@ -102,15 +116,17 @@ def page_transactions(q: dict) -> str:
         " LEFT JOIN inventory_ids sb ON sb.id = q.secondary_buyer_id"
         " LEFT JOIN inventory_ids p ON p.id = q.seller_party_id"
         " ORDER BY q.created_at DESC")
-    rows, err = query_dicts(select)
+    rows, err = query_dicts(select, (*params, page * 100))
     if err:
         return error_page(err)
-    # Total count + per-type histogram in ONE pass over the filtered window;
-    # total = sum of the histogram rows.
-    counts, err = query_dicts(
+    # Total count + per-type histogram in ONE pass over the filtered window
+    # (total = sum of the histogram rows), TTL-cached per filter combo.
+    counts, err = cached_query_dicts(
+        ("txn-hist", hours, ttype, item, user), HIST_TTL,
         "SELECT tt.type, COUNT(*)::int AS n FROM transactions t"
         " JOIN transaction_types tt ON tt.id = t.transaction_type_id"
-        f"{where} GROUP BY tt.type ORDER BY COUNT(*) DESC")
+        f"{where} GROUP BY tt.type ORDER BY COUNT(*) DESC",
+        tuple(params))
     if err:
         return error_page(err)
     total = sum(r["n"] for r in counts)
@@ -120,7 +136,7 @@ def page_transactions(q: dict) -> str:
         for r in counts) or "<span class='muted'>no transactions stored</span>"
 
     def link(**kw):
-        link_params = dict(params)
+        link_params = dict(url_params)
         link_params.update({k: v for k, v in kw.items() if v})
         return f"/transactions?{urlencode(link_params)}"
 

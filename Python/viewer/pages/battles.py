@@ -4,7 +4,7 @@ from datetime import datetime, timedelta, timezone
 from urllib.parse import urlencode
 
 from ..config import BATTLE_TYPES
-from ..queries import country_where, first_val, query_dicts
+from ..queries import country_cond, first_val, query_dicts
 from ..ui import abbr, aligned_pair, battle_link, esc, error_page, fmt_bounty, layout, ts
 
 
@@ -32,17 +32,20 @@ def page_battles(q: dict) -> str:
         page = max(0, int(q.get("page", ["0"])[0]))
     except ValueError:
         page = 0
-    where = []
+    conds = []
+    params: list = []
     if country:
-        where.append(country_where(country))
+        conds.append(country_cond())
+        params.extend((country, country))
     if btype:
-        where.append(f"battle_type = '{btype}'")
-    fsql = (" WHERE " + " AND ".join(where)) if where else ""
+        conds.append("battle_type = %s")
+        params.append(btype)
+    fsql = (" WHERE " + " AND ".join(conds)) if conds else ""
     if status == "active":
-        where.append("ended_at IS NULL")
+        conds.append("ended_at IS NULL")
     elif status == "finished":
-        where.append("ended_at IS NOT NULL")
-    wsql = (" WHERE " + " AND ".join(where)) if where else ""
+        conds.append("ended_at IS NOT NULL")
+    wsql = (" WHERE " + " AND ".join(conds)) if conds else ""
     order = ("bd.attacker_damages + bd.defender_damages DESC" if status == "active"
              else "bd.created_at DESC")
     rows, err = query_dicts(
@@ -57,10 +60,11 @@ def page_battles(q: dict) -> str:
         " FROM battle_details bd"
         " LEFT JOIN LATERAL (SELECT attacker_damages, defender_damages FROM rounds"
         " WHERE battle_id = bd.battle_id ORDER BY number DESC NULLS LAST LIMIT 1) lr ON true"
-        f"{wsql} ORDER BY {order} LIMIT 100 OFFSET {page * 100}")
+        f"{wsql} ORDER BY {order} LIMIT 100 OFFSET %s", (*params, page * 100))
     if err:
         return error_page(err)
-    total_rows, _ = query_dicts(f"SELECT COUNT(*) AS n FROM battle_details{wsql}")
+    total_rows, _ = query_dicts(
+        f"SELECT COUNT(*) AS n FROM battle_details{wsql}", tuple(params))
     total = first_val(total_rows or [], "n") or 0
     pages = max(1, (total + 99) // 100)
 
@@ -76,7 +80,7 @@ def page_battles(q: dict) -> str:
     counts, _ = query_dicts(
         "SELECT COUNT(*) FILTER (WHERE ended_at IS NULL) AS active,"
         " COUNT(*) FILTER (WHERE ended_at IS NOT NULL) AS finished"
-        f" FROM battle_details{fsql}")
+        f" FROM battle_details{fsql}", tuple(params))
     c = counts[0] if counts else {}
     tabs = ("<div class='tabs'>" + tab("active", f"⚡ Active ({c.get('active', 0):,})")
             + tab("finished", f"Finished ({c.get('finished', 0):,})")
