@@ -93,6 +93,50 @@ def _page_span_hint(region_ms: int, cap: int) -> int:
     return max(1, min(cap, max(1, region_ms // PAGE_SPAN_MS)))
 
 
+def _detect_gaps(buckets: list[dict], live: dict, stats: dict, now_ms: int,
+                 edge_ms: int, bottoms: list[int], probe_depth: int,
+                 offset_ms: int, bucket_cap: int) -> list[dict]:
+    """Mint repair buckets for the regions a completed probe round missed.
+
+    Two shapes:
+      • tile contiguity — an early tile's bottom not reaching the next
+        tile's top (rate spike > ~9 txns/s) spawns buckets for the strip;
+      • connection to the stored anchor (live.prev_newest_ms) — the
+        deepest tile not reaching it spawns buckets for the whole
+        uncovered region. The anchor is ONLY the last stored item (never
+        max'ed with the run's newest: after a downtime the probes re-fetch
+        the newest items, so the max would equal now and mask the hole —
+        the state would mark done=True with hours of the window missing).
+        The covered check spawns each region once: while the spawns drain,
+        every round re-sees the same lag, and the overlap check is
+        region-specific so genuine new gaps still spawn (the 2026-08-07
+        stall ballooned to 2191 buckets without it).
+    """
+    new_buckets: list[dict] = []
+    for i in range(1, probe_depth):
+        tile_top = now_ms - int(i * offset_ms)
+        if bottoms[i - 1] > tile_top + 1:
+            new_buckets += _make_buckets(
+                tile_top, bottoms[i - 1],
+                _page_span_hint(bottoms[i - 1] - tile_top, bucket_cap))
+    prev_newest = live.get("prev_newest_ms")
+    if prev_newest is None and not buckets:
+        # fresh state → seed the full window fill (edge, top]
+        new_buckets += _make_buckets(
+            edge_ms, now_ms - int((probe_depth - 1) * offset_ms), bucket_cap)
+    elif prev_newest is not None and bottoms[-1] > prev_newest + 1:
+        if not any(
+                b.get("top_ms", 0) >= bottoms[-1]
+                and b.get("bottom_ms", 0) <= prev_newest
+                for b in buckets if not b.get("done")):
+            new_buckets += _make_buckets(
+                prev_newest, bottoms[-1],
+                _page_span_hint(bottoms[-1] - prev_newest, bucket_cap))
+    if new_buckets:
+        stats["gaps"] = stats.get("gaps", 0) + 1
+    return new_buckets
+
+
 def _make_buckets(bottom_ms: int, top_ms: int, n: int) -> list[dict]:
     """Split (bottom_ms, top_ms] into n time buckets with their own cursor
     chains. Bucket i covers (bottom + i*step, bottom + (i+1)*step]; the top
@@ -230,31 +274,10 @@ def _run_cycle(s, args, state: dict, now_ms: int, edge_ms: int) -> int:
     bottoms: list[int] = [b for b in probe_bottoms if b is not None]
     if not args.skip_backfill and not args.backfill_only \
             and len(bottoms) == args.probe_depth:
-        prev_newest = max(live.get("prev_newest_ms") or 0,
-                          newest_ms or 0) or None
-        # internal tile contiguity: tile i−1's bottom must reach tile i's top
-        for i in range(1, args.probe_depth):
-            tile_top = now_ms - int(i * args.probe_offset * 1000)
-            if bottoms[i - 1] > tile_top + 1:
-                new_buckets += _make_buckets(
-                    tile_top, bottoms[i - 1],
-                    _page_span_hint(bottoms[i - 1] - tile_top, args.bucket_cap))
-        # connection to last cycle's coverage (fresh state → window fill)
-        deepest = bottoms[-1]
-        if prev_newest is None and not buckets:
-            new_buckets += _make_buckets(edge_ms, now_ms - int(
-                (args.probe_depth - 1) * args.probe_offset * 1000), args.bucket_cap)
-        elif prev_newest is not None and deepest > prev_newest + 1:
-            # spawn once per uncovered region (see the Filler's twin check —
-            # a stall re-detects the same gap every round otherwise)
-            if not any(b.get("top_ms", 0) >= deepest
-                       and b.get("bottom_ms", 0) <= prev_newest
-                       for b in buckets if not b.get("done")):
-                new_buckets += _make_buckets(prev_newest, deepest,
-                                             _page_span_hint(deepest - prev_newest,
-                                                             args.bucket_cap))
+        new_buckets = _detect_gaps(
+            buckets, live, stats, now_ms, edge_ms, bottoms,
+            args.probe_depth, int(args.probe_offset * 1000), args.bucket_cap)
     if new_buckets:
-        stats["gaps"] = stats.get("gaps", 0) + 1
         buckets.extend(new_buckets)
         print(f"  gap: {len(new_buckets)} new bucket(s) covering "
               f"{len([b for b in buckets if not b.get('done')])} pending total", flush=True)
@@ -317,8 +340,6 @@ class TransactionFiller:
         self._offered: set[int] = set()
         self._items: list[dict] = []
         self._newest_ms: int | None = None
-        self._probe_bottoms: list[int | None] = []
-        self._probes_added = 0
         self._dirty = False
 
     def _probes_due(self, now_ms: int) -> bool:
@@ -360,7 +381,6 @@ class TransactionFiller:
                     p["cursor"] = str(now_ms - off)
                 tokens.append(("probe", i))
                 slots.append(len(calls))
-                self._probes_added += 1
                 calls.append(("transaction.getPaginatedTransactions", p))
         for i, b in enumerate(buckets):
             if len(calls) >= MAX_BATCH:
@@ -380,13 +400,24 @@ class TransactionFiller:
                 tokens: list[tuple[str, int]]) -> None:
         """Pick transaction results out of a mixed_fetch response (positions
         ``slots``, kinds from the per-request ``tokens``): advance bucket
-        cursors, track probe bottoms for gap detection, stash items for
-        stmts(). Errors are skipped — retried by the next run."""
+        cursors, track THIS request's probe bottoms for gap detection, stash
+        items for stmts(). Errors are skipped — retried by the next run.
+
+        A probe round is ONE request: top_up only adds probes when a round
+        is due and every consumer's slack fits all four, so a request
+        carrying every probe index IS the round — its bottoms are
+        gap-detected in idx order (a request with a partial set never
+        triggers detection, and a failed/empty probe defers it: the round
+        is stamped so quiet periods keep the PROBE_EVERY throttle, but an
+        unknown bottom keeps the region unreported). Overlapping in-flight
+        requests (the live walk's WORKERS bodies) each run their own round
+        against the shared anchor; the covered check dedupes the spawns."""
         now_ms = int(time.time() * 1000)
         live = self.state.setdefault("live", {})
         buckets = self.state.setdefault("buckets", [])
         stats = self.state.setdefault("stats", {})
         edge_ms = int(now_ms - self.state.get("window_hours", DEFAULT_WINDOW_HOURS) * 3600_000)
+        round_bottoms: dict[int, int | None] = {}
         for pos, (kind, idx) in zip(slots, tokens):
             if pos >= len(results):
                 continue
@@ -394,11 +425,11 @@ class TransactionFiller:
             if "error" in res:
                 stats["failed_calls"] = stats.get("failed_calls", 0) + 1
                 if kind == "probe":
-                    self._probe_bottoms.append(None)
+                    round_bottoms[idx] = None
                 continue
             its = (res["result"]["data"].get("items")) or []
             if kind == "probe":
-                self._probe_bottoms.append(to_unix_ms(its[-1]["createdAt"]) if its else None)
+                round_bottoms[idx] = to_unix_ms(its[-1]["createdAt"]) if its else None
             elif kind == "bucket" and 0 <= idx < len(buckets):
                 b = buckets[idx]
                 if its:
@@ -413,47 +444,21 @@ class TransactionFiller:
                     self._newest_ms = m
                 self._items.extend(its)
             self._dirty = True
-        # probe round finished → gap detection + freshness stamp
-        if self._probes_added and len(self._probe_bottoms) == self._probes_added:
-            bottoms = [b for b in self._probe_bottoms if b is not None]
-            if len(bottoms) == len(self._probe_bottoms):
-                # anchor on what THIS instance has stored (it runs for minutes
-                # mid-cycle; the state's prev_newest_ms only refreshes at the
-                # run's end, so using it here mints phantom ~minute gaps and
-                # spawns a fresh batch of buckets every round — the 2026-08-07
-                # pile ballooned to 5K+ buckets that way)
-                prev_newest = max(live.get("prev_newest_ms") or 0,
-                                  self._newest_ms or 0) or None
-                new_buckets: list[dict] = []
-                for i in range(1, len(bottoms)):
-                    tile_top = now_ms - int(i * DEFAULT_PROBE_OFFSET * 1000)
-                    if bottoms[i - 1] > tile_top + 1:
-                        new_buckets += _make_buckets(
-                            tile_top, bottoms[i - 1],
-                            _page_span_hint(bottoms[i - 1] - tile_top, DEFAULT_BUCKET_CAP))
-                if prev_newest is None and not buckets:
-                    new_buckets += _make_buckets(
-                        edge_ms,
-                        now_ms - int((DEFAULT_PROBE_DEPTH - 1) * DEFAULT_PROBE_OFFSET * 1000),
-                        DEFAULT_BUCKET_CAP)
-                elif prev_newest is not None and bottoms[-1] > prev_newest + 1:
-                    # only spawn once per uncovered region: while the spawns
-                    # drain, every round would re-see the same lag and spawn
-                    # ~46 more buckets over the same window (measured: pile
-                    # ballooned to 2191 during the 2026-08-07 stall). The
-                    # overlap check is region-specific so genuine new gaps
-                    # (downtime) still spawn while old buckets drain.
-                    covered = any(
-                        b.get("top_ms", 0) >= bottoms[-1]
-                        and b.get("bottom_ms", 0) <= prev_newest
-                        for b in buckets if not b.get("done"))
-                    if not covered:
-                        new_buckets += _make_buckets(
-                            prev_newest, bottoms[-1],
-                            _page_span_hint(bottoms[-1] - prev_newest,
-                                            DEFAULT_BUCKET_CAP))
+        # one completed probe round → gap detection (all bottoms known) +
+        # freshness stamp. The anchor is the STORED prev_newest_ms — never
+        # max'ed with this run's newest, which after a downtime round equals
+        # now and would mask the hole (state would mark done=True with hours
+        # of the window missing). The anchor advances in memory below as
+        # rounds complete, so only the first round after a downtime spawns.
+        if all(i in round_bottoms for i in range(DEFAULT_PROBE_DEPTH)):
+            if all(round_bottoms[i] is not None for i in range(DEFAULT_PROBE_DEPTH)):
+                bottoms = [b for i in range(DEFAULT_PROBE_DEPTH)
+                           if (b := round_bottoms[i]) is not None]
+                new_buckets = _detect_gaps(
+                    buckets, live, stats, now_ms, edge_ms, bottoms,
+                    DEFAULT_PROBE_DEPTH, int(DEFAULT_PROBE_OFFSET * 1000),
+                    DEFAULT_BUCKET_CAP)
                 if new_buckets:
-                    stats["gaps"] = stats.get("gaps", 0) + 1
                     buckets.extend(new_buckets)
             live["last_probe_ms"] = now_ms
             self._dirty = True
