@@ -2,18 +2,25 @@
 rolling 72 h the API serves, with zero / near-zero cells flagged so skipped
 scraping windows are visible at a glance.
 
-Older rows (leftovers from before the API window) render muted rather than
-alarming — the API will never serve them again.
+Older rows (leftovers from the per-item-code / per-user walks, predating the
+API window) render muted rather than alarming — the API will never serve
+them again. Day cells link to the /transactions page filtered to that day.
+
+Performance: the hourly GROUP BY is bounded to the last 15 days (the
+display never shows more) and TTL-cached; the all-time oldest row comes
+from a LIMIT-1 index scan instead of the full-table MIN.
 """
 
 from datetime import datetime, timedelta, timezone
 
-from ..queries import query_dicts
+from ..queries import cached_query_dicts, query_dicts
 from ..ui import esc, error_page, layout
 
 HOURS = 72
 DAYS = 14
+RETAIN = 15  # query bound: the display covers at most DAYS + the window edge
 WARN_FRAC = 0.2  # a cell below 20% of the non-zero median counts as "warn"
+COV_TTL = 120.0
 
 
 def _cell(n: int, inside: bool, med: int, *, title: str) -> str:
@@ -26,14 +33,28 @@ def _cell(n: int, inside: bool, med: int, *, title: str) -> str:
     return f"<td title='{esc(title)}'>{n:,}</td>"
 
 
+def _day_link(d: datetime) -> str:
+    nxt = d + timedelta(days=1)
+    return (f"/transactions?from={d:%Y-%m-%d}&to={nxt:%Y-%m-%d}")
+
+
 def page_transactions_coverage(q: dict) -> str:
-    # ONE pass over the table instead of the old three (hourly, daily,
-    # min/max/count): per-hour counts + per-hour MIN/MAX; days, total and
-    # overall min/max are derived in Python from the same rows.
-    hour_rows, err = query_dicts(
+    # ONE pass over the retained horizon (instead of the whole table):
+    # per-hour counts + per-hour MIN/MAX; days, total and the window
+    # freshness are derived in Python from the same rows.
+    hour_rows, err = cached_query_dicts(
+        ("txn-cov",), COV_TTL,
         "SELECT date_trunc('hour', created_at) AS h, COUNT(*)::int AS n,"
         " MIN(created_at) AS mn, MAX(created_at) AS mx"
-        " FROM transactions GROUP BY 1")
+        f" FROM transactions WHERE created_at >= NOW() - interval '{RETAIN} days'"
+        " GROUP BY 1")
+    if err:
+        return error_page(err)
+    # All-time oldest: LIMIT-1 index scan, ~2 ms (the bounded GROUP BY
+    # above cannot provide it).
+    oldest_rows, err = query_dicts(
+        "SELECT created_at FROM transactions"
+        " ORDER BY created_at ASC LIMIT 1")
     if err:
         return error_page(err)
 
@@ -42,7 +63,7 @@ def page_transactions_coverage(q: dict) -> str:
 
     hours: dict[datetime, int] = {}
     days: dict[datetime, int] = {}
-    mn = mx = None
+    mx = None
     total = 0
     for r in hour_rows:
         h = r["h"]
@@ -53,14 +74,15 @@ def page_transactions_coverage(q: dict) -> str:
         total += n
         d = h.replace(hour=0, minute=0, second=0, microsecond=0)
         days[d] = days.get(d, 0) + n
-        if r["mn"] is not None and (mn is None or r["mn"] < mn):
-            mn = r["mn"]
         if r["mx"] is not None and (mx is None or r["mx"] > mx):
             mx = r["mx"]
-    if mn is not None and mn.tzinfo is None:
-        mn = mn.replace(tzinfo=timezone.utc)
     if mx is not None and mx.tzinfo is None:
         mx = mx.replace(tzinfo=timezone.utc)
+    oldest = None
+    if oldest_rows:
+        oldest = oldest_rows[0]["created_at"]
+        if oldest.tzinfo is None:
+            oldest = oldest.replace(tzinfo=timezone.utc)
 
     in_window = sorted(h for h in hours if h >= window_edge)
     nonzero = [hours[h] for h in in_window if hours[h] > 0]
@@ -110,15 +132,16 @@ def page_transactions_coverage(q: dict) -> str:
         n = days.get(d, 0)
         inside = d >= window_edge
         day_rows_html.append(
-            f"<tr><td>{d:%Y-%m-%d} (UTC)</td>"
+            f"<tr><td><a href=\"{_day_link(d)}\">{d:%Y-%m-%d}</a> (UTC)</td>"
             + _cell(n, inside, d_med, title=f"{d:%Y-%m-%d}")
             + "</tr>")
 
     lag_line = ""
-    if mx is not None:
+    if mx is not None and oldest is not None:
         lag_line = (f"<p class='muted'>newest stored: {mx:%Y-%m-%d %H:%M:%S}Z"
-                    f" &middot; oldest: {mn:%Y-%m-%d %H:%M:%SZ}"
-                    f" &middot; total: {total:,} rows</p>")
+                    f" &middot; oldest stored: {oldest:%Y-%m-%d %H:%M:%SZ}"
+                    f" &middot; rows in the last {RETAIN} days: {total:,}"
+                    " (day cells link to that day's transactions)</p>")
 
     return layout("Transactions coverage", f"""
         <p><a href="/transactions">&larr; transactions</a> &middot;
