@@ -44,9 +44,11 @@ Python/update_users_lite.py fetches user.getUserLite for up to
 disables the user pass), and Python/update_weekly_ranking.py stores hourly
 official weekly-ranking snapshots (--weekly 1, self-throttled to xx:01; 0
 disables). The transactions table stays current with the API's rolling
-72 h window through the transaction filler: the mixed batches of the first
+72 h window through the transaction fillers: the mixed batches of the first
 three scripts carry transaction.getPaginatedTransactions probes + pending
-window-backfill pages in their slack slots (--transactions 0 disables it).
+window-backfill pages + itemMarket item-code walks + XP-ranked user walks
+in their slack slots, via the priority-ordered filler pool
+(Python/fillers.py; --transactions 0 disables it).
 The header timer shows the seconds until the next run and switches to
 "updating…" while a run is in progress.
 
@@ -102,8 +104,9 @@ def main() -> int:
                         "weeklyCountryDamages/muWeeklyDamages, self-throttled to "
                         "xx:01; default 1, 0 disables)")
     p.add_argument("--transactions", type=int, default=int(config.settings.transactions_enabled),
-                   help="transaction window filler (transaction probes + 72 h "
-                        "window backfill riding the pipeline's mixed batches; "
+                   help="transaction fillers (window probes + 72 h backfill + "
+                        "itemMarket item-code walks + XP-ranked user walks "
+                        "riding the pipeline's mixed batches' slack; "
                         "default 1, 0 disables)")
     args = p.parse_args()
 

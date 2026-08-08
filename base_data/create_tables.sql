@@ -407,13 +407,16 @@ CREATE TABLE users (
     military_rank   SMALLINT NULL,                            -- getUserLite militaryRank (numeric)
     username        TEXT NULL,                                -- getUserLite username
     lite_checked_at TIMESTAMPTZ NULL,                         -- last successful getUserLite fetch
-    last_active_at  TIMESTAMPTZ NULL                          -- creation date of the last round the
+    last_active_at  TIMESTAMPTZ NULL,                         -- creation date of the last round the
                                                               -- user participated in (round_ranking_
                                                               -- entries; lower-bound approximation,
                                                               -- replaced by getUserLite dates.
                                                               -- lastConnectionAt when available);
-                                                               -- NULL = never fought (inactive).
-                                                               -- Refresh pool: within 4 days.
+                                                              -- NULL = never fought (inactive).
+                                                              -- Refresh pool: within 4 days.
+    transactions_scraped_at TIMESTAMPTZ NULL                  -- full history confirmed scraped via the
+                                                              -- userId filter (UserTxFiller stamp;
+                                                              -- NULL = still in the scrape pool)
 );
 
 -- viewer search: case-insensitive username prefix (search.py — /search)

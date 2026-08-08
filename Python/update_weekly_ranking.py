@@ -74,8 +74,8 @@ import requests
 
 from api import batched_fetch, make_session, mixed_fetch
 from db import esc, exec_batch, exec_many, flush_endpoint_log, query, scalar, value_sql
-from update_transactions import TransactionFiller
-from update_users_lite import Filler, upsert_stmts
+from fillers import build_filler_pool
+from update_users_lite import upsert_stmts
 from utils import ENTITY, MAX_BATCH, STATE_DIR, read_json, to_unix_ms, write_json
 
 STATE_FILE = os.path.join(STATE_DIR, "weekly_ranking_state.json")
@@ -564,17 +564,17 @@ def fetch(dbname: str, force: bool = False) -> int:
         return 0
     max_week = scalar("SELECT MAX(week_start) FROM weekly_ranking_snapshots;", dbname)
     s = make_session(pool_size=4)
-    filler = Filler(dbname)
-    # Transaction window filler rides the same mixed request (probes/bucket
-    # pages; the hourly cadence means it usually finds nothing due — the
-    # 15 s scripts cover it). WARERA_TX_FILLER=0 disables it.
-    txn = TransactionFiller(dbname) if os.environ.get("WARERA_TX_FILLER", "1") != "0" else None
+    # The filler pool rides the same mixed request (user-lite + transaction
+    # window + itemMarket + user walks, in priority order; the hourly cadence
+    # means the window probes usually find nothing due — the 15 s scripts
+    # cover it). WARERA_TX_FILLER=0 disables the transaction fillers.
+    pool = build_filler_pool(dbname)
     stmts: list[str] = []
     rollover_week: datetime | None = None
     api_failed = False
     # The due types (throttle exclusions applied per type) go in ONE mixed
     # request — the three ranking.getRanking calls are independent; the slack
-    # slots carry user.getUserLite filler (backfill + active pools).
+    # slots carry the filler pool (backfills drain at no extra request cost).
     due: list[tuple[str, str, int, datetime | None]] = []
     for ranking_type, key, etype in WEEKLY_TYPES:
         latest = scalar(f"SELECT MAX(snapshot_at) FROM weekly_ranking_snapshots"
@@ -585,18 +585,15 @@ def fetch(dbname: str, force: bool = False) -> int:
         due.append((ranking_type, key, etype, latest))
     if due:
         calls = [("ranking.getRanking", {"rankingType": rt}) for rt, _, _, _ in due]
-        slots = filler.top_up(calls)
-        tslots = txn.top_up(calls) if txn is not None else []
+        _, req = pool.top_up(calls)
         try:
             results = mixed_fetch(s, calls, timeout=120)
         except RuntimeError as exc:
             print(f"weekly snapshots: API failure: {exc}", file=sys.stderr)
             api_failed = True
             results = []
-        if results and slots:
-            filler.collect(results, slots)
-        if results and txn is not None and tslots:
-            txn.collect(results, tslots)
+        if results and req:
+            pool.collect(results, req)
         for (ranking_type, key, etype, latest), res in zip(due, results):
             if "error" in res:
                 print(f"  {ranking_type}: API failure: {res['error']}", file=sys.stderr)
@@ -618,17 +615,13 @@ def fetch(dbname: str, force: bool = False) -> int:
         flush_endpoint_log(dbname)
         print(f"  stored {len(stmts)} snapshot rows"
               + ("; pruned finished weeks to their finals" if rollover_week is not None else ""))
-    fs = filler.stmts()
-    if fs:
-        exec_many(fs, dbname)
-        print(f"  filler: {len(filler.fetched)} users upserted, "
-              f"{len(filler.dead)} dead marked", flush=True)
-    if txn is not None:
-        ts = txn.stmts()
-        if ts:
-            exec_batch(ts, dbname)
-            print(f"  txn filler: {len(ts)} transactions stored", flush=True)
-        txn.save_state()
+    # Flush the filler pool: user-lite upserts + transaction window items +
+    # itemMarket/user history items + user done-marks, then their state files
+    ps = pool.stmts()
+    if ps:
+        exec_batch(ps, dbname)
+        print(f"  filler pool: {len(ps)} statements flushed", flush=True)
+    pool.save_state()
     write_json(STATE_FILE, {**state, "last_attempt": time.time()})
     return 1 if api_failed else 0
 

@@ -49,9 +49,10 @@ Notes
       batches at 50 calls per request (413 "Batch size too large (max 50)";
       verified 2026-08-02 — it is NOT a URL-length limit). Since 2026-08-07
       the batches are MIXED: every request carries battle/round calls in its
-      essential slots and fills the rest with user.getUserLite calls from the
-      users backfill queue (update_users_lite.Filler) — the queue drains at
-      no extra request cost (standard tRPC positional batching, verified).
+      essential slots and fills the rest with filler calls from the filler
+      pool (Python/fillers.py — user-lite + transaction window + itemMarket
+      code walks + user transaction walks, in priority order) at no extra
+      request cost (standard tRPC positional batching, verified).
     - Battles are fetched via a timestamp index (data/battle_timestamps.json):
       the createdAt of every 100th battle, OLDEST-first. Positions are stable
       as new battles arrive, so the index only needs appending, never a
@@ -96,8 +97,7 @@ from db import (
     round_hexes_for,
     unfinalized_round_hexes_for,
 )
-from update_transactions import TransactionFiller
-from update_users_lite import Filler
+from fillers import FillerPool, build_filler_pool
 from utils import (
     BASE_DIR,
     MAX_BATCH,
@@ -124,11 +124,11 @@ UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]
 
 
 def mixed_batch(session: requests.Session, calls: list[tuple[str, dict]],
-                filler: Filler | None = None,
-                txn: TransactionFiller | None = None) -> list:
+                pool: FillerPool | None = None) -> list:
     """Execute (endpoint, payload) calls in ≤MAX_BATCH chunks, topping each
-    chunk up with user.getUserLite filler AND transaction-window filler
-    (returns per-call results aligned to *calls*, filler results stripped).
+    chunk up with filler-pool calls (user-lite + transaction window +
+    itemMarket + user transactions; returns per-call results aligned to
+    *calls*, filler results stripped).
 
     A whole-batch 404 means every call in it failed — with filler attached,
     drop the fillers and retry the essential calls once before propagating
@@ -137,31 +137,20 @@ def mixed_batch(session: requests.Session, calls: list[tuple[str, dict]],
     out: list = []
     for off in range(0, len(calls), MAX_BATCH):
         essential = calls[off:off + MAX_BATCH]
-        chunk = essential
-        slots: list[int] = []
-        tslots: list[int] = []
-        if filler is not None:
-            chunk = list(essential)
-            slots = filler.top_up(chunk)
-        if txn is not None:
-            if chunk is essential:
-                chunk = list(essential)
-            tslots = txn.top_up(chunk)
+        chunk = list(essential)
+        slots, req = pool.top_up(chunk) if pool is not None else ([], [])
         try:
             results = mixed_fetch(session, chunk)
         except NotFoundError:
-            if (filler is not None and slots) or (txn is not None and tslots):
+            if pool is not None and slots:
                 print("  ⚠ mixed batch whole-404 — retrying essentials without filler",
                       file=sys.stderr, flush=True)
                 results = mixed_fetch(session, essential)
-                slots = []
-                tslots = []
+                req = []
             else:
                 raise
-        if filler is not None and slots:
-            filler.collect(results, slots)
-        if txn is not None and tslots:
-            txn.collect(results, tslots)
+        if pool is not None and req:
+            pool.collect(results, req)
         out.extend(results[:len(essential)])
     return out
 
@@ -204,8 +193,7 @@ def fetch_battles_sequential(session: requests.Session, since_ms: int, until_ms:
 
 
 def fetch_battles(session: requests.Session, since_ms: int, until_ms: int, index_ms: list[int],
-                  filler: Filler | None = None,
-                  txn: TransactionFiller | None = None) -> list[dict]:
+                  pool: FillerPool | None = None) -> list[dict]:
     """Fetch battles in the window (since_ms, until_ms] using batched requests.
 
     index_ms holds the createdAt of every INDEX_STEP-th battle, OLDEST-first
@@ -226,7 +214,7 @@ def fetch_battles(session: requests.Session, since_ms: int, until_ms: int, index
 
     if until_ms > newest_entry:
         res = mixed_batch(session, [("battle.getBattles",
-                                     {"limit": 100, "direction": "forward"})], filler, txn)[0]
+                                     {"limit": 100, "direction": "forward"})], pool)[0]
         items = res["result"]["data"]["items"]
         for it in items:
             ms = to_unix_ms(it["createdAt"])
@@ -271,7 +259,7 @@ def fetch_battles(session: requests.Session, since_ms: int, until_ms: int, index
     page_calls = [("battle.getBattles", p) for p in payloads]
     for i in range(0, len(page_calls), MAX_BATCH):
         chunk = page_calls[i:i + MAX_BATCH]
-        results = mixed_batch(session, chunk, filler, txn)
+        results = mixed_batch(session, chunk, pool)
         for (_, payload), res in zip(chunk, results):
             pages += 1
             if "error" in res:
@@ -317,8 +305,7 @@ def fetch_battles(session: requests.Session, since_ms: int, until_ms: int, index
 
 
 def fetch_active_docs(session: requests.Session, battle_ids: list[str], batch_size: int = MAX_BATCH,
-                      filler: Filler | None = None,
-                      txn: TransactionFiller | None = None) -> list[dict]:
+                      pool: FillerPool | None = None) -> list[dict]:
     """Refresh active battles via battle.getById, batched (≤ batch_size per request).
 
     Returns full docs (minus currentRound). getById is also how live battles
@@ -331,7 +318,7 @@ def fetch_active_docs(session: requests.Session, battle_ids: list[str], batch_si
         chunk_ids = battle_ids[i:i + batch_size]
         calls = [("battle.getById", {"battleId": b}) for b in chunk_ids]
         try:
-            results = mixed_batch(session, calls, filler, txn)
+            results = mixed_batch(session, calls, pool)
         except RuntimeError as exc:
             if "API key rejected" in str(exc):
                 raise
@@ -375,8 +362,7 @@ def minimize_round(rd: dict) -> dict:
 
 
 def fetch_rounds(session: requests.Session, round_ids: list[str], batch_size: int = MAX_BATCH,
-                 filler: Filler | None = None,
-                 txn: TransactionFiller | None = None) -> list[dict]:
+                 pool: FillerPool | None = None) -> list[dict]:
     """Fetch round docs by id, batched (≤ batch_size per request)."""
     ids = sorted(round_ids)
     rounds: list[dict] = []
@@ -385,7 +371,7 @@ def fetch_rounds(session: requests.Session, round_ids: list[str], batch_size: in
         chunk_ids = ids[i:i + batch_size]
         calls = [("round.getById", {"roundId": rid}) for rid in chunk_ids]
         try:
-            results = mixed_batch(session, calls, filler, txn)
+            results = mixed_batch(session, calls, pool)
         except RuntimeError as exc:
             if "API key rejected" in str(exc):
                 raise
@@ -480,14 +466,13 @@ def _run(args) -> int:
                                          or now_ms - active_walked_at >= args.active_interval * 60_000)
 
     session = make_session()
-    # Fills the slack of every mixed batch with user.getUserLite calls (see
-    # update_users_lite.Filler); stmts flushed at the end of the run.
-    filler = Filler(args.db)
-    # The transaction window rides the same slack (see
-    # update_transactions.TransactionFiller): pending bucket pages + live
-    # probes; flushed + state-saved at the end of the run. WARERA_TX_FILLER=0
-    # (set by the viewer when --transactions 0) disables it.
-    txn = TransactionFiller(args.db) if os.environ.get("WARERA_TX_FILLER", "1") != "0" else None
+    # The filler pool fills the slack of every mixed batch (see
+    # Python/fillers.py): user-lite + transaction window (probes/buckets) +
+    # itemMarket code walks + user transaction walks, in priority order;
+    # statements are flushed and state saved at the end of the run.
+    # WARERA_TX_FILLER=0 (set by the viewer when --transactions 0) disables
+    # the transaction fillers.
+    pool = build_filler_pool(args.db)
     if since_ms >= until_ms:
         print("Already up to date.", flush=True)
     else:
@@ -500,12 +485,12 @@ def _run(args) -> int:
         if not index_ms:
             index_ms, index_src = build_index(args.db, args.index)
             print(f"  index: built from {index_src} ({len(index_ms)} entries)", flush=True)
-        docs = {b["_id"]: b for b in fetch_battles(session, since_ms, until_ms, index_ms, filler, txn)}
+        docs = {b["_id"]: b for b in fetch_battles(session, since_ms, until_ms, index_ms, pool)}
         active_ids: list[str] = []
         if active_due:
             active_ids = active_battle_hexes(args.db)
             print(f"  active battles: refreshing {len(active_ids)} from DB", flush=True)
-            for doc in fetch_active_docs(session, active_ids, args.max_batch, filler, txn):
+            for doc in fetch_active_docs(session, active_ids, args.max_batch, pool):
                 docs.setdefault(doc["_id"], doc)
         elif args.no_active:
             print("  active battles: skipped (--no-active)", flush=True)
@@ -540,7 +525,7 @@ def _run(args) -> int:
                     round_ids.discard(cr["_id"])
                 elif isinstance(cr, str) and cr:
                     round_ids.add(cr)
-            rounds = fetch_rounds(session, sorted(round_ids), args.max_batch, filler, txn) if round_ids else []
+            rounds = fetch_rounds(session, sorted(round_ids), args.max_batch, pool) if round_ids else []
             rounds += [minimize_round(cr) for cr in live_docs]
             print(f"rounds: {len(round_ids) + len(live_docs)} to fetch, {len(rounds)} fetched", flush=True)
 
@@ -563,10 +548,10 @@ def _run(args) -> int:
     bf_missing = battles_without_rounds(args.db)
     if bf_missing:
         print(f"rounds backfill: {len(bf_missing)} battles without stored rounds", flush=True)
-        bf_docs = {d["_id"]: d for d in fetch_active_docs(session, bf_missing, args.max_batch, filler, txn)}
+        bf_docs = {d["_id"]: d for d in fetch_active_docs(session, bf_missing, args.max_batch, pool)}
         bf_existing = round_hexes_for(list(bf_docs), args.db)
         bf_round_ids = {rid for doc in bf_docs.values() for rid in (doc.get("rounds") or [])} - bf_existing
-        bf_rounds = fetch_rounds(session, sorted(bf_round_ids), args.max_batch, filler, txn) if bf_round_ids else []
+        bf_rounds = fetch_rounds(session, sorted(bf_round_ids), args.max_batch, pool) if bf_round_ids else []
         bf_payload = [{k: v for k, v in d.items() if k != "currentRound"} for d in bf_docs.values()] + bf_rounds
         insert_docs(args.db, bf_payload, args.batch_size)
         print(f"rounds backfill: stored rounds for {len(bf_docs)} battles ({len(bf_rounds)} rounds)", flush=True)
@@ -574,20 +559,13 @@ def _run(args) -> int:
     if fixed:
         print(f"damage repair: {fixed} battles now carry round-sum damages", flush=True)
 
-    # Flush filler upserts (user.getUserLite docs fetched as batch slack)
-    fs = filler.stmts()
-    if fs:
-        exec_many(fs, args.db)
-        print(f"  filler: {len(filler.fetched)} users upserted, "
-              f"{len(filler.dead)} dead marked", flush=True)
-
-    # Flush transaction filler (window probes + bucket pages) + shared state
-    if txn is not None:
-        ts = txn.stmts()
-        if ts:
-            exec_batch(ts, args.db)
-            print(f"  txn filler: {len(ts)} transactions stored", flush=True)
-        txn.save_state()
+    # Flush the filler pool: user-lite upserts + transaction window items +
+    # itemMarket/user history items + user done-marks, then their state files
+    ps = pool.stmts()
+    if ps:
+        exec_batch(ps, args.db)
+        print(f"  filler pool: {len(ps)} statements flushed", flush=True)
+    pool.save_state()
 
     # Flush any endpoint usages not covered by the last DB call
     flush_endpoint_log(args.db)

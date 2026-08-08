@@ -299,10 +299,14 @@ class TransactionFiller:
     Results are collected per run and stored via insert_transaction
     (idempotent ON CONFLICT, dedupe by _id): consumers flush
     ``txn.stmts()`` through exec_batch and call ``txn.save_state()`` at the
-    end of the run. The shared state (state/transactions_state.json) is
-    written atomically; the viewer's updater runs the consuming scripts
-    sequentially, so the file is never written concurrently — do NOT run
-    update_transactions.py standalone while a viewer cycle is filling.
+    end of the run. ``top_up`` returns (slots, tokens) — the tokens are the
+    per-request (kind, index) snapshot for ``collect``, so overlapping
+    requests (the live ranking walk keeps WORKERS bodies in flight) never
+    misattribute a response to another request's slot. The shared state
+    (state/transactions_state.json) is written atomically; the viewer's
+    updater runs the consuming scripts sequentially, so the file is never
+    written concurrently — do NOT run update_transactions.py standalone
+    while a viewer cycle is filling.
     """
 
     PROBE_EVERY = 30  # min seconds between live probe rounds (0 = off)
@@ -310,7 +314,6 @@ class TransactionFiller:
     def __init__(self, db: str) -> None:
         self.db = db
         self.state = read_json(STATE_FILE, DEFAULT_STATE)
-        self._slot_keys: dict[int, tuple[str, int]] = {}
         self._offered: set[int] = set()
         self._items: list[dict] = []
         self._newest_ms: int | None = None
@@ -324,11 +327,14 @@ class TransactionFiller:
         last = self.state.get("live", {}).get("last_probe_ms")
         return last is None or now_ms - last >= self.PROBE_EVERY * 1000
 
-    def top_up(self, calls: list[tuple[str, dict]]) -> list[int]:
+    def top_up(self, calls: list[tuple[str, dict]]) -> tuple[list[int], list[tuple[str, int]]]:
         """Append transaction.getPaginatedTransactions calls until the batch
         holds MAX_BATCH: pending bucket pages first (the finite window-fill
-        work), then live probes when a round is due. Returns the indices
-        (into ``calls``) of the filler calls added."""
+        work), then live probes when a round is due. Returns (the indices
+        (into ``calls``) of the filler calls added, their ``(kind, index)``
+        tokens for collect — captured per request, so overlapping requests
+        (the live walk keeps WORKERS bodies in flight) can never read a
+        newer request's slot mapping)."""
         now_ms = int(time.time() * 1000)
         edge_ms = int(now_ms - self.state.get("window_hours", DEFAULT_WINDOW_HOURS) * 3600_000)
         buckets = self.state.setdefault("buckets", [])
@@ -339,6 +345,7 @@ class TransactionFiller:
                 buckets.extend(_make_buckets(edge_ms, top, DEFAULT_BUCKET_CAP))
                 self._dirty = True
         slots: list[int] = []
+        tokens: list[tuple[str, int]] = []
         # Live probes get FIRST priority when a round is due: the top edge
         # must stay covered even while a large bucket pile is draining —
         # buckets first starve the probes (their gap detection is what keeps
@@ -351,10 +358,9 @@ class TransactionFiller:
                 p = {"limit": PAGE_LIMIT, "direction": "forward"}
                 if off:
                     p["cursor"] = str(now_ms - off)
-                pos = len(calls)
-                self._slot_keys[pos] = ("probe", i)
+                tokens.append(("probe", i))
+                slots.append(len(calls))
                 self._probes_added += 1
-                slots.append(pos)
                 calls.append(("transaction.getPaginatedTransactions", p))
         for i, b in enumerate(buckets):
             if len(calls) >= MAX_BATCH:
@@ -362,30 +368,29 @@ class TransactionFiller:
             if b.get("done") or i in self._offered:
                 continue
             cursor = b.get("cursor_ms") or b["top_ms"] + 1
-            pos = len(calls)
-            self._slot_keys[pos] = ("bucket", i)
+            tokens.append(("bucket", i))
+            slots.append(len(calls))
             self._offered.add(i)
-            slots.append(pos)
             calls.append(("transaction.getPaginatedTransactions",
                           {"limit": PAGE_LIMIT, "direction": "forward",
                            "cursor": str(cursor)}))
-        return slots
+        return slots, tokens
 
-    def collect(self, results: list, slots: list[int]) -> None:
+    def collect(self, results: list, slots: list[int],
+                tokens: list[tuple[str, int]]) -> None:
         """Pick transaction results out of a mixed_fetch response (positions
-        ``slots``): advance bucket cursors, track probe bottoms for gap
-        detection, stash items for stmts(). Errors are skipped — retried by
-        the next run."""
+        ``slots``, kinds from the per-request ``tokens``): advance bucket
+        cursors, track probe bottoms for gap detection, stash items for
+        stmts(). Errors are skipped — retried by the next run."""
         now_ms = int(time.time() * 1000)
         live = self.state.setdefault("live", {})
         buckets = self.state.setdefault("buckets", [])
         stats = self.state.setdefault("stats", {})
         edge_ms = int(now_ms - self.state.get("window_hours", DEFAULT_WINDOW_HOURS) * 3600_000)
-        for pos in slots:
+        for pos, (kind, idx) in zip(slots, tokens):
             if pos >= len(results):
                 continue
             res = results[pos]
-            kind, idx = self._slot_keys.get(pos, ("", -1))
             if "error" in res:
                 stats["failed_calls"] = stats.get("failed_calls", 0) + 1
                 if kind == "probe":
