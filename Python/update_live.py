@@ -10,7 +10,7 @@ update_battles.py and insert_ranking_sample.py) or standalone:
 
 The per-entity ranking sync is the expensive part (one walk per live battle),
 so it is throttled by --ranking-interval (default 300s, tracked in
-Python/live_state.json); the battle list, reconciliation and battle-doc
+state/live_state.json); the battle list, reconciliation and battle-doc
 refresh run on every invocation (i.e. every 15s from the website).
 
 Per run:
@@ -78,18 +78,18 @@ from db import (
     value_sql,
 )
 from utils import (
-    BASE_DIR,
     ENTITY,
     MAX_BATCH,
     PAGE_LIMIT,
     SIDE,
+    STATE_DIR,
     read_json,
     write_json,
 )
 from update_transactions import TransactionFiller
 from update_users_lite import Filler
 
-STATE_FILE = os.path.join(BASE_DIR, "live_state.json")
+STATE_FILE = os.path.join(STATE_DIR, "live_state.json")
 
 FLUSH = 20000
 FUTURE_CURSOR = "2099-01-01T00:00:00Z"

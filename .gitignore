@@ -2,4 +2,4 @@
 __pycache__/
 extra/
 Python/__pycache__
-Python/*.json
+state/

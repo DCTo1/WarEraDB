@@ -48,16 +48,16 @@ from db import (
     weekly_damage_stmts,
 )
 from utils import (
-    BASE_DIR,
     ENTITY,
     MAX_BATCH,
     SIDE,
+    STATE_DIR,
     read_json,
     write_json,
 )
 
-STATE_FILE = os.path.join(BASE_DIR, "ranking_sample_state.json")
-RATE_FILE = os.path.join(BASE_DIR, "ranking_sample_rate.json")
+STATE_FILE = os.path.join(STATE_DIR, "ranking_sample_state.json")
+RATE_FILE = os.path.join(STATE_DIR, "ranking_sample_rate.json")
 MERGED_CUTOFF = "2026-03-29T18:25:00Z"
 
 SLEEP = 0.1

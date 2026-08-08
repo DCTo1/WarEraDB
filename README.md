@@ -19,7 +19,7 @@ TimescaleDB hypertables.
 > probes (no-cursor + now−5s/−10s/−15s) every `PROBE_EVERY` seconds that
 > tile the newest ~26 s and detect gaps. Both pools stop naturally when the
 > work is drained (`done=True` in
-> `Python/transactions_state.json` → no more calls until a probe finds
+> `state/transactions_state.json` → no more calls until a probe finds
 > something new). The full 72 h window is stored continuously from the moment
 > the scraper runs; anything older than 72 h at that point is unreachable
 > until the per-entity backfill lands.
@@ -148,13 +148,13 @@ done
 # batched request), ≥48 h apart, "just came back" users first; inactive
 # accounts are never requested. last_active_at is kept close by an activity
 # check every 2 h (--check-interval, min 1 h; state in
-# Python/users_lite_state.json): recent rounds raise it, raise-only. Runs
+# state/users_lite_state.json): recent rounds raise it, raise-only. Runs
 # automatically on the viewer's cycle too.
 .venv/bin/python Python/update_users_lite.py --limit 100
 
 # Official weekly-ranking snapshots (weeklyUserDamages / weeklyCountryDamages
 # / muWeeklyDamages) stored at xx:01 every hour (self-throttled; state in
-# Python/weekly_ranking_state.json), finished weeks pruned to their per-entity
+# state/weekly_ranking_state.json), finished weeks pruned to their per-entity
 # final value at each Monday rollover. Every web cycle a straddler reconcile
 # moves the post-reset portion of users' reset-straddling rounds to the
 # correct week — gated by inactivity (no pre-reset-started active battles,
@@ -272,7 +272,7 @@ this link always resolves to the newest backup:
   → `timescaledb_post_restore()`), then rebuilds `user_battle_stats` (full
   DELETE + INSERT-from-source), `user_weekly_damage`
   (`update_weekly_ranking.py --backfill`), `data/battle_timestamps.json` and
-  the `Python/*.json` state files, and finishes with
+  the `state/*.json` state files, and finishes with
   `insert_ranking_sample.py --verify` + a stats spot check.
 - **Uploading is owner-only**: it requires the `WARERA_GITHUB_TOKEN` env var
   or `~/.config/warera/github_token.txt` (plain text, 0600 — same pattern as
@@ -369,4 +369,5 @@ ORDER BY r.rank LIMIT 20;
 | `docker-compose.yml` | Manual alternative to the GUI's container setup (`docker compose up -d` — same image/port/volume) |
 | `base_data/` | Schema DDL (`create_tables.sql`), PL/pgSQL functions (`functions.sql`), indexes, views |
 | `Python/` | Battle tooling: shared modules (`api.py` WarEra API client, `db.py` SQLAlchemy DB access + SQL helpers, `utils.py` time/state/constants + `prepare_transaction()`, `endpoint_log.py`) + the CLI scripts (`update_battles.py`, `update_live.py`, `update_countries.py`, `insert_ranking_sample.py`, `update_users.py`, `update_users_lite.py`, `update_weekly_ranking.py`, `update_transactions.py` (TransactionFiller — the transaction-window filler riding the mixed batches), `seed_endpoints.py`) + the web viewer (`db_web.py` entry point and the `viewer/` package with its pages, incl. the `/tracker` damage tracker, the `/weekly` rankings and the `/transactions` window browser) |
+| `state/` | Runtime state files (gitignored, regenerable — `backups.py load` resets them): scraper cursors / throttle stamps / audit trails (`battles_state.json`, `live_state.json`, `transactions_state.json`, `users_lite_state.json`, `weekly_ranking_state.json`, `weekly_reconcile_state.json`, `ranking_sample_state.json`, `ranking_sample_rate.json`) |
 | `data/battle_timestamps.json` | Battle timestamp index for batched pagination (oldest-first, append-only) |

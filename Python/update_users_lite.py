@@ -76,7 +76,7 @@ import requests
 
 from api import NotFoundError, make_session, mixed_fetch
 from db import esc, exec_many, flush_endpoint_log, query
-from utils import BASE_DIR, MAX_BATCH, read_json, write_json
+from utils import MAX_BATCH, STATE_DIR, read_json, write_json
 
 BATCH_CAP = MAX_BATCH      # 50 calls per tRPC request
 FLUSH = 500
@@ -86,7 +86,7 @@ STALE_HOURS = 48           # re-fetch a user only when last checked more than th
 PRIORITY_HOURS = 96        # active users last checked longer ago than this = "just came back"
 CHECK_INTERVAL = 7200      # regular cadence of the activity check (2 h)
 CHECK_INTERVAL_MIN = 3600  # never run the activity check more often than hourly
-STATE_FILE = os.path.join(BASE_DIR, "users_lite_state.json")
+STATE_FILE = os.path.join(STATE_DIR, "users_lite_state.json")
 
 
 def pick_hexes(db: str, limit: int) -> list[str]:

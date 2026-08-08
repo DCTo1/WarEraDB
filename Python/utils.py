@@ -24,10 +24,15 @@ import json
 import os
 from datetime import datetime, timezone
 
-# Python/ directory — the root for the pipeline's shared modules and state
-# files. Scripts running from Python/new/ resolve the same paths, so state
-# files keep their stable location no matter where the script runs from.
+# Python/ directory — the root for the pipeline's shared modules. Scripts
+# running from Python/new/ resolve the same paths, so paths keep their
+# stable location no matter where the script runs from.
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# state/ directory — runtime state files (scraper cursors, throttle stamps,
+# audit trails), kept out of the code tree and regenerable (backups.py load
+# resets them). Gitignored via .gitignore ("state/").
+STATE_DIR = os.path.join(BASE_DIR, "..", "state")
 
 # Path to the WarEra API token (api.py reads it).
 API_KEY_FILE = os.path.join(os.path.expanduser("~"), ".config", "warera", "api_key.txt")
