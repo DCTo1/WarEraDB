@@ -9,20 +9,29 @@ TimescaleDB hypertables.
 > Transactions: the API serves only the rolling **72 h window** of transaction
 > history unfiltered (verified 2026-08-07 — the edge is exactly now − 72.00 h
 > and moves with the clock; older rows are reachable only via per-entity
-> filters like `userId`/`itemCode`, whose full-history backfill is planned but
-> not yet run). The window is kept current by a **filler** riding the web
+> filters like `userId`/`itemCode`, whose full-history backfill runs through
+> the fillers below). The window is kept current by a **filler** riding the web
 > viewer's mixed batches (no dedicated step since 2026-08-07): on every
 > cycle the slack slots of update_battles / update_live / update_weekly_ranking
-> carry `transaction.getPaginatedTransactions` calls from
-> `update_transactions.TransactionFiller` — a time-bucketed walk that fills
-> the window back to the edge (~1.5M rows on the first fill) plus 4 live
-> probes (no-cursor + now−5s/−10s/−15s) every `PROBE_EVERY` seconds that
-> tile the newest ~26 s and detect gaps. Both pools stop naturally when the
-> work is drained (`done=True` in
+> carry `transaction.getPaginatedTransactions` calls from a priority-ordered
+> **filler pool** (`Python/fillers.py`, see `extra/docs/FILLERS.md`):
+> 1. `user.getUserLite` (user-lite backfill + active refresh),
+> 2. `transaction.getPaginatedTransactions` **window work** — a
+>    time-bucketed walk that fills the window back to the edge (~1.5M rows on
+>    the first fill) plus 4 live probes (no-cursor + now−5s/−10s/−15s) every
+>    `PROBE_EVERY` seconds that tile the newest ~26 s and detect gaps,
+> 3. an **itemMarket walk per item code** (`itemCode` filter bypasses the
+>    72 h window — full history per equipment code, `ITEM_MARKET_CODES`),
+> 4. a **user walk** (`userId` filter bypasses the window too — full lifetime
+>    history per user, picked by XP ranking; at most `USER_TX_POOL_SIZE`
+>    users in parallel, each stamped `users.transactions_scraped_at` once
+>    an empty page confirms their scrape finished).
+> The window pools stop naturally when the work is drained (`done=True` in
 > `state/transactions_state.json` → no more calls until a probe finds
-> something new). The full 72 h window is stored continuously from the moment
-> the scraper runs; anything older than 72 h at that point is unreachable
-> until the per-entity backfill lands.
+> something new); the code/user walks ride the same slack, so they never
+> start additional requests. The full 72 h window is stored continuously from
+> the moment the scraper runs; anything older than 72 h at that point is
+> reachable only through the per-entity walks (code and user pools).
 
 **What's in the DB today** *(rough counts — they grow with every incremental update run)*
 
@@ -37,7 +46,7 @@ TimescaleDB hypertables.
 | Loot items (upserted from ranking loot) | ~1.4M |
 | Inventory ids (users, countries, MUs — global ObjectID → int map) | ~100K |
 | Users (API lifetime stats + username/level/MU detail) | ~100K |
-| Transactions (rolling 72 h window, kept live by the mixed-batch filler) | ~1.5M |
+| Transactions (rolling 72 h window, kept live by the mixed-batch filler + full history per item code / per user via the bypass filters) | ~1.5M + growing |
 
 ## Easy setup (for everyone)
 
@@ -172,7 +181,13 @@ done
 # Live transaction window — NO dedicated step (2026-08-07): the rolling 72 h
 # window is filled/kept live by TransactionFiller (update_transactions.py)
 # riding the slack of update_battles/update_live/update_weekly_ranking mixed
-# batches on the web viewer's cycle; WARERA_TX_FILLER=0 disables it.
+# batches on the web viewer's cycle; the same slack also carries full-history
+# backfills via the bypass filters: per-item-code itemMarket walks and
+# per-user walks (XP-ranked, users.transactions_scraped_at marks finished
+# ones; see Python/fillers.py + extra/docs/FILLERS.md). The fillers never
+# start additional requests. WARERA_TX_FILLER=0 disables the transaction
+# fillers (viewer --transactions 0); WARERA_ITEM_MARKET_FILLER=0 /
+# WARERA_USER_TX_FILLER=0 disable individual ones.
 # Coverage report (no API calls) still works standalone:
 .venv/bin/python Python/update_transactions.py --verify   # coverage report
 
@@ -217,8 +232,15 @@ cycle also runs update_users_lite.py: backfills user.getUserLite basic info
 for up to 100 unchecked users per run, wealth/damage rankings first, then
 re-checks users active within 4 days only — users.last_active_at, ≤50 per
 cycle, ≥48 h apart, real lastConnectionAt stored on fetch, activity check
-every 2 h; the transaction 72 h window rides the mixed batches' slack via
-`update_transactions.TransactionFiller` — `--transactions 0` disables):
+every 2 h; the transaction work rides the mixed batches' slack via the
+priority-ordered filler pool (`Python/fillers.py` — window probes/buckets +
+per-item-code itemMarket walks + XP-ranked per-user walks, see
+`extra/docs/FILLERS.md`) — `--transactions 0` disables). `/stats` shows the
+filler health at the top (window buckets, itemMarket codes, user walks,
+history rows) plus exact request counts — every `api.mixed_fetch` POST logs
+one `request_id` (`endpoints_used.request_id`, migration_22), so a 50-call
+batch counts as ONE request; pre-2026-08-08 rows fall back to
+same-timestamp groups):
 
 ```bash
 # WARERA_DB_URL must be set in the viewer's environment: the auto-updater
@@ -368,6 +390,6 @@ ORDER BY r.rank LIMIT 20;
 | `warera_gui.py` | Control panel (stdlib-only Tkinter GUI + `--setup` headless mode): one-command first-time setup (venv, TimescaleDB container, schema, latest backup), start/stop/restart the web viewer, local backups + backup restore, API token storage |
 | `docker-compose.yml` | Manual alternative to the GUI's container setup (`docker compose up -d` — same image/port/volume) |
 | `base_data/` | Schema DDL (`create_tables.sql`), PL/pgSQL functions (`functions.sql`), indexes, views |
-| `Python/` | Battle tooling: shared modules (`api.py` WarEra API client, `db.py` SQLAlchemy DB access + SQL helpers, `utils.py` time/state/constants + `prepare_transaction()`, `endpoint_log.py`) + the CLI scripts (`update_battles.py`, `update_live.py`, `update_countries.py`, `insert_ranking_sample.py`, `update_users.py`, `update_users_lite.py`, `update_weekly_ranking.py`, `update_transactions.py` (TransactionFiller — the transaction-window filler riding the mixed batches), `seed_endpoints.py`) + the web viewer (`db_web.py` entry point and the `viewer/` package with its pages, incl. the `/tracker` damage tracker, the `/weekly` rankings and the `/transactions` window browser) |
-| `state/` | Runtime state files (gitignored, regenerable — `backups.py load` resets them): scraper cursors / throttle stamps / audit trails (`battles_state.json`, `live_state.json`, `transactions_state.json`, `users_lite_state.json`, `weekly_ranking_state.json`, `weekly_reconcile_state.json`, `ranking_sample_state.json`, `ranking_sample_rate.json`) |
+| `Python/` | Battle tooling: shared modules (`api.py` WarEra API client, `db.py` SQLAlchemy DB access + SQL helpers, `utils.py` time/state/constants + `prepare_transaction()`, `endpoint_log.py`, `fillers.py` — the priority-ordered filler pool + the itemMarket/user-history fillers) + the CLI scripts (`update_battles.py`, `update_live.py`, `update_countries.py`, `insert_ranking_sample.py`, `update_users.py`, `update_users_lite.py`, `update_weekly_ranking.py`, `update_transactions.py` (TransactionFiller — the transaction-window filler riding the mixed batches), `seed_endpoints.py`) + the web viewer (`db_web.py` entry point and the `viewer/` package with its pages, incl. the `/tracker` damage tracker, the `/weekly` rankings and the `/transactions` window browser) |
+| `state/` | Runtime state files (gitignored, regenerable — `backups.py load` resets them): scraper cursors / throttle stamps / audit trails (`battles_state.json`, `live_state.json`, `transactions_state.json`, `item_market_state.json`, `user_tx_state.json`, `users_lite_state.json`, `weekly_ranking_state.json`, `weekly_reconcile_state.json`, `ranking_sample_state.json`, `ranking_sample_rate.json`) |
 | `data/battle_timestamps.json` | Battle timestamp index for batched pagination (oldest-first, append-only) |
