@@ -381,6 +381,10 @@ CREATE TABLE endpoints (
 CREATE TABLE endpoints_used (
     id          BIGSERIAL PRIMARY KEY,
     endpoint_id SMALLINT NOT NULL REFERENCES endpoints(id),
+    request_id  BIGINT NOT NULL DEFAULT 0,    -- the HTTP request this call rode in
+                                              -- (api.py mixed_fetch, one id per POST —
+                                              -- a 50-call batch shares one id; 0 = rows
+                                              -- predating 2026-08-08 / manual single calls)
     date_used   TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 

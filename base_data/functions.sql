@@ -719,12 +719,12 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
-CREATE OR REPLACE FUNCTION insert_endpoint_used(p_name TEXT)
+CREATE OR REPLACE FUNCTION insert_endpoint_used(p_name TEXT, p_request_id BIGINT DEFAULT 0)
 RETURNS VOID AS $$
 DECLARE
     v_id SMALLINT;
 BEGIN
     v_id := get_endpoint_id(p_name);
-    INSERT INTO endpoints_used (endpoint_id) VALUES (v_id);
+    INSERT INTO endpoints_used (endpoint_id, request_id) VALUES (v_id, p_request_id);
 END;
 $$ LANGUAGE plpgsql;
