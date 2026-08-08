@@ -21,6 +21,16 @@ the last 7 days whose rounds lack round-ranking rows are re-fetched via
 insert_ranking_sample.py --ids. This repairs battles that ended while the
 site was down (or whose final fetch fell through the settle window), so
 gaps from battles ending overnight are fixed as soon as the site boots.
+
+The cycle steps run as PARALLEL subprocesses (since 2026-08-08), each
+launched LAUNCH_STAGGER seconds after the previous one: the API serves
+every batched request in ~0.6-1.7 s no matter its size, so the old
+sequential chain serialized the cycle's ~6 requests into ~6-8 s, while the
+parallel launches cut the wall time to the longest step (~5 s for
+update_battles). The stagger keeps the steps' first API requests from
+hitting the server in the same instant — raise LAUNCH_STAGGER if the API
+ever answers HTTP 429 ("please slow down") as the project grows and more
+steps/requests join the cycle; 0 = fire everything at once.
 """
 
 import os
@@ -33,6 +43,12 @@ import time
 from .config import (LIVE_SCRIPT, MAX_UPDATE_LINES, RANKING_SCRIPT, UPDATE_INTERVAL, UPDATE_SCRIPT, USER_LITE_SCRIPT, WEEKLY_SCRIPT, settings)
 from .queries import query_dicts
 from .ui import esc, layout
+
+# Seconds between the parallel cycle steps' launches (step k starts at
+# k * LAUNCH_STAGGER). Manually changeable: the API rate-limits bursts with
+# HTTP 429 — if a "please slow down" response ever appears (more steps,
+# more requests per step), raise this value; 0 = fire all steps at once.
+LAUNCH_STAGGER = 0.2
 
 # State of the background updater. Guarded by UPDATE_LOCK.
 UPDATE_STATE: dict = {"running": False, "done": False, "rc": None, "output": [],
@@ -124,10 +140,14 @@ def _first_nonzero(*rcs: int) -> int:
 
 
 def _run_updater() -> None:
-    """Background thread: boot check first, then update_battles.py, then
-    update_live.py, then insert_ranking_sample.py, then
-    update_weekly_ranking.py (hourly self-throttled snapshot fetch), then
-    update_users_lite.py."""
+    """Background thread: boot check first, then all cycle steps as PARALLEL
+    subprocesses (update_battles.py, update_live.py, insert_ranking_sample.py,
+    update_weekly_ranking.py, update_users_lite.py), each launched
+    LAUNCH_STAGGER seconds after the previous one. The steps are
+    independent: their API requests don't overlap in data, and the DB
+    writes are idempotent upserts on separate connections. The filler
+    state files (state/*.json) are safe under concurrency — the pool's
+    save_state() merges them under a lock (Python/fillers.py)."""
     db = settings.db
     # WARERA_NO_RETRIES: the 15 s cycle must never block on API retries —
     # a transient failure burns seconds × retries (up to ~50 s of backoff)
@@ -138,55 +158,65 @@ def _run_updater() -> None:
         # --transactions 0: the transaction window filler (riding the mixed
         # batches below) is disabled for every spawned script.
         env["WARERA_TX_FILLER"] = "0"
-    rc2 = 0  # ranking step rc (0 = skipped when --ranking 0 disables it)
-    rc4 = 0  # user-lite step rc (0 = skipped when --user-lite 0 disables it)
-    rc5 = 0  # weekly snapshot step rc (0 = skipped when --weekly 0 disables it)
     try:
         rc0 = _boot_check(db, env) if settings.ranking_latest else 0
-        rc = _tee_output(subprocess.Popen(
-            [sys.executable, UPDATE_SCRIPT, "--db", db, "--force-active"],
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            text=True, bufsize=1, env=env))
-        with UPDATE_LOCK:
-            UPDATE_STATE["rc"] = _first_nonzero(rc0, rc)
-        with UPDATE_LOCK:
-            UPDATE_STATE["output"].append("\n=== live sync: update_live.py ===")
-        rc3 = _tee_output(subprocess.Popen(
-            [sys.executable, LIVE_SCRIPT, "--db", db],
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            text=True, bufsize=1, env=env))
-        with UPDATE_LOCK:
-            UPDATE_STATE["rc"] = _first_nonzero(rc0, rc, rc3)
+        # The cycle steps, launched staggered: battles first (it is the
+        # longest step, ~5 s; the short steps finish during its run).
+        steps: list[tuple[str, str, list[str]]] = [
+            ("rc", "battles: update_battles.py",
+             [sys.executable, UPDATE_SCRIPT, "--db", db, "--force-active"]),
+            ("rc3", "live sync: update_live.py",
+             [sys.executable, LIVE_SCRIPT, "--db", db]),
+        ]
         if settings.ranking_latest:
-            with UPDATE_LOCK:
-                UPDATE_STATE["output"].append(
-                    f"\n=== rankings: insert_ranking_sample.py --latest {settings.ranking_latest} ===")
-            rc2 = _tee_output(subprocess.Popen(
-                [sys.executable, RANKING_SCRIPT, "--latest", str(settings.ranking_latest)],
-                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                text=True, bufsize=1, env=env))
-            with UPDATE_LOCK:
-                UPDATE_STATE["rc"] = _first_nonzero(rc0, rc, rc3, rc2)
+            steps.append(("rc2",
+                          f"rankings: insert_ranking_sample.py --latest {settings.ranking_latest}",
+                          [sys.executable, RANKING_SCRIPT, "--latest",
+                           str(settings.ranking_latest)]))
         if settings.weekly_enabled:
-            with UPDATE_LOCK:
-                UPDATE_STATE["output"].append(
-                    "\n=== weekly snapshots: update_weekly_ranking.py ===")
-            rc5 = _tee_output(subprocess.Popen(
-                [sys.executable, WEEKLY_SCRIPT, "--db", db],
-                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                text=True, bufsize=1, env=env))
-            with UPDATE_LOCK:
-                UPDATE_STATE["rc"] = _first_nonzero(rc0, rc, rc3, rc2, rc5)
+            steps.append(("rc5", "weekly snapshots: update_weekly_ranking.py",
+                          [sys.executable, WEEKLY_SCRIPT, "--db", db]))
         if settings.user_lite_limit:
+            steps.append(("rc4",
+                          f"user lite: update_users_lite.py --limit {settings.user_lite_limit}",
+                          [sys.executable, USER_LITE_SCRIPT, "--limit",
+                           str(settings.user_lite_limit)]))
+        rcs: dict[str, int] = {}
+        procs: dict[str, subprocess.Popen] = {}
+        for i, (key, label, argv) in enumerate(steps):
+            if i:
+                time.sleep(LAUNCH_STAGGER)
             with UPDATE_LOCK:
-                UPDATE_STATE["output"].append(
-                    f"\n=== user lite: update_users_lite.py --limit {settings.user_lite_limit} ===")
-            rc4 = _tee_output(subprocess.Popen(
-                [sys.executable, USER_LITE_SCRIPT, "--limit", str(settings.user_lite_limit)],
-                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                text=True, bufsize=1, env=env))
+                UPDATE_STATE["output"].append(f"\n=== {label} ===")
+            try:
+                procs[key] = subprocess.Popen(
+                    argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    text=True, bufsize=1, env=env)
+            except OSError as exc:
+                rcs[key] = -1
+                with UPDATE_LOCK:
+                    UPDATE_STATE["output"].append(f"  launch failed: {exc}")
+        if not rcs:
             with UPDATE_LOCK:
-                UPDATE_STATE["rc"] = _first_nonzero(rc0, rc, rc3, rc2, rc5, rc4)
+                UPDATE_STATE["rc"] = _first_nonzero(rc0, 0, 0, 0, 0, 0)
+
+        def _record(key: str) -> None:
+            with UPDATE_LOCK:
+                UPDATE_STATE["rc"] = _first_nonzero(
+                    rc0, rcs.get("rc", 0), rcs.get("rc3", 0),
+                    rcs.get("rc2", 0), rcs.get("rc5", 0), rcs.get("rc4", 0))
+
+        def _tee_one(key: str, proc: subprocess.Popen) -> None:
+            rcs[key] = _tee_output(proc)
+            _record(key)
+
+        threads = [threading.Thread(target=_tee_one, args=(k, p))
+                   for k, p in procs.items()]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        _record("")
     except Exception as exc:
         with UPDATE_LOCK:
             UPDATE_STATE["rc"] = -1
