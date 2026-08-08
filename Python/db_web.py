@@ -72,6 +72,20 @@ from http.server import ThreadingHTTPServer
 from viewer import config, server, updater
 
 
+class ViewServer(ThreadingHTTPServer):
+    """ThreadingHTTPServer with a real listen backlog.
+
+    The stdlib default request_queue_size is 5: under a burst of concurrent
+    connections (measured: 25+ tabs/benchmark workers) the accept queue
+    overflows, the kernel drops the SYN packets and clients retry at ~1 s,
+    ~2 s, ~3 s — the flat ~1 s p99 stall. 128 connections queue in the
+    kernel instead (handlers run 1-2 ms for cached pages), which is plenty
+    for 50 users; nginx/caddy in front would also absorb this.
+    """
+
+    request_queue_size = 128
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description="Local web viewer for the WarEra DB.")
     p.add_argument("--port", type=int, default=config.DEFAULT_PORT)
@@ -100,7 +114,7 @@ def main() -> int:
     config.settings.transactions_enabled = args.transactions != 0
 
     threading.Thread(target=updater.scheduler_loop, daemon=True).start()
-    srv = ThreadingHTTPServer(("127.0.0.1", args.port), server.Handler)
+    srv = ViewServer(("127.0.0.1", args.port), server.Handler)
     print(f"WarEra DB viewer: http://127.0.0.1:{args.port}  "
           f"(auto-updates every {config.UPDATE_INTERVAL}s, Ctrl+C to stop)")
     try:
