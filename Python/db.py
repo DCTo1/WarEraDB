@@ -80,27 +80,32 @@ def _flush_endpoint_log(conn) -> None:
 
 
 @_as_db_error
-def query(sql: str, db: str | None = None) -> list[tuple]:
-    """Run one SELECT, return the rows as tuples."""
+def query(sql: str, db: str | None = None, params: tuple | None = None) -> list[tuple]:
+    """Run one SELECT, return the rows as tuples.
+
+    `params` (psycopg %s placeholders) enables psycopg's server-side prepared
+    statements: after 5 executions of the same SQL text the plan is reused
+    (the viewer's repeated page queries). None → raw statement, no placeholder
+    processing (the pipeline's inlined literals)."""
     with engine(db).begin() as conn:
         _flush_endpoint_log(conn)
-        return [tuple(row) for row in conn.exec_driver_sql(sql)]
+        return [tuple(row) for row in conn.exec_driver_sql(sql, params)]
 
 
 @_as_db_error
-def scalar(sql: str, db: str | None = None):
+def scalar(sql: str, db: str | None = None, params: tuple | None = None):
     """Run one SELECT, return the first column of the first row."""
     with engine(db).begin() as conn:
         _flush_endpoint_log(conn)
-        return conn.exec_driver_sql(sql).scalar()
+        return conn.exec_driver_sql(sql, params).scalar()
 
 
 @_as_db_error
-def query_dicts(sql: str, db: str | None = None) -> list[dict]:
+def query_dicts(sql: str, db: str | None = None, params: tuple | None = None) -> list[dict]:
     """Run one SELECT, return the rows as dicts (used by the web viewer)."""
     with engine(db).begin() as conn:
         _flush_endpoint_log(conn)
-        return [dict(row) for row in conn.exec_driver_sql(sql).mappings()]
+        return [dict(row) for row in conn.exec_driver_sql(sql, params).mappings()]
 
 
 @_as_db_error

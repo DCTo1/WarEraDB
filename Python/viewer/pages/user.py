@@ -18,14 +18,13 @@ def page_user(q: dict) -> str:
     hexid = q.get("hex", [""])[0]
     if not (name or (hexid and HEX_RE.match(hexid))):
         return error_page("pass ?name=username or ?hex=24-hex-user-id")
-    where = (f"username = '{name.replace(chr(39), chr(39) + chr(39))}'"
-             if name else f"user_id = objectid_to_uuid('{hexid}')")
+    where = ("username = %s" if name else "user_id = objectid_to_uuid(%s)")
     rows, err = query_dicts(
         "SELECT lower(uuid_to_objectid(user_id)) AS user_id, username, user_damages,"
         " user_bounty, user_wealth, total_xp, military_rank,"
         " (SELECT lower(uuid_to_objectid(x.external_id))"
         "  FROM inventory_ids x WHERE x.id = users.mu_id) AS mu"
-        f" FROM users WHERE {where}")
+        f" FROM users WHERE {where}", (name or hexid,))
     if err:
         return error_page(err)
     if not rows:
@@ -50,11 +49,12 @@ def page_user(q: dict) -> str:
         " LEFT JOIN LATERAL (SELECT attacker_damages, defender_damages FROM rounds"
         " WHERE battle_id = b.battle_id ORDER BY number DESC NULLS LAST LIMIT 1) lr ON true"
         f" WHERE s.user_id = (SELECT id FROM inventory_ids"
-        f" WHERE external_id = objectid_to_uuid('{hexid}'))"
+        f" WHERE external_id = objectid_to_uuid(%s))"
         " GROUP BY b.battle_id, b.created_at, b.ended_at, bt.code, ca.name, cd.name,"
         " b.attacker_won_rounds_count, b.defender_won_rounds_count,"
         " lr.attacker_damages, lr.defender_damages"
-        " ORDER BY SUM(s.damage) DESC NULLS LAST")
+        " ORDER BY SUM(s.damage) DESC NULLS LAST",
+        (hexid,))
     if err:
         return error_page(err)
     a = {
@@ -65,7 +65,7 @@ def page_user(q: dict) -> str:
     }
     uid_rows, err = query_dicts(
         "SELECT id FROM inventory_ids"
-        f" WHERE external_id = objectid_to_uuid('{hexid}')")
+        " WHERE external_id = objectid_to_uuid(%s)", (hexid,))
     if err:
         return error_page(err)
     txns = []
@@ -86,11 +86,11 @@ def page_user(q: dict) -> str:
             " q.other_is_buyer"
             " FROM (SELECT t.created_at, t.money, t.quantity, t.item_code_id,"
             "   t.item_id, t.transaction_type_id,"
-            f"   (t.seller_id = {uid}) AS other_is_buyer,"
-            f"   CASE WHEN t.seller_id = {uid} THEN t.buyer_id"
-            f"   ELSE t.seller_id END AS other_id"
+            "   (t.seller_id = %s) AS other_is_buyer,"
+            "   CASE WHEN t.seller_id = %s THEN t.buyer_id"
+            "   ELSE t.seller_id END AS other_id"
             "  FROM transactions t"
-            f"  WHERE t.seller_id = {uid} OR t.buyer_id = {uid}"
+            "  WHERE t.seller_id = %s OR t.buyer_id = %s"
             "  ORDER BY t.created_at DESC LIMIT 20) q"
             " JOIN transaction_types tt ON tt.id = q.transaction_type_id"
             " LEFT JOIN item_codes ic ON ic.id = q.item_code_id"
@@ -98,7 +98,7 @@ def page_user(q: dict) -> str:
             " LEFT JOIN item_codes it ON it.id = i.item_code_id"
             " LEFT JOIN inventory_ids oi ON oi.id = q.other_id"
             " LEFT JOIN users ou ON ou.user_id = oi.external_id"
-            " ORDER BY q.created_at DESC")
+            " ORDER BY q.created_at DESC", (uid, uid, uid, uid))
         if err:
             return error_page(err)
     def item_cell(r: dict) -> str:
