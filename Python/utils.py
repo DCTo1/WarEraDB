@@ -87,6 +87,43 @@ def write_json(path: str, data) -> None:
     os.replace(tmp, path)
 
 
+def write_json_merged(path: str, data) -> None:
+    """Persist a JSON state file, merging against the on-disk copy so
+    concurrent writers never lose each other's additive changes.
+
+    The viewer's auto-updater runs the pipeline steps as parallel
+    subprocesses (viewer/updater.py, 2026-08-08), and the filler pool's
+    state files (transactions/item_market/user_tx) are shared between
+    steps. Per-entry overlay at every dict level: OUR entries win, entries
+    only the other process added (new users/codes/buckets) survive. A
+    same-key collision is last-write-wins and harmless — every filler is
+    idempotent (ON CONFLICT upserts / cursor re-offers), so the loser's
+    page is simply re-fetched next cycle. Callers must hold the filler
+    pool lock (fillers.FillerPool.save_state) so the read-modify-write
+    below is serialized against the other process's.
+    """
+    disk = read_json(path, None)
+    if disk is None:
+        write_json(path, data)
+        return
+    merged = _deep_merge(disk, data)
+    write_json(path, merged)
+
+
+def _deep_merge(base, over):
+    """Per-entry overlay of ``over`` onto ``base`` (dicts merged recursively,
+    everything else overlaid wholesale). Never mutates the inputs."""
+    if isinstance(base, dict) and isinstance(over, dict):
+        out = dict(base)
+        for k, v in over.items():
+            if k in out:
+                out[k] = _deep_merge(out[k], v)
+            else:
+                out[k] = v
+        return out
+    return over
+
+
 def prepare_transaction(txn: dict) -> dict:
     """Add derived fields needed by the DB insertion function.
 

@@ -54,7 +54,7 @@ extra/docs/FILLERS.md): pending bucket pages + live probes fill the scripts'
 slack slots until the window fill drains, then only the probes remain
 (once per PROBE_EVERY seconds). This script stays for standalone
 backfill/recovery runs and --verify; do not run it while a viewer cycle
-is filling (they share the state file).
+is filling (standalone writes skip the filler pool lock).
 
 Exit: 0 ok / 1 API / 2 DB. WARERA_NO_RETRIES (set by the viewer's
 updater) forces single attempts — a failed cycle is re-attempted 15 s
@@ -70,7 +70,8 @@ from datetime import datetime, timezone
 
 from api import NotFoundError, batched_fetch, make_session
 from db import exec_batch, query
-from utils import MAX_BATCH, PAGE_LIMIT, STATE_DIR, prepare_transaction, read_json, to_unix_ms, write_json
+from utils import (MAX_BATCH, PAGE_LIMIT, STATE_DIR, prepare_transaction,
+                   read_json, to_unix_ms, write_json_merged)
 
 ENDPOINT = "transaction.getPaginatedTransactions"
 STATE_FILE = os.path.join(STATE_DIR, "transactions_state.json")
@@ -300,7 +301,7 @@ def _run_cycle(s, args, state: dict, now_ms: int, edge_ms: int) -> int:
     buckets[:] = [b for b in buckets if not b.get("done")]
     state["done"] = (not buckets) and not args.skip_backfill \
         and live.get("prev_newest_ms") is not None
-    write_json(STATE_FILE, state)
+    write_json_merged(STATE_FILE, state)
     return 0
 
 
@@ -326,10 +327,12 @@ class TransactionFiller:
     per-request (kind, index) snapshot for ``collect``, so overlapping
     requests (the live ranking walk keeps WORKERS bodies in flight) never
     misattribute a response to another request's slot. The shared state
-    (state/transactions_state.json) is written atomically; the viewer's
-    updater runs the consuming scripts sequentially, so the file is never
-    written concurrently — do NOT run update_transactions.py standalone
-    while a viewer cycle is filling.
+    (state/transactions_state.json) is written via write_json_merged under
+    the filler pool lock — the viewer's updater runs the consuming scripts
+    as PARALLEL subprocesses since 2026-08-08 (viewer/updater.py), so
+    concurrent saves must not lose each other's additive changes. Do NOT
+    run update_transactions.py standalone while a viewer cycle is filling
+    (standalone writes skip the pool lock).
     """
 
     PROBE_EVERY = 30  # min seconds between live probe rounds (0 = off)
@@ -471,14 +474,18 @@ class TransactionFiller:
         return _store_stmts(self._items)
 
     def save_state(self) -> None:
-        """Filter done buckets and persist the shared state (atomic write).
-        No-op when nothing was fetched or processed this run."""
+        """Filter done buckets and persist the shared state (atomic write,
+        merged against the on-disk copy — the viewer's updater runs the
+        consuming scripts as PARALLEL subprocesses since 2026-08-08, and the
+        pool's save_state serializes the writes under a lock; see
+        fillers.FillerPool.save_state). No-op when nothing was fetched or
+        processed this run."""
         if not self._dirty:
             return
         state = self.state
         state["buckets"][:] = [b for b in state.get("buckets", []) if not b.get("done")]
         state["done"] = not state["buckets"]
-        write_json(STATE_FILE, state)
+        write_json_merged(STATE_FILE, state)
 
 
 def verify(db: str) -> int:

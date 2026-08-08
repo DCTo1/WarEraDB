@@ -41,10 +41,37 @@ import os
 from db import query
 from update_transactions import TransactionFiller, _store_stmts
 from update_users_lite import Filler
-from utils import MAX_BATCH, PAGE_LIMIT, STATE_DIR, read_json, to_unix_ms, write_json
+from utils import (MAX_BATCH, PAGE_LIMIT, STATE_DIR, read_json, to_unix_ms,
+                   write_json_merged)
 
 ITEM_MARKET_STATE = os.path.join(STATE_DIR, "item_market_state.json")
 USER_TX_STATE = os.path.join(STATE_DIR, "user_tx_state.json")
+
+# Lock file serializing the filler state writes of the viewer's PARALLEL
+# cycle steps (viewer/updater.py launches them staggered since 2026-08-08;
+# before that the steps ran sequentially and the state files were never
+# written concurrently). The lock is held only around save_state — the
+# read-modify-write of each file happens under it; write_json_merged then
+# preserves the other process's additive changes.
+_FILLER_LOCK_PATH = os.path.join(STATE_DIR, ".filler_pool.lock")
+
+
+class _filler_lock:
+    """Exclusive flock on state/.filler_pool.lock — serializes the filler
+    state writes of the viewer's parallel cycle steps. Blocking: the
+    critical section is a few file writes, so contention lasts milliseconds."""
+
+    def __enter__(self):
+        import fcntl
+        self._fd = open(_FILLER_LOCK_PATH, "a+")
+        fcntl.flock(self._fd, fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, *exc):
+        import fcntl
+        fcntl.flock(self._fd, fcntl.LOCK_UN)
+        self._fd.close()
+        return False
 
 # The itemMarket history walk covers these codes (each bypasses the 72 h
 # window, so the FULL history of the code is scraped once per code, then the
@@ -150,8 +177,19 @@ class FillerPool:
         return out
 
     def save_state(self) -> None:
-        for f in self.fillers:
-            f.save_state()
+        """Persist all state files, serialized against the other cycle steps.
+
+        The viewer's updater launches the consuming scripts as parallel
+        subprocesses (viewer/updater.py), so the writes below happen
+        concurrently: the flock keeps the read-modify-write of each file
+        atomic across processes, and each filler's save uses
+        write_json_merged so the other process's additive changes (new
+        users/codes/buckets) survive. A same-key collision is
+        last-write-wins and harmless — every filler is idempotent, the
+        loser's page is re-fetched next cycle."""
+        with _filler_lock():
+            for f in self.fillers:
+                f.save_state()
 
 
 class ItemMarketFiller:
@@ -249,7 +287,9 @@ class ItemMarketFiller:
     def save_state(self) -> None:
         if not self._dirty:
             return
-        write_json(ITEM_MARKET_STATE, self.state)
+        # merge against the on-disk copy (concurrent cycle steps) — the
+        # caller holds the filler pool lock (FillerPool.save_state)
+        write_json_merged(ITEM_MARKET_STATE, self.state)
 
 
 class UserTxFiller:
@@ -387,7 +427,9 @@ class UserTxFiller:
     def save_state(self) -> None:
         if not self._dirty:
             return
-        write_json(USER_TX_STATE, self.state)
+        # merge against the on-disk copy (concurrent cycle steps) — the
+        # caller holds the filler pool lock (FillerPool.save_state)
+        write_json_merged(USER_TX_STATE, self.state)
 
 
 def build_filler_pool(db: str) -> FillerPool:
