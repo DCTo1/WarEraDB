@@ -106,15 +106,13 @@ CREATE UNIQUE INDEX idx_transactions_transaction_id
 -- Native compression (migration_19, 2026-08-07): segmentby
 -- transaction_type_id (the /transactions page's type filter; ~11 segments)
 -- + orderby created_at (the page's default sort + time-window chunk
--- pruning). NO query indexes beyond the unique upsert index (see
--- create_indexes.sql): compressed chunks drop their indexes anyway, and the
--- viewer's 1-72 h window scans hit only the recent uncompressed chunks,
--- where a seq scan + top-N sort is sub-millisecond. Measured on a 2M-row
--- DB (2026-08-07): every /transactions and /user filter is equal or faster
--- with compression and without the five per-chunk indexes (94 B/row heap +
--- 201 B/row indexes → 8 B/row total).
--- The 7-day policy keeps the rolling 72 h window + a day of chunk slack
--- uncompressed while the transaction filler writes into it.
+-- pruning). The 7-day policy keeps the rolling 72 h window + a day of chunk
+-- slack uncompressed while the transaction filler writes into it.
+-- The four query indexes (created_at DESC / type / seller / buyer) live in
+-- create_indexes.sql (migration_20, 2026-08-08) — they exist ONLY on the
+-- uncompressed day-chunks (compression drops per-chunk indexes), which is
+-- exactly where the 1-72 h viewer window scans run (the compressed chunks
+-- serve time-window queries via the compress_orderby instead).
 ALTER TABLE transactions SET (
     timescaledb.compress,
     timescaledb.compress_segmentby = 'transaction_type_id',

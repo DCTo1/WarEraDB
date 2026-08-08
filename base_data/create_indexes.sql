@@ -108,28 +108,32 @@
 -- =============================================================================
 --  Transactions
 --
---  NO INDEXES NEEDED (2026-08-07, migration_19): the transactions hypertable
---  is natively compressed (segmentby transaction_type_id, orderby created_at
---  — see create_tables.sql), and compressed chunks drop their per-chunk
---  indexes anyway. The /transactions page always filters a 1-72 h window, so
---  the created_at orderby + chunk pruning serve the sort, and the window scan
---  over the few recent uncompressed chunks is sub-millisecond. The only index
---  is the unique (transaction_id, created_at) ON CONFLICT target in
---  create_tables.sql. Measured (2026-08-07, 2M-row DB): every page filter is
---  equal or FASTER without these five indexes (browse 0.5 → 1.0 ms, +type
---  0.4 → 0.4 ms, +item 0.4 → 0.7 ms, +user 3.4 → 2.5 ms, histogram 27.6 →
---  37.5 ms — all for a 24 h window on the full history).
---
---  Historic (do NOT re-enable): these used to be per-chunk query indexes —
---  CREATE INDEX IF NOT EXISTS idx_transactions_created_at
---      ON transactions (created_at DESC);
---  CREATE INDEX IF NOT EXISTS idx_transactions_type
---      ON transactions (transaction_type_id, created_at DESC);
---  CREATE INDEX IF NOT EXISTS idx_transactions_item
---      ON transactions (item_code_id, created_at DESC);
---  CREATE INDEX IF NOT EXISTS idx_transactions_seller
---      ON transactions (seller_id, created_at DESC);
---  CREATE INDEX IF NOT EXISTS idx_transactions_buyer
---      ON transactions (buyer_id, created_at DESC);
+--  ENABLED BY DEFAULT (migration_20, 2026-08-08) — the viewer's /transactions
+--  and /user pages depend on them. They live ONLY on the uncompressed day-
+--  chunks: TimescaleDB drops per-chunk indexes when a chunk compresses, so
+--  compressed chunks serve the type filter via the segmentby and the sort via
+--  the compress_orderby, while the 1-72 h window scans hit the ~7 recent
+--  uncompressed chunks (append-mostly inserts — low write amplification).
+--  Rationale: migration_19 dropped these as redundant based on a 2M-row-TOTAL
+--  benchmark where a 24 h window scanned only ~22K rows; the window alone now
+--  holds ~2M rows (~700K/day) and the unindexed scan + top-N sort measured
+--  53 ms (browse) / 81 ms (histogram) on 2026-08-08 — 0.05 ms / 46 ms with
+--  them. The unique (transaction_id, created_at) upsert index lives in
+--  create_tables.sql.
+-- =============================================================================
+
+-- Default browse: ORDER BY created_at DESC LIMIT 100 over the window
+CREATE INDEX IF NOT EXISTS idx_transactions_created_at
+    ON transactions (created_at DESC);
+
+-- Type filter + the per-type histogram (window-scan group by)
+CREATE INDEX IF NOT EXISTS idx_transactions_type
+    ON transactions (transaction_type_id, created_at DESC);
+
+-- User filter (seller/buyer) on /transactions + the /user page's recent box
+CREATE INDEX IF NOT EXISTS idx_transactions_seller
+    ON transactions (seller_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_transactions_buyer
+    ON transactions (buyer_id, created_at DESC);
 -- =============================================================================
 
