@@ -161,8 +161,7 @@ def page_user(q: dict) -> str:
         <table style="width:max-content"><tr><th>Battle (Defender vs Attacker)</th>
         <th style='width:40px'>Rounds</th><th>Date</th><th>Side</th>
         <th>Damage</th><th>Points</th><th>Last Round Damage</th></tr>{hist_rows}</table>
-        <h2>Recent transactions <small class="muted">(72 h window ·
-            <a href="/transactions?{urlencode({'user': hexid})}">all →</a>)</small></h2>
+        <h2>Recent transactions <small class="muted">(<a href="/transactions?{urlencode({'user': hexid})}">all history →</a>)</small></h2>
         <table style="width:max-content"><tr><th>Time</th><th>Type</th><th>Item</th>
         <th>Qty</th><th>Money</th><th>Counterpart</th></tr>
         {txn_rows or "<tr><td colspan='6' class='muted'>none in the stored window</td></tr>"}</table>""")
