@@ -205,7 +205,6 @@ class Filler:
         self.fetched: dict = {}
         self.dead: list[str] = []
         self._seen: set[str] = set()
-        self._slot_hexes: dict[int, str] = {}
         self._backfill_exhausted = False
         self._active_exhausted = False
 
@@ -228,38 +227,46 @@ class Filler:
             return self.active.pop(0)
         return None
 
-    def top_up(self, calls: list[tuple[str, dict]]) -> list[int]:
+    def top_up(self, calls: list[tuple[str, dict]]) -> tuple[list[int], list[str]]:
         """Append user.getUserLite calls until the batch holds MAX_BATCH;
-        returns the indices (into ``calls``) of the filler calls added."""
+        returns (the indices (into ``calls``) of the filler calls added, the
+        user hexes in position order — the per-request token for collect, so
+        overlapping requests can never misattribute a response)."""
         slots: list[int] = []
+        hexes: list[str] = []
         while len(calls) < MAX_BATCH:
             h = self._next_hex()
             if h is None:
                 break
             self._seen.add(h)
-            pos = len(calls)
-            self._slot_hexes[pos] = h
-            slots.append(pos)
+            hexes.append(h)
+            slots.append(len(calls))
             calls.append(("user.getUserLite", {"userId": h}))
-        return slots
+        return slots, hexes
 
-    def collect(self, results: list, slots: list[int]) -> None:
+    def collect(self, results: list, slots: list[int], hexes: list[str]) -> None:
         """Pick filler results out of a mixed_fetch response (positions
-        ``slots``); in-band 404s are collected as dead."""
-        for pos in slots:
+        ``slots``, users from the per-request ``hexes`` token); in-band 404s
+        are collected as dead."""
+        for pos, h in zip(slots, hexes):
             if pos >= len(results):
                 continue
             res = results[pos]
             if "error" in res:
                 err = res["error"]
                 if (err.get("data") or {}).get("httpStatus") == 404:
-                    self.dead.append(self._slot_hexes[pos])
+                    self.dead.append(h)
                 continue
-            self.fetched[self._slot_hexes[pos]] = res["result"]["data"]
+            self.fetched[h] = res["result"]["data"]
 
     def stmts(self) -> list[str]:
         """Upsert statements for the fetched fillers + dead markers."""
         return upsert_stmts(self.fetched) + mark_dead_stmts(self.dead)
+
+    def save_state(self) -> None:
+        """No-op: this filler has no state file — its pools are re-derived
+        from the DB every run (the FillerPool calls save_state on every
+        registered filler)."""
 
 
 def check_due(interval: int) -> bool:

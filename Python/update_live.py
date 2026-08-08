@@ -27,17 +27,18 @@ Per run:
      emitting endedAt (e.g. 15596-15598, stuck since 2026-02).
   3. Battle docs upserted via insert_battle — refreshes the mutable stats of
      live battles (damages, hit counts, won rounds).
-  4. Per-entity battle rankings for live battles: dataTypes damage/points ×
-     sides attacker/defender × types user/country/mu, limit=100 + cursor
-     pagination — batched (<=BODY_CAP calls/request) AND continuously
-     pipelined (WORKERS=16 requests in flight; the walk was sequential until
-     2026-08-04 and one sync of the live battles took 30-60 s), upserted via
-     insert_battle_ranking_entry on a background flusher thread (the DB
-     writes no longer stall the API walk). Since 2026-08-07 the requests are
-     MIXED: the slack slots (up to MAX_BATCH=50 total calls) carry
-     user.getUserLite calls from the users backfill queue
-     (update_users_lite.Filler) — the walk keeps its request count while the
-     queue drains at no extra cost. Pagination is capped at LIVE_PAGES
+     4. Per-entity battle rankings for live battles: dataTypes damage/points ×
+        sides attacker/defender × types user/country/mu, limit=100 + cursor
+        pagination — batched (<=BODY_CAP calls/request) AND continuously
+        pipelined (WORKERS=16 requests in flight; the walk was sequential until
+        2026-08-04 and one sync of the live battles took 30-60 s), upserted via
+        insert_battle_ranking_entry on a background flusher thread (the DB
+        writes no longer stall the API walk). Since 2026-08-07 the requests are
+        MIXED: the slack slots (up to MAX_BATCH=50 total calls) carry filler
+        calls from the filler pool (Python/fillers.py — user-lite, transaction
+        window, itemMarket code walks, user walks) — the walk keeps its request
+        count while the backfills drain at no extra cost. Pagination is capped
+        at LIVE_PAGES
      (3) per combo: the rows are partial by design (the final end-of-battle
      fetch overwrites them) and the site only shows the top of each ranking,
      so deep pages would only buy discarded rows — the API takes ~25 s to
@@ -86,8 +87,7 @@ from utils import (
     read_json,
     write_json,
 )
-from update_transactions import TransactionFiller
-from update_users_lite import Filler
+from fillers import FillerPool, build_filler_pool
 
 STATE_FILE = os.path.join(STATE_DIR, "live_state.json")
 
@@ -104,25 +104,15 @@ LIVE_PAGES = 3          # pagination depth cap per live combo (300 entries).
 DATA_TYPES = ("damage", "points")
 
 
-def fetch_live_battles(s: requests.Session, filler: Filler | None = None,
-                       txn: TransactionFiller | None = None) -> list[dict]:
-    """ALL active battles in one request (fillers top up the slack slots)."""
+def fetch_live_battles(s: requests.Session, pool: FillerPool | None = None) -> list[dict]:
+    """ALL active battles in one request (the filler pool tops up the slack)."""
     calls = [("battle.getBattles", {"isActive": True, "limit": 100, "cursor": FUTURE_CURSOR})]
-    if filler is not None:
-        slots = filler.top_up(calls)
-    else:
-        slots = []
-    if txn is not None:
-        tslots = txn.top_up(calls)
-    else:
-        tslots = []
+    slots, req = pool.top_up(calls) if pool is not None else ([], [])
     out = mixed_fetch(s, calls)
     if "error" in out[0]:
         raise RuntimeError(f"getBattles: {out[0]['error']}")
-    if filler is not None and slots:
-        filler.collect(out, slots)
-    if txn is not None and tslots:
-        txn.collect(out, tslots)
+    if pool is not None and req:
+        pool.collect(out, req)
     return out[0]["result"]["data"]["items"]
 
 
@@ -201,8 +191,7 @@ class EndpointDown(RuntimeError):
 
 
 def fetch_live_rankings(s: requests.Session, battles: list[dict], dbname: str,
-                        filler: Filler | None = None,
-                        txn: TransactionFiller | None = None) -> tuple[int, int]:
+                        fpool: FillerPool | None = None) -> tuple[int, int]:
     """Per-entity battle rankings for live battles (partial, growing).
 
     Battles whose DB ended_at is already set are skipped: they ended between
@@ -322,10 +311,12 @@ def fetch_live_rankings(s: requests.Session, battles: list[dict], dbname: str,
 
     def fill() -> None:
         """Submit batched bodies until the pool is full or no work is left.
-        Each body = up to BODY_CAP ranking calls, topped up with getUserLite
-        + transaction-window filler calls (mixed batch) — the slack slots pay
-        for the user-lite backfill queue and the transaction window at no
-        extra request cost."""
+        Each body = up to BODY_CAP ranking calls, topped up with the filler
+        pool (user-lite + transaction window + itemMarket + user walks,
+        mixed batch) — the slack slots pay for the backfills at no extra
+        request cost. The per-request req token travels with the future, so
+        collect dispatches against THIS body's filler calls even while other
+        bodies are in flight."""
         nonlocal requests_n
         while pending and len(inflight) < WORKERS:
             combos: list = []
@@ -340,13 +331,8 @@ def fetch_live_rankings(s: requests.Session, battles: list[dict], dbname: str,
                 calls.append(("battleRanking.getRanking", payload))
             if not calls:
                 break
-            slots: list[int] = []
-            if filler is not None:
-                slots = filler.top_up(calls)
-            tslots: list[int] = []
-            if txn is not None:
-                tslots = txn.top_up(calls)
-            inflight[pool.submit(fetch_body, calls)] = (combos, slots, tslots)
+            _, req = fpool.top_up(calls) if fpool is not None else ([], [])
+            inflight[pool.submit(fetch_body, calls)] = (combos, req)
             requests_n += 1
 
     def drain() -> None:
@@ -377,7 +363,7 @@ def fetch_live_rankings(s: requests.Session, battles: list[dict], dbname: str,
         while inflight:
             done, _ = wait(list(inflight), return_when=FIRST_COMPLETED)
             for fut in done:
-                combos, slots, tslots = inflight.pop(fut)
+                combos, req = inflight.pop(fut)
                 try:
                     data, failed = fut.result()
                 except EndpointDown as exc:
@@ -406,10 +392,8 @@ def fetch_live_rankings(s: requests.Session, battles: list[dict], dbname: str,
                     else:
                         cursors.pop(c, None)
                         active.discard(c)
-                if filler is not None and slots:
-                    filler.collect(data, slots)
-                if txn is not None and tslots:
-                    txn.collect(data, tslots)
+                if fpool is not None and req:
+                    fpool.collect(data, req)
                 # The ranking endpoint intermittently 400s for minutes at a
                 # time (ranking docs rewritten at battle end). If most RANKING
                 # calls of a request fail, the endpoint is down — abort and
@@ -458,12 +442,14 @@ def main() -> int:
     dbname = args.db
 
     s = make_session(pool_size=16)
-    filler = Filler(dbname)
-    # Transaction window filler (probes + bucket pages) rides the same slack;
-    # WARERA_TX_FILLER=0 (viewer --transactions 0) disables it.
-    txn = TransactionFiller(dbname) if os.environ.get("WARERA_TX_FILLER", "1") != "0" else None
+    # The filler pool fills every mixed batch's slack (see Python/fillers.py):
+    # user-lite + transaction window (probes/buckets) + itemMarket code walks
+    # + user transaction walks, in priority order; statements are flushed and
+    # state saved at the end of the run. WARERA_TX_FILLER=0 (viewer
+    # --transactions 0) disables the transaction fillers.
+    pool = build_filler_pool(dbname)
     try:
-        live = fetch_live_battles(s, filler, txn)
+        live = fetch_live_battles(s, pool)
     except RuntimeError as exc:
         print(f"API failure: {exc}", file=sys.stderr)
         _flush_safe(dbname)
@@ -471,33 +457,26 @@ def main() -> int:
     print(f"live battles from API: {len(live)}", flush=True)
 
     try:
-        _sync(s, live, args, dbname, filler, txn)
+        _sync(s, live, args, dbname, pool)
     except RuntimeError as exc:
         if str(exc).startswith("DB error"):
             print(f"DB failure: {exc}", file=sys.stderr)
             _flush_safe(dbname)
             return 2
         raise
-    # Flush filler upserts (user.getUserLite docs fetched as batch slack)
-    fs = filler.stmts()
-    if fs:
-        exec_many(fs, dbname)
-        print(f"  filler: {len(filler.fetched)} users upserted, "
-              f"{len(filler.dead)} dead marked", flush=True)
-    # Flush transaction filler (window probes + bucket pages) + shared state
-    if txn is not None:
-        ts = txn.stmts()
-        if ts:
-            exec_batch(ts, dbname)
-            print(f"  txn filler: {len(ts)} transactions stored", flush=True)
-        txn.save_state()
+    # Flush the filler pool: user-lite upserts + transaction window items +
+    # itemMarket/user history items + user done-marks, then their state files
+    ps = pool.stmts()
+    if ps:
+        exec_batch(ps, dbname)
+        print(f"  filler pool: {len(ps)} statements flushed", flush=True)
+    pool.save_state()
     _flush_safe(dbname)
     return 0
 
 
 def _sync(s: requests.Session, live: list[dict], args, dbname: str,
-          filler: Filler | None = None,
-          txn: TransactionFiller | None = None) -> None:
+          pool: FillerPool | None = None) -> None:
     """Reconciliation + battle-doc refresh + (throttled) live rankings."""
     db_active = active_battle_hexes(dbname)
 
@@ -516,7 +495,7 @@ def _sync(s: requests.Session, live: list[dict], args, dbname: str,
         state = read_json(STATE_FILE, {})
         last = state.get("last_ranking_at", 0)
         if time.time() - last >= args.ranking_interval:
-            reqs, entries = fetch_live_rankings(s, live, dbname, filler, txn)
+            reqs, entries = fetch_live_rankings(s, live, dbname, pool)
             print(f"rankings: {entries} live entries in {reqs} requests", flush=True)
             write_json(STATE_FILE, {**state, "last_ranking_at": int(time.time())})
         else:
