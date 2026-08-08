@@ -228,7 +228,12 @@ WARERA_DB_URL='postgresql+psycopg://postgres:postgres@localhost:5433/{db}' \
 
 Local read-only web viewer + auto-updater (battles/rounds/countries, live
 battle sync, rankings, users, bounties, **transactions** — every 15 s; the
-cycle also runs update_users_lite.py: backfills user.getUserLite basic info
+cycle steps run as parallel subprocesses launched 0.2 s apart
+(`LAUNCH_STAGGER` in `Python/viewer/updater.py` — raise it if the API ever
+answers 429) — the API serves every batched request in ~0.6-1.7 s
+regardless of size, so parallel launches cut the cycle's wall time from
+~6-8 s to ~5 s; the cycle
+also runs update_users_lite.py: backfills user.getUserLite basic info
 for up to 100 unchecked users per run, wealth/damage rankings first, then
 re-checks users active within 4 days only — users.last_active_at, ≤50 per
 cycle, ≥48 h apart, real lastConnectionAt stored on fetch, activity check
