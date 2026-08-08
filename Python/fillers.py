@@ -66,6 +66,44 @@ ITEM_MARKET_CODES = [
 USER_TX_POOL_SIZE = 100
 
 
+def _step_walk(entry: dict, its: list[dict], no_cursor: bool) -> str:
+    """Advance one page of a full-history walk (UserTxFiller / ItemMarketFiller).
+
+    Cursor chains walk DOWN from the newest page. The top of each pass is
+    remembered (walk_top_id / walk_top_ms) so the pass's LAST no-cursor page
+    can prove nothing new arrived while the pass ran — transactions created
+    mid-walk sit above the pass's top, a downward walk never re-visits them,
+    and without this re-check the user/code would be stamped done with those
+    rows missing forever (the 72 h window covers them only while it runs).
+    New items found at the re-check start a bounded catch-up pass that walks
+    only the band (old_top, new_top] (stop line = the previous pass's top).
+
+    Returns:
+      "done"    — the no-cursor page's newest item is the pass's own top:
+                  the walk covered everything → caller marks finished;
+      "continue" — keep walking (entry's cursor_ms advanced);
+      "recheck" — the cursor was reset to None: the next offer re-fetches
+                  the top of the history (band covered / oldest reached).
+    """
+    if no_cursor:
+        top_id = its[0]["_id"]
+        top_ms = to_unix_ms(its[0]["createdAt"])
+        if entry.get("walk_top_id") == top_id:
+            return "done"
+        # pass start — fresh walk, or catch-up after new items appeared
+        entry["catch_to_ms"] = entry.get("walk_top_ms")  # None → full pass
+        entry["walk_top_id"] = top_id
+        entry["walk_top_ms"] = top_ms
+        entry["cursor_ms"] = to_unix_ms(its[-1]["createdAt"]) + 1
+        return "continue"
+    entry["cursor_ms"] = to_unix_ms(its[-1]["createdAt"]) + 1
+    if (entry.get("catch_to_ms") is not None
+            and to_unix_ms(its[-1]["createdAt"]) <= entry["catch_to_ms"]):
+        entry["cursor_ms"] = None  # the catch-up band is covered → re-check
+        return "recheck"
+    return "continue"
+
+
 class FillerPool:
     """Priority-ordered filler scheduler for one consumer run.
 
@@ -121,16 +159,17 @@ class ItemMarketFiller:
     item codes (the API's itemCode filter bypasses the rolling 72 h window).
 
     Each code has its own cursor chain (one page per batch, so codes walk
-    down in parallel); a code is done when a page comes back empty — its
-    oldest transaction reached. Payload per page:
+    down in parallel); a code is done when the top-of-history re-check
+    confirms the walk covered everything (its oldest row reached AND no new
+    rows appeared while the walk ran). Payload per page:
         {"transactionType": "itemMarket", "itemCode": <code>, limit: 100,
          direction: "forward", cursor: <last item ms + 1>}
     (no-cursor first page = the newest of the code's history). Items flow
     through the same idempotent insert_transaction upsert as the window.
 
     State: state/item_market_state.json — {codes: {<code>: {cursor_ms,
-    done}}, stats: {}}. Re-walking a code whose state was lost is
-    idempotent (ON CONFLICT + _id dedupe).
+    walk_top_id, walk_top_ms, catch_to_ms, done}}, stats: {}}. Re-walking a
+    code whose state was lost is idempotent (ON CONFLICT + _id dedupe).
     """
 
     ENDPOINT = "transaction.getPaginatedTransactions"
@@ -141,15 +180,15 @@ class ItemMarketFiller:
         self._offer = 0       # round-robin position into ITEM_MARKET_CODES
         self._dirty = False
 
-    def top_up(self, calls: list[tuple[str, dict]]) -> tuple[list[int], list[str]]:
+    def top_up(self, calls: list[tuple[str, dict]]) -> tuple[list[int], list[tuple[str, bool]]]:
         """One page per pending code (round-robin); returns (positions, the
-        codes in position order — the collect token)."""
+        (code, was-cursor-less) pairs in position order — the collect token)."""
         slots: list[int] = []
-        codes: list[str] = []
+        tokens: list[tuple[str, bool]] = []
         state = self.state.setdefault("codes", {})
         n = len(ITEM_MARKET_CODES)
         if not n:
-            return slots, codes
+            return slots, tokens
         base = self._offer
         last_k = -1
         for k in range(n):
@@ -163,19 +202,21 @@ class ItemMarketFiller:
             p = {"transactionType": "itemMarket", "itemCode": code,
                  "limit": PAGE_LIMIT, "direction": "forward"}
             cursor = entry.get("cursor_ms")
+            no_cursor = cursor is None
             if cursor:
                 p["cursor"] = str(cursor)
             slots.append(len(calls))
-            codes.append(code)
+            tokens.append((code, no_cursor))
             calls.append((self.ENDPOINT, p))
         if last_k >= 0:
             self._offer = (base + last_k + 1) % n
-        return slots, codes
+        return slots, tokens
 
-    def collect(self, results: list, slots: list[int], codes: list[str]) -> None:
+    def collect(self, results: list, slots: list[int],
+                tokens: list[tuple[str, bool]]) -> None:
         state = self.state.setdefault("codes", {})
         stats = self.state.setdefault("stats", {})
-        for pos, code in zip(slots, codes):
+        for pos, (code, no_cursor) in zip(slots, tokens):
             if pos >= len(results):
                 continue
             res = results[pos]
@@ -185,13 +226,19 @@ class ItemMarketFiller:
             its = (res["result"]["data"].get("items")) or []
             entry = state.setdefault(code, {})
             if its:
-                entry["cursor_ms"] = to_unix_ms(its[-1]["createdAt"]) + 1
                 self._items.extend(its)
                 stats["items"] = stats.get("items", 0) + len(its)
-            else:
-                # empty page = the code's oldest transaction reached
+                if _step_walk(entry, its, no_cursor) == "done":
+                    entry["done"] = True
+                    entry.pop("cursor_ms", None)
+            elif no_cursor:
+                # a code with no market history at all → done on the spot
                 entry["done"] = True
                 entry.pop("cursor_ms", None)
+            else:
+                # the code's oldest row reached → re-check the top for rows
+                # created while the walk ran
+                entry["cursor_ms"] = None
             self._dirty = True
         if self._dirty:
             stats["pages"] = stats.get("pages", 0) + len(slots)
@@ -213,16 +260,21 @@ class UserTxFiller:
     Pool = the first USER_TX_POOL_SIZE unfinished users by total_xp DESC
     (users.transactions_scraped_at IS NULL). Each user is a cursor chain
     (one page per batch — slots #25 and #26 can walk different users in the
-    same request). An EMPTY page means the scrape is confirmed finished
-    (the user's oldest transaction reached; a user with no transactions
-    finishes on the first page): the user is marked in the DB
-    (transactions_scraped_at = NOW()) and the pool refills with the
-    next-by-XP user — a conveyor capped at USER_TX_POOL_SIZE.
+    same request). A user is marked done ONLY when the walk end's
+    top-of-history re-check confirms nothing new arrived while the walk ran
+    (a downward walk never re-visits its own top, so transactions created
+    mid-walk would otherwise be missing — the re-check starts a bounded
+    catch-up pass over just the new band instead of stamping done). A user
+    with no transactions finishes on the first page. In-band 404s (deleted
+    accounts) drop the user and stamp it done — the API will never serve
+    its history. On any other error the user keeps its cursor and is
+    retried next run.
 
-    In-progress cursors live in state/user_tx_state.json ({users: {hex:
-    {cursor_ms}}, stats: {}}). Finished markers live in the DB, so a state
-    reset only re-walks interrupted users (idempotent, ON CONFLICT + _id
-    dedupe) and never re-walks finished ones.
+    In-progress cursors + pass metadata live in state/user_tx_state.json
+    ({users: {hex: {cursor_ms, walk_top_id, walk_top_ms, catch_to_ms}},
+    stats: {}}). Finished markers live in the DB, so a state reset only
+    re-walks interrupted users (idempotent, ON CONFLICT + _id dedupe) and
+    never re-walks finished ones.
     """
 
     ENDPOINT = "transaction.getPaginatedTransactions"
@@ -235,6 +287,7 @@ class UserTxFiller:
         self.state = read_json(USER_TX_STATE, {"users": {}, "stats": {}})
         self._items: list[dict] = []
         self._marks: list[str] = []
+        self._dead: set[str] = set()
         self._offer = 0       # round-robin position into the active set
         self._dirty = False
 
@@ -251,22 +304,23 @@ class UserTxFiller:
             "ORDER BY total_xp DESC NULLS LAST\n"
             f"LIMIT {n};", self.db)
         for (h,) in rows:
-            if h not in users:
+            if h not in users and h not in self._dead:
                 users[h] = {}
                 self._dirty = True
 
-    def top_up(self, calls: list[tuple[str, dict]]) -> tuple[list[int], list[str]]:
+    def top_up(self, calls: list[tuple[str, dict]]) -> tuple[list[int], list[tuple[str, bool]]]:
         """One page per active user (round-robin); returns (positions, the
-        user hexes in position order — the collect token)."""
+        (user hex, was-cursor-less) pairs in position order — the collect
+        token)."""
         slots: list[int] = []
-        hexes: list[str] = []
+        tokens: list[tuple[str, bool]] = []
         users = self.state.setdefault("users", {})
         if len(users) < USER_TX_POOL_SIZE:
             self._refill()
         keys = list(users.keys())
         n = len(keys)
         if not n:
-            return slots, hexes
+            return slots, tokens
         base = self._offer
         last_k = -1
         for k in range(n):
@@ -276,34 +330,49 @@ class UserTxFiller:
             h = keys[(base + k) % n]
             p = {"userId": h, "limit": PAGE_LIMIT, "direction": "forward"}
             cursor = (users[h] or {}).get("cursor_ms")
+            no_cursor = cursor is None
             if cursor:
                 p["cursor"] = str(cursor)
             slots.append(len(calls))
-            hexes.append(h)
+            tokens.append((h, no_cursor))
             calls.append((self.ENDPOINT, p))
         if last_k >= 0:
             self._offer = (base + last_k + 1) % n
-        return slots, hexes
+        return slots, tokens
 
-    def collect(self, results: list, slots: list[int], hexes: list[str]) -> None:
+    def collect(self, results: list, slots: list[int],
+                tokens: list[tuple[str, bool]]) -> None:
         users = self.state.setdefault("users", {})
         stats = self.state.setdefault("stats", {})
-        for pos, h in zip(slots, hexes):
+        for pos, (h, no_cursor) in zip(slots, tokens):
             if pos >= len(results):
                 continue
             res = results[pos]
             if "error" in res:
-                stats["failed_calls"] = stats.get("failed_calls", 0) + 1
-                continue  # retried by the next run — the user keeps the cursor
+                if (res["error"].get("data") or {}).get("httpStatus") == 404:
+                    # deleted account: the API will never serve its history
+                    users.pop(h, None)
+                    self._dead.add(h)
+                    self._marks.append(h)
+                    stats["dead"] = stats.get("dead", 0) + 1
+                else:
+                    stats["failed_calls"] = stats.get("failed_calls", 0) + 1
+                continue  # non-404 errors: the user keeps the cursor
             its = (res["result"]["data"].get("items")) or []
-            if its:
-                entry = users.setdefault(h, {})
-                entry["cursor_ms"] = to_unix_ms(its[-1]["createdAt"]) + 1
-                self._items.extend(its)
-                stats["items"] = stats.get("items", 0) + len(its)
-            else:
-                # empty page = confirmed finished (the user's oldest
-                # transaction reached) → mark + drop from the pool
+            if not its:
+                if no_cursor:
+                    # a user with NO transactions at all → done on the spot
+                    users.pop(h, None)
+                    self._marks.append(h)
+                else:
+                    # the user's oldest transaction reached → re-check the
+                    # top for transactions created while the walk ran
+                    users.setdefault(h, {})["cursor_ms"] = None
+                self._dirty = True
+                continue
+            self._items.extend(its)
+            stats["items"] = stats.get("items", 0) + len(its)
+            if _step_walk(users.setdefault(h, {}), its, no_cursor) == "done":
                 users.pop(h, None)
                 self._marks.append(h)
             self._dirty = True
