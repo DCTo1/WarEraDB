@@ -1,5 +1,10 @@
 """HTML/UI helpers: page layout, escaping, theme + timer JS, error pages.
 
+The header countdown (TIMER_JS) and the /update-status log (LOG_JS) are fed by
+Server-Sent Events since 2026-08-13 — /timer/stream and /update-status/stream,
+both served by viewer/server.py from generators in viewer/updater.py. Both keep
+their old poll as a fallback for clients whose stream never delivers a frame.
+
 Ported unchanged from the original extra/db_web.py — same markup, same CSS
 variables, same dark/light theme toggle (localStorage, no server state).
 """
@@ -58,19 +63,120 @@ def battle_link(bid: str, btype: str, defender: str, attacker: str) -> str:
 
 TIMER_JS = """<script>
 (function () {
+  // Header countdown, pushed over /timer/stream (SSE): one frame when a run
+  // starts and one when the next is scheduled — ~2 per 15 s cycle, replacing
+  // the 1 req/s/tab poll this used to be (the viewer speaks HTTP/1.0, so that
+  // poll opened a TCP connection and a server thread every second per tab).
+  // Frames carry next_at plus the server's own now, so the difference converts
+  // the deadline into the LOCAL clock (clock skew cancels out) and the 1 s tick
+  // below runs entirely offline between frames.
   var lbl = document.getElementById('upd_lbl');
   var sec = document.getElementById('upd_sec');
-  function tick() {
-    fetch('/timer').then(function (r) { return r.json(); }).then(function (d) {
-      if (d.running) { lbl.textContent = 'updating\\u2026'; sec.textContent = ''; }
-      else if (d.seconds !== null && d.seconds !== undefined) {
-        lbl.textContent = 'next update in';
-        sec.textContent = String(Math.max(1, Math.ceil(d.seconds)));
-      }
-    }).catch(function () {});
+  var deadline = null, running = false, es = null, polling = false, got = false;
+  function apply(d) {
+    got = true;
+    running = !!d.running;
+    if (d.next_at && d.now) deadline = Date.now() / 1000 + (d.next_at - d.now);
+    else if (d.seconds !== null && d.seconds !== undefined) deadline = Date.now() / 1000 + d.seconds;
+    else deadline = null;
+    render();
   }
-  tick();
-  setInterval(tick, 1000);
+  function render() {
+    if (running) { lbl.textContent = 'updating\\u2026'; sec.textContent = ''; return; }
+    if (deadline === null) return;
+    lbl.textContent = 'next update in';
+    sec.textContent = String(Math.max(1, Math.ceil(deadline - Date.now() / 1000)));
+  }
+  function poll() {
+    // Fallback: no EventSource, a stream that closed for good, or one that
+    // never delivered a frame (an intermediary buffering text/event-stream).
+    if (polling) return;
+    polling = true;
+    if (es) { es.close(); es = null; }
+    function tick() {
+      fetch('/timer').then(function (r) { return r.json(); }).then(apply).catch(function () {});
+    }
+    tick();
+    setInterval(tick, 1000);
+  }
+  setInterval(render, 1000);
+  if (window.EventSource) {
+    es = new EventSource('/timer/stream');
+    es.addEventListener('timer', function (e) { apply(JSON.parse(e.data)); });
+    // EventSource reconnects by itself; only a permanent close needs the poll.
+    es.onerror = function () { if (es && es.readyState === 2) poll(); };
+    setTimeout(function () { if (!got) poll(); }, 10000);
+  } else {
+    poll();
+  }
+})();
+</script>"""
+
+LOG_JS = """<script>
+(function () {
+  // /update-status log over /update-status/stream (SSE): the current run's
+  // buffered output on connect, then each line as the updater tees it. This
+  // replaces the page's 2 s meta-refresh — which NAV_JS re-implements as a full
+  // pjax re-fetch of the whole page — with one connection pushing single lines.
+  // It lives in the frame rather than in the page body because pjax swaps
+  // main.innerHTML, and inline scripts inserted that way never execute; a
+  // MutationObserver watches for the page's #upd_log arriving and leaving.
+  if (!window.EventSource) return;
+  var main = document.getElementById('main');
+  if (!main) return;
+  var es = null, TAIL = 120;
+  function renderHead(d) {
+    var el = document.getElementById('upd_head');
+    if (!el) return;
+    if (d.running) el.innerHTML = '<p>Update running \\u2014 streaming live.</p>';
+    else if (d.done) el.innerHTML = '<p class="' + (d.rc === 0 ? 'ok' : 'err') + '">Update ' +
+      (d.rc === 0 ? 'finished (exit 0). ' : 'failed (exit ' + d.rc + '). ') +
+      '<a href="/">\\u2190 back to overview</a></p>';
+    else {
+      // Before the first run of a boot: borrow the header chip's countdown.
+      var s = document.getElementById('upd_sec');
+      el.innerHTML = '<p class="err">No update running \\u2014 next scheduled run in ' +
+        ((s && s.textContent) || '?') + 's.</p>';
+    }
+  }
+  function onLog(e) {
+    var d = JSON.parse(e.data);
+    var pre = document.getElementById('upd_log');
+    if (!pre) return;
+    if (d.reset) pre.textContent = '';       // a new run: the page only ever shows the current one
+    if (d.lines && d.lines.length) {
+      pre.textContent += d.lines.join('\\n') + '\\n';
+      var ls = pre.textContent.split('\\n');
+      // Same tail the server renders (lines[-120:]), so a stream left open for
+      // hours cannot grow the page without bound.
+      if (ls.length > TAIL + 1) pre.textContent = ls.slice(ls.length - TAIL - 1).join('\\n');
+    }
+    if (!pre.textContent) pre.textContent = 'no output yet\\u2026';
+    if (!window.__wdbStream) {
+      // A frame actually arrived, so the stream works end to end (cloudflared
+      // included) and NAV_JS can stop honouring the 2 s meta-refresh.
+      window.__wdbStream = true;
+      if (window.__wdbCancelRefresh) window.__wdbCancelRefresh();
+    }
+    renderHead(d);
+  }
+  function sync() {
+    if (document.getElementById('upd_log')) {
+      if (!es) {
+        es = new EventSource('/update-status/stream');
+        es.addEventListener('log', onLog);
+        es.onerror = function () { if (es && es.readyState === 2) sync2(); };
+      }
+    } else if (es) {
+      sync2();
+    }
+  }
+  function sync2() {   // tear down: pjax navigated away, or the stream died
+    if (es) { es.close(); es = null; }
+    window.__wdbStream = false;
+  }
+  new MutationObserver(sync).observe(main, { childList: true });
+  sync();
 })();
 </script>"""
 
@@ -203,8 +309,14 @@ NAV_JS = """<script>
   var scheme = /^[a-z][a-z0-9+.-]*:/i;
   function schedule(url, secs) {
     if (timer) { clearTimeout(timer); timer = null; }
+    // Once the /update-status SSE (LOG_JS) is delivering, it carries the
+    // updates — don't also re-fetch the whole page every 2 s.
+    if (window.__wdbStream) return;
     timer = setTimeout(function () { nav(url, false); }, secs * 1000);
   }
+  window.__wdbCancelRefresh = function () {
+    if (timer) { clearTimeout(timer); timer = null; }
+  };
   function swap(html, url, push) {
     var doc = new DOMParser().parseFromString(html, 'text/html');
     var fresh = doc.getElementById('main');
@@ -368,4 +480,5 @@ def layout(title: str, body: str, refresh: bool = False) -> str:
 {THEME_JS}
 {MORE_JS}
 {SEARCH_JS}
-{NAV_JS}</body></html>"""
+{NAV_JS}
+{LOG_JS}</body></html>"""

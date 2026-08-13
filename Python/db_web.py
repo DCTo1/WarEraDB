@@ -28,8 +28,11 @@ Pages
     /countries   bounty money per country (total vs ended-battles pools)
     /stats       endpoint usage analytics (endpoints / endpoints_used tables)
     /sql         read-only SQL console (SELECT/EXPLAIN only, capped at 1000 rows)
-    /update-status  log of the automatic updater runs
-    /timer       JSON {"running": bool, "seconds": n} — polled by the header timer
+    /update-status  log of the automatic updater runs (pushed live over SSE)
+    /timer       JSON {"running": bool, "seconds": n, "next_at": t, "now": t} —
+                 the poll fallback for the header timer
+    /timer/stream          SSE: header-countdown state, pushed on every change
+    /update-status/stream  SSE: updater log lines, pushed as they are tee'd
 
 The DB auto-updates every UPDATE_INTERVAL seconds (default 15) in a background
 thread: Python/update_battles.py brings battles/rounds/countries up to the
@@ -50,7 +53,12 @@ window-backfill pages + itemMarket item-code walks + XP-ranked user walks
 in their slack slots, via the priority-ordered filler pool
 (Python/fillers.py; --transactions 0 disables it).
 The header timer shows the seconds until the next run and switches to
-"updating…" while a run is in progress.
+"updating…" while a run is in progress. Its state — and the /update-status
+log — are PUSHED over Server-Sent Events (/timer/stream,
+/update-status/stream), so neither polls: the countdown ticks locally
+between the ~2 frames a 15 s cycle produces. Clients whose stream never
+delivers a frame (no EventSource, a buffering proxy) fall back to the old
+/timer poll and the 2 s meta-refresh.
 
 Stdlib only for the viewer itself (the spawned pipeline scripts use
 SQLAlchemy + requests, already in requirements.txt). All reads go through
