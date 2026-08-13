@@ -28,6 +28,8 @@ _ms = _bytes = 0
 
 _cpu_last: tuple[float, float] | None = None
 _docker_cache: tuple[float, str] | None = None
+_docker_lock = threading.Lock()
+_docker_busy = False
 
 
 def record(path: str, ms: float, size: int, ip: str, *, err: bool = False) -> None:
@@ -80,12 +82,9 @@ def _proc_stats() -> tuple[float, float, int]:
     return rss_mb, cpu_s, threads
 
 
-def _docker_stats() -> str:
-    """CPU/mem line for the timescale container (cached DOCKER_TTL seconds)."""
-    global _docker_cache
-    now = time.monotonic()
-    if _docker_cache and now - _docker_cache[0] < DOCKER_TTL:
-        return _docker_cache[1]
+def _docker_refresh() -> None:
+    """Shell out to docker and store the result. Runs on a worker thread only."""
+    global _docker_cache, _docker_busy
     text = ""
     try:
         names = subprocess.run(
@@ -99,8 +98,31 @@ def _docker_stats() -> str:
                 capture_output=True, text=True, timeout=10).stdout.strip()
     except (OSError, subprocess.SubprocessError):
         pass
-    _docker_cache = (now, text)
-    return text
+    with _docker_lock:
+        _docker_cache = (time.monotonic(), text)
+        _docker_busy = False
+
+
+def _docker_stats() -> str:
+    """CPU/mem line for the timescale container — cached, never blocks.
+
+    `docker ps` + `docker stats --no-stream` take ~1 s together, which used to
+    be the single largest chunk of a /usage render: the page paid it on its
+    first load and again every DOCKER_TTL while it meta-refreshes. Serve the
+    cached line and refresh it on a daemon thread instead — the fresh value
+    lands on the next auto-refresh, and the empty first reading renders as the
+    "docker not reachable" note the page already has.
+    """
+    global _docker_busy
+    with _docker_lock:
+        cached = _docker_cache
+        stale = not cached or time.monotonic() - cached[0] >= DOCKER_TTL
+        start = stale and not _docker_busy
+        if start:
+            _docker_busy = True
+    if start:
+        threading.Thread(target=_docker_refresh, daemon=True).start()
+    return cached[1] if cached else ""
 
 
 def snapshot() -> dict:
