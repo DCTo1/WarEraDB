@@ -4,10 +4,11 @@ Every UPDATE_INTERVAL seconds (default 15) a scheduler thread runs
 Python/update_battles.py --force-active, then Python/update_live.py, then
 Python/insert_ranking_sample.py --latest N (skipped when N == 0), then
 Python/update_weekly_ranking.py (hourly self-throttled snapshot fetch),
-then Python/update_users_lite.py. A run is skipped (retried half an
-interval later) if a previous run is still going. Output is tee'd into
-UPDATE_STATE and shown on /update-status; /timer serves the countdown for
-the header.
+then Python/update_users_lite.py, then Python/rollup_endpoint_usage.py
+(daily self-throttled endpoints_used rollup + retention). A run is skipped
+(retried half an interval later) if a previous run is still going. Output
+is tee'd into UPDATE_STATE and shown on /update-status; /timer serves the
+countdown for the header.
 
 Both of those are PUSHED over SSE (2026-08-13): timer_events() feeds the
 header countdown (/timer/stream) and log_events() feeds the /update-status
@@ -48,7 +49,7 @@ import threading
 import time
 from typing import Iterator
 
-from .config import (LIVE_SCRIPT, MAX_UPDATE_LINES, RANKING_SCRIPT, UPDATE_INTERVAL, UPDATE_SCRIPT, USER_LITE_SCRIPT, WEEKLY_SCRIPT, settings)
+from .config import (LIVE_SCRIPT, MAX_UPDATE_LINES, RANKING_SCRIPT, ROLLUP_SCRIPT, UPDATE_INTERVAL, UPDATE_SCRIPT, USER_LITE_SCRIPT, WEEKLY_SCRIPT, settings)
 from .queries import query_dicts
 from .ui import esc, layout
 
@@ -221,6 +222,11 @@ def _run_updater() -> None:
                           f"user lite: update_users_lite.py --limit {settings.user_lite_limit}",
                           [sys.executable, USER_LITE_SCRIPT, "--limit",
                            str(settings.user_lite_limit)]))
+        # Self-throttled to ~once/day (Python/rollup_endpoint_usage.py) — makes
+        # no API calls, so it always runs; almost every invocation is a
+        # single cheap MAX(day) check that finds nothing due.
+        steps.append(("rc6", "endpoint usage rollup: rollup_endpoint_usage.py",
+                      [sys.executable, ROLLUP_SCRIPT, "--db", db]))
         rcs: dict[str, int] = {}
         procs: dict[str, subprocess.Popen] = {}
         for i, (key, label, argv) in enumerate(steps):
@@ -236,14 +242,15 @@ def _run_updater() -> None:
                 _log(f"  launch failed: {exc}")
         if not rcs:
             with UPDATE_LOCK:
-                UPDATE_STATE["rc"] = _first_nonzero(rc0, 0, 0, 0, 0, 0)
+                UPDATE_STATE["rc"] = _first_nonzero(rc0, 0, 0, 0, 0, 0, 0)
                 _bump()
 
         def _record(key: str) -> None:
             with UPDATE_LOCK:
                 UPDATE_STATE["rc"] = _first_nonzero(
                     rc0, rcs.get("rc", 0), rcs.get("rc3", 0),
-                    rcs.get("rc2", 0), rcs.get("rc5", 0), rcs.get("rc4", 0))
+                    rcs.get("rc2", 0), rcs.get("rc5", 0), rcs.get("rc4", 0),
+                    rcs.get("rc6", 0))
                 _bump()
 
         def _tee_one(key: str, proc: subprocess.Popen) -> None:

@@ -29,7 +29,8 @@ def page_usage(q: dict) -> str:
     size, err = query_dicts(
         "SELECT pg_size_pretty(pg_database_size(current_database())) AS size,"
         " (SELECT count(*) FROM transactions) AS transactions,"
-        " (SELECT count(*) FROM endpoints_used) AS api_calls")
+        " (SELECT coalesce(sum(calls), 0) FROM endpoint_usage_daily_totals)"
+        " + (SELECT count(*) FROM endpoints_used) AS api_calls")
     if err:
         return error_page(err)
     db = size[0] if size else {}

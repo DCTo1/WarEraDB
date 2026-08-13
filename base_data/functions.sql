@@ -728,3 +728,43 @@ BEGIN
     INSERT INTO endpoints_used (endpoint_id, request_id) VALUES (v_id, p_request_id);
 END;
 $$ LANGUAGE plpgsql;
+
+-- rollup_endpoint_usage: folds endpoints_used rows older than p_cutoff into
+-- endpoint_usage_daily / endpoint_usage_daily_totals, then deletes them.
+-- Called by Python/rollup_endpoint_usage.py (throttled to ~once/day). Runs
+-- as one transaction — either a cutoff's rows fully move into the rollup
+-- tables and get deleted, or (on error) nothing does; ON CONFLICT upserts
+-- also make it safe to re-run over an already-rolled cutoff.
+CREATE OR REPLACE FUNCTION rollup_endpoint_usage(p_cutoff DATE)
+RETURNS VOID AS $$
+BEGIN
+    INSERT INTO endpoint_usage_daily (day, endpoint_id, calls, last_used)
+    SELECT date_used::date, endpoint_id, count(*), max(date_used)
+    FROM endpoints_used
+    WHERE date_used < p_cutoff
+    GROUP BY 1, 2
+    ON CONFLICT (day, endpoint_id) DO UPDATE SET
+        calls = endpoint_usage_daily.calls + EXCLUDED.calls,
+        last_used = GREATEST(endpoint_usage_daily.last_used, EXCLUDED.last_used);
+
+    -- Same count(DISTINCT) shape as REQUESTS_SQL (Python/viewer/pages/stats.py):
+    -- collapse to distinct (date_used, request_id) pairs by hash aggregation
+    -- first so the two count(DISTINCT)s never sort the rolled-up rows to disk.
+    INSERT INTO endpoint_usage_daily_totals (day, calls, req_exact, req_legacy)
+    SELECT day,
+           sum(c) AS calls,
+           count(DISTINCT request_id) FILTER (WHERE request_id <> 0) AS req_exact,
+           count(DISTINCT date_used)  FILTER (WHERE request_id = 0) AS req_legacy
+    FROM (SELECT date_used::date AS day, date_used, request_id, count(*) AS c
+          FROM endpoints_used
+          WHERE date_used < p_cutoff
+          GROUP BY 1, 2, 3) g
+    GROUP BY day
+    ON CONFLICT (day) DO UPDATE SET
+        calls = endpoint_usage_daily_totals.calls + EXCLUDED.calls,
+        req_exact = endpoint_usage_daily_totals.req_exact + EXCLUDED.req_exact,
+        req_legacy = endpoint_usage_daily_totals.req_legacy + EXCLUDED.req_legacy;
+
+    DELETE FROM endpoints_used WHERE date_used < p_cutoff;
+END;
+$$ LANGUAGE plpgsql;

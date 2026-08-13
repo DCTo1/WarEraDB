@@ -388,6 +388,30 @@ CREATE TABLE endpoints_used (
     date_used   TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+-- Daily rollup of endpoints_used, written by rollup_endpoint_usage.py
+-- (Python/rollup_endpoint_usage.py, throttled to ~once/day). Raw rows older
+-- than the rollup's cutoff are deleted after being folded in here, so these
+-- two tables are the only durable record of usage beyond the last few days
+-- — unlike endpoints_used itself they are NOT excluded from backups.
+CREATE TABLE endpoint_usage_daily (
+    day         DATE NOT NULL,
+    endpoint_id SMALLINT NOT NULL REFERENCES endpoints(id),
+    calls       BIGINT NOT NULL,
+    last_used   TIMESTAMPTZ NOT NULL,
+    PRIMARY KEY (day, endpoint_id)
+);
+
+-- Per-day request counts (can't be derived from endpoint_usage_daily: one
+-- HTTP request can carry calls to several endpoints in a mixed batch, so
+-- request-distinctness has to be computed before folding by endpoint — see
+-- REQUESTS_SQL in Python/viewer/pages/stats.py).
+CREATE TABLE endpoint_usage_daily_totals (
+    day        DATE PRIMARY KEY,
+    calls      BIGINT NOT NULL,
+    req_exact  BIGINT NOT NULL,   -- count(DISTINCT request_id) WHERE request_id <> 0
+    req_legacy BIGINT NOT NULL    -- count(DISTINCT date_used)  WHERE request_id = 0
+);
+
 
 -- =============================================================================
 -- 8. Users

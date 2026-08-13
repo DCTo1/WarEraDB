@@ -19,6 +19,7 @@ LIVE_SCRIPT = os.path.join(REPO, "Python", "update_live.py")
 RANKING_SCRIPT = os.path.join(REPO, "Python", "insert_ranking_sample.py")
 WEEKLY_SCRIPT = os.path.join(REPO, "Python", "update_weekly_ranking.py")
 USER_LITE_SCRIPT = os.path.join(REPO, "Python", "update_users_lite.py")
+ROLLUP_SCRIPT = os.path.join(REPO, "Python", "rollup_endpoint_usage.py")
 
 HEX_RE = re.compile(r"^[0-9a-f]{24}$")
 BATTLE_TYPES = ("war", "resistance", "tournament", "revolution")

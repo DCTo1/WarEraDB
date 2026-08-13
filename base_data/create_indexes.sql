@@ -80,19 +80,23 @@
 -- =============================================================================
 --  Endpoint usage
 --
---  endpoints_used is append-only; the stats page aggregates it. Both indexes
---  below stay commented out DELIBERATELY: /stats reports all-time totals, so
---  each of its two queries reads every row no matter what — an index prunes
---  nothing there and only taxes the insert path, which every pipeline flush
---  goes through. Measured 2026-08-13 at 3.5 M rows / 271 MB: the page runs its
---  two full scans in ~0.7 s wall (in parallel), against 5.0 s for the six
---  sequential queries it used to issue.
---
---  What DOES need doing eventually is bounding the growth (~700 k rows/day):
---  a daily rollup table + retention on the raw rows, after which a BRIN index
---  on date_used becomes worth adding (the remaining scans would be
---  recent-only, and the column is perfectly correlated with physical order).
+--  endpoints_used is append-only, but rollup_endpoint_usage.py (throttled to
+--  ~once/day) folds rows older than a few days into endpoint_usage_daily /
+--  endpoint_usage_daily_totals and deletes them, so the raw table stays
+--  small and recent-only instead of growing unbounded (measured 2026-08-13,
+--  pre-rollup: 3.5 M rows / 271 MB after 9 days). Because the remaining raw
+--  rows are always recent, a BRIN index on date_used is now worth it: it's
+--  tiny, near-free to maintain given date_used is perfectly correlated with
+--  physical insert order, and lets both the /stats "last 24h" query and the
+--  rollup function's own `WHERE date_used < cutoff` scan/delete prune chunks
+--  instead of seq-scanning. The per-endpoint / per-day btree indexes below
+--  stay commented out — the raw table's queries all filter by date_used
+--  first (or are the whole-table rollup GROUP BY, which reads every
+--  surviving row no matter what), so a second index would only tax inserts.
 -- =============================================================================
+
+CREATE INDEX IF NOT EXISTS idx_endpoints_used_date_brin
+    ON endpoints_used USING BRIN (date_used);
 
 -- Per-endpoint history (counts, last used) — covers the stats page's main
 -- GROUP BY when the log is large.

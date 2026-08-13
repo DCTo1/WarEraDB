@@ -19,34 +19,55 @@ from ..config import REPO
 from ..queries import parallel_query_dicts
 from ..ui import esc, error_page, layout
 
-# endpoints_used is a plain 271 MB / 3.5 M-row table with only its PK index, so
-# every query below is a full scan — the page's cost is the NUMBER of scans, not
-# their selectivity. Hence two scans total (CALLS_SQL + REQUESTS_SQL) covering
-# what used to be five separate queries, run in parallel with FILLER_SQL.
+# rollup_endpoint_usage.py (throttled to ~once/day) folds endpoints_used rows
+# older than a few days into endpoint_usage_daily / endpoint_usage_daily_totals
+# and deletes them, so the raw table stays small and recent-only instead of
+# growing unbounded (pre-rollup measured 2026-08-13: 3.5 M rows / 271 MB after
+# 9 days). Every query below is still a full scan of whatever it reads, but
+# that's now either the tiny rollup tables or the bounded raw tail — six cheap
+# scans in parallel (via parallel_query_dicts) beat the old two full-table
+# scans once the table itself no longer stays small on its own.
 
-# Hourly × endpoint rollup (~500 rows): all-time and last-24 h call counts per
-# endpoint, the last-used timestamp, and the set of endpoints ever called.
-# The 24 h flag is per hour bucket — see the page footnote.
-CALLS_SQL = """
-SELECT date_trunc('hour', date_used) AS h, endpoint_id, count(*) AS c,
-       max(date_used) AS mx,
-       bool_or(date_used > now() - interval '24 hours') AS recent
-FROM endpoints_used GROUP BY 1, 2
+# All-time per-endpoint totals + last-used: the daily rollup UNIONed with a
+# fresh aggregate of the (small, bounded) raw tail not yet rolled up.
+CALLS_ALLTIME_SQL = """
+SELECT endpoint_id, sum(calls) AS c, max(last_used) AS mx
+FROM (
+    SELECT endpoint_id, calls, last_used FROM endpoint_usage_daily
+    UNION ALL
+    SELECT endpoint_id, count(*) AS calls, max(date_used) AS last_used
+    FROM endpoints_used GROUP BY 1
+) u
+GROUP BY 1
 """
 
-# Calls + request counts per day, plus an all-time grand total (the day IS NULL
-# row from GROUPING SETS). The inner GROUP BY collapses the table to its
-# distinct (date_used, request_id) pairs by hash aggregation first, so the two
-# count(DISTINCT)s never sort the full 3.5 M rows to disk (the old shape spilled
-# a 117 MB external merge and took 2.5 s on its own).
-REQUESTS_SQL = """
+# Last-24h per-endpoint activity: raw-only, no rollup involved — cheap now
+# that the raw table is small instead of 3.5 M rows.
+CALLS_RECENT_SQL = """
+SELECT endpoint_id, count(*) AS c, max(date_used) AS mx
+FROM endpoints_used WHERE date_used > now() - interval '24 hours'
+GROUP BY 1
+"""
+
+# Per-day request counts already rolled up (durable — see
+# endpoint_usage_daily_totals in base_data/create_tables.sql).
+REQUESTS_ROLLED_SQL = "SELECT day, calls, req_exact, req_legacy FROM endpoint_usage_daily_totals"
+
+# Per-day request counts for days still in the raw tail (not yet rolled up).
+# Same count(DISTINCT) shape the rollup function itself uses: the inner
+# GROUP BY collapses to distinct (date_used, request_id) pairs by hash
+# aggregation first, so the two count(DISTINCT)s never sort to disk. A day
+# lives in exactly ONE of this query or REQUESTS_ROLLED_SQL — the rollup
+# processes whole calendar days — so the two result sets never overlap and
+# can just be concatenated in Python.
+REQUESTS_RAW_SQL = """
 SELECT day,
        count(DISTINCT request_id) FILTER (WHERE request_id <> 0) AS req_exact,
        count(DISTINCT date_used)  FILTER (WHERE request_id = 0) AS req_legacy,
        sum(c) AS calls
 FROM (SELECT date_used::date AS day, date_used, request_id, count(*) AS c
       FROM endpoints_used GROUP BY 1, 2, 3) g
-GROUP BY GROUPING SETS ((day), ()) ORDER BY day NULLS LAST
+GROUP BY day
 """
 
 FILLER_SQL = """
@@ -153,24 +174,32 @@ def _filler_table(f: dict, tx: dict, im: dict, ut: dict, ul: dict) -> str:
 
 def page_stats(q: dict) -> str:
     """Endpoint usage analytics + filler health."""
-    results = parallel_query_dicts([(CALLS_SQL, None), (REQUESTS_SQL, None),
-                                    (FILLER_SQL, None), (ENDPOINTS_SQL, None)])
+    results = parallel_query_dicts([
+        (CALLS_ALLTIME_SQL, None), (CALLS_RECENT_SQL, None),
+        (REQUESTS_ROLLED_SQL, None), (REQUESTS_RAW_SQL, None),
+        (FILLER_SQL, None), (ENDPOINTS_SQL, None)])
     for _rows, err in results:
         if err:
             return error_page(err)
-    calls, reqs, filler, eps = (rows for rows, _err in results)
+    calls_alltime, calls_recent, reqs_rolled, reqs_raw, filler, eps = (
+        rows for rows, _err in results)
     f = filler[0]
 
-    # Per-day rows + the GROUPING SETS grand total (day IS NULL, sorted last).
-    per_day = [r for r in reqs if r["day"] is not None]
-    grand = next((r for r in reqs if r["day"] is None), None) or {
-        "calls": 0, "req_exact": 0, "req_legacy": 0}
+    # REQUESTS_ROLLED_SQL and REQUESTS_RAW_SQL each own a disjoint set of
+    # days (the rollup processes whole calendar days), so concatenating is
+    # exact — no per-day merge needed. The grand total sums req_exact +
+    # req_legacy across days instead of a global count(DISTINCT request_id):
+    # once a day is rolled up only its per-day distinct count survives, so
+    # this is what "exact" degrades to (a request straddling midnight would
+    # double-count across two days — negligible, and the old code's legacy
+    # count(DISTINCT date_used) path was already a documented lower bound).
+    per_day = sorted((*reqs_rolled, *reqs_raw), key=lambda r: r["day"])
     today_row = next((r for r in per_day if r["day"] == f["today"]), None)
 
-    total_calls = int(grand["calls"] or 0)
+    total_calls = sum(int(r["calls"] or 0) for r in per_day)
     calls_today = int(today_row["calls"] or 0) if today_row else 0
-    requests = grand["req_exact"] + grand["req_legacy"]
-    requests_today = (today_row["req_exact"] + today_row["req_legacy"]
+    requests = sum(int(r["req_exact"] or 0) + int(r["req_legacy"] or 0) for r in per_day)
+    requests_today = (int(today_row["req_exact"] or 0) + int(today_row["req_legacy"] or 0)
                       if today_row else 0)
     avg_batch = requests and f"{total_calls / requests:.1f}" or "—"
 
@@ -191,17 +220,18 @@ def page_stats(q: dict) -> str:
     oldest = f["txn_oldest"]
     oldest_lbl = str(oldest)[:10] if oldest else "—"
 
-    # Fold the hourly × endpoint rollup into per-endpoint totals.
+    # Fold the all-time + last-24h per-endpoint queries into one dict. Every
+    # endpoint in calls_recent is also in calls_alltime (it's a subset of the
+    # same raw table), so a plain setdefault in the second pass never fires
+    # in practice — kept only as a defensive fallback.
     names = {r["id"]: r["name"] for r in eps}
-    per_ep: dict[int, dict] = {}
-    for r in calls:
+    per_ep: dict[int, dict] = {
+        r["endpoint_id"]: {"calls": int(r["c"] or 0), "recent": 0, "last": r["mx"]}
+        for r in calls_alltime}
+    for r in calls_recent:
         a = per_ep.setdefault(r["endpoint_id"],
                               {"calls": 0, "recent": 0, "last": None})
-        a["calls"] += r["c"]
-        if r["recent"]:
-            a["recent"] += r["c"]
-        if a["last"] is None or r["mx"] > a["last"]:
-            a["last"] = r["mx"]
+        a["recent"] = int(r["c"] or 0)
 
     top = sorted(per_ep.items(), key=lambda kv: kv[1]["calls"], reverse=True)
     max_top = max((a["calls"] for _i, a in top), default=0)
@@ -273,9 +303,14 @@ def page_stats(q: dict) -> str:
         request is flushed separately, but requests flushed in one DB transaction
         merge into one timestamp (the live ranking walk's 40-POST waves collapse to
         1), so the legacy part is a lower bound.<br>
-        <b>Last 24 hours</b>: bucketed by hour, so the window is the last 24 whole
-        hours rather than an exact rolling 24 h — the chart is read for relative
-        volume, and the hourly rollup is what lets the whole page run on two scans
-        of <code>endpoints_used</code> instead of five. Everything else on the page
-        (totals, per-day, per-endpoint) is exact. Filler cards read the state files
+        <b>Retention</b>: <code>endpoints_used</code> rows older than a few days
+        are folded into <code>endpoint_usage_daily</code> /
+        <code>endpoint_usage_daily_totals</code> and deleted
+        (<code>rollup_endpoint_usage.py</code>, ~once/day) so the raw table
+        stays small — totals above combine the rollup with whatever's still
+        raw. Grand request totals sum each day's <code>count(DISTINCT
+        request_id)</code> rather than one global distinct count, so a request
+        that straddled midnight before being rolled up would double-count by
+        1 — negligible in practice. Everything else on the page (totals,
+        per-day, per-endpoint) is exact. Filler cards read the state files
         in <code>state/</code> + the DB (pages/items from the fillers' stats).</p>""")
