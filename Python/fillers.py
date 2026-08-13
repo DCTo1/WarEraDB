@@ -30,10 +30,11 @@ The fillers:
      window fill / gap-repair buckets;
   3. ItemMarketFiller — full itemMarket history per equipment item code
      (the API's itemCode filter bypasses the rolling 72 h window);
-  4. UserTxFiller — full transaction history per user, picked by XP ranking
-     (the API's userId filter bypasses the window too); users are marked in
-     the DB once their scrape is confirmed finished and replaced by the
-     next-in-line (a conveyor capped at USER_TX_POOL_SIZE).
+   4. UserTxFiller — full transaction history per user, picked by XP ranking
+      (the API's userId filter bypasses the window too); users are marked in
+      the DB once their scrape is confirmed finished and replaced by the
+      next-in-line (a conveyor capped at USER_TX_TOTAL_LIMIT total users,
+      USER_TX_POOL_SIZE in parallel).
 """
 
 import os
@@ -89,8 +90,15 @@ ITEM_MARKET_CODES = [
 # Max users walked in parallel by UserTxFiller (one page per user per batch).
 # The walk is inherently inefficient (a user's history is a long sequential
 # cursor chain), so the pool is capped — raise this manually if you want more
-# coverage.
+# concurrent coverage.
 USER_TX_POOL_SIZE = 100
+
+# TOTAL users ever walked by UserTxFiller (users stamped transactions_scraped_at
+# in the DB + users in flight in the pool). The refill stops pulling new users
+# from the XP ranking once this many have been consumed, so the walk drains
+# quietly when the last of them finishes. Raise/lower this manually to change
+# how far down the XP ranking the walk goes.
+USER_TX_TOTAL_LIMIT = 500
 
 
 def _step_walk(entry: dict, its: list[dict], no_cursor: bool) -> str:
@@ -104,6 +112,14 @@ def _step_walk(entry: dict, its: list[dict], no_cursor: bool) -> str:
     rows missing forever (the 72 h window covers them only while it runs).
     New items found at the re-check start a bounded catch-up pass that walks
     only the band (old_top, new_top] (stop line = the previous pass's top).
+
+    The bottom of the history is detected by CURSOR EQUALITY, not by an
+    empty page: the API's cursor is a strict `<` upper bound (full-ms
+    precision), so `cursor = oldest_ms + 1` always re-includes the boundary
+    item — a page that returns only that item never comes back empty, and
+    the pre-2026-08-09 code looped forever re-fetching it (every code/user
+    stuck at first_tx_ms + 1). A page whose oldest item is at sent_cursor-1
+    proves nothing older exists → oldest reached.
 
     Returns:
       "done"    — the no-cursor page's newest item is the pass's own top:
@@ -123,7 +139,14 @@ def _step_walk(entry: dict, its: list[dict], no_cursor: bool) -> str:
         entry["walk_top_ms"] = top_ms
         entry["cursor_ms"] = to_unix_ms(its[-1]["createdAt"]) + 1
         return "continue"
+    sent = entry.get("cursor_ms")
     entry["cursor_ms"] = to_unix_ms(its[-1]["createdAt"]) + 1
+    if sent is not None and entry["cursor_ms"] == sent:
+        # no progress: the page's oldest item sits exactly at sent-1, i.e.
+        # the API returned only the boundary duplicate — nothing older
+        # exists → oldest reached → re-check the top
+        entry["cursor_ms"] = None
+        return "recheck"
     if (entry.get("catch_to_ms") is not None
             and to_unix_ms(its[-1]["createdAt"]) <= entry["catch_to_ms"]):
         entry["cursor_ms"] = None  # the catch-up band is covered → re-check
@@ -298,9 +321,11 @@ class UserTxFiller:
     the user's whole lifetime is reachable, all transaction types).
 
     Pool = the first USER_TX_POOL_SIZE unfinished users by total_xp DESC
-    (users.transactions_scraped_at IS NULL). Each user is a cursor chain
-    (one page per batch — slots #25 and #26 can walk different users in the
-    same request). A user is marked done ONLY when the walk end's
+    (users.transactions_scraped_at IS NULL), pulled from the XP ranking
+    until USER_TX_TOTAL_LIMIT users have been walked in total (DB-stamped
+    + in flight) — the conveyor stops at that many. Each user is a cursor
+    chain (one page per batch — slots #25 and #26 can walk different users
+    in the same request). A user is marked done ONLY when the walk end's
     top-of-history re-check confirms nothing new arrived while the walk ran
     (a downward walk never re-visits its own top, so transactions created
     mid-walk would otherwise be missing — the re-check starts a bounded
@@ -333,9 +358,21 @@ class UserTxFiller:
 
     def _refill(self) -> None:
         """Bring the active set up to USER_TX_POOL_SIZE from the XP ranking
-        (unfinished users only — the DB stamp excludes finished ones)."""
+        (unfinished users only — the DB stamp excludes finished ones), until
+        USER_TX_TOTAL_LIMIT users have been walked in total. The total =
+        users already stamped transactions_scraped_at in the DB + the users
+        in flight in the state pool: once the limit is reached the refill
+        stops pulling new users and the pool drains as the last ones finish
+        (finishing users keep their DB stamp, so a later restart of the walk
+        never re-pulls them)."""
         users = self.state.setdefault("users", {})
         n = USER_TX_POOL_SIZE - len(users)
+        if n <= 0:
+            return
+        (consumed,) = query(
+            "SELECT count(*) FROM users WHERE transactions_scraped_at IS NOT NULL",
+            self.db)[0]
+        n = min(n, USER_TX_TOTAL_LIMIT - consumed - len(users))
         if n <= 0:
             return
         rows = query(

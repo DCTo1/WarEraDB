@@ -100,7 +100,7 @@ def _filler_table(f: dict) -> str:
          f"{imstats.get('pages', 0):,} pages · {imstats.get('items', 0):,} items · "
          f"{imstats.get('failed_calls', 0)} failed"),
         ("user walks", f"{len(ut.get('users', {}))} in flight, {ut_done:,} scraped",
-         "pool refills from the XP ranking as users finish",
+         "refills from the XP ranking until USER_TX_TOTAL_LIMIT users walked",
          f"{utstats.get('pages', 0):,} pages · {utstats.get('items', 0):,} items · "
          f"{utstats.get('failed_calls', 0)} failed"),
         ("user-lite", f"{f['lite_queue']:,} in queue",

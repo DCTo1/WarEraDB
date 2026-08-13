@@ -23,9 +23,10 @@ TimescaleDB hypertables.
 > 3. an **itemMarket walk per item code** (`itemCode` filter bypasses the
 >    72 h window — full history per equipment code, `ITEM_MARKET_CODES`),
 > 4. a **user walk** (`userId` filter bypasses the window too — full lifetime
->    history per user, picked by XP ranking; at most `USER_TX_POOL_SIZE`
->    users in parallel, each stamped `users.transactions_scraped_at` once
->    an empty page confirms their scrape finished).
+>    history per user, picked by XP ranking; at most `USER_TX_TOTAL_LIMIT`
+>    users walked in total — `USER_TX_POOL_SIZE` in parallel — each stamped
+>    `users.transactions_scraped_at` once an empty page confirms their
+>    scrape finished).
 > The window pools stop naturally when the work is drained (`done=True` in
 > `state/transactions_state.json` → no more calls until a probe finds
 > something new); the code/user walks ride the same slack, so they never
@@ -220,7 +221,7 @@ Defaults: `postgresql+psycopg://postgres:postgres@localhost:5432/{db}`
 (`BATTLE_DB` env / `--db` flag, default `tsdb`):
 
 ```bash
-WARERA_DB_URL='postgresql+psycopg://postgres:postgres@localhost:5433/{db}' \
+WARERA_DB_URL='postgresql+psycopg://postgres:postgres@localhost:5432/{db}' \
   .venv/bin/python Python/update_countries.py
 ```
 
