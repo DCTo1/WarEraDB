@@ -11,14 +11,15 @@ prepared statements after 5 identical executions — repeated page queries skip
 the per-request parse+plan (~1.5 ms each).
 """
 
+from concurrent.futures import ThreadPoolExecutor
 from time import monotonic
 
 from db import engine, query_dicts as _db_query_dicts
 
 from .config import settings
 
-__all__ = ["query_dicts", "query_dicts_nopar", "first_val", "country_cond",
-           "cached_query_dicts"]
+__all__ = ["query_dicts", "query_dicts_nopar", "parallel_query_dicts",
+           "first_val", "country_cond", "cached_query_dicts"]
 
 
 def query_dicts(sql: str, params: tuple | None = None) -> tuple[list, str | None]:
@@ -27,6 +28,24 @@ def query_dicts(sql: str, params: tuple | None = None) -> tuple[list, str | None
         return _db_query_dicts(sql, settings.db, params), None
     except RuntimeError as exc:
         return [], str(exc)
+
+
+_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="query")
+
+
+def parallel_query_dicts(
+        jobs: list[tuple[str, tuple | None]]) -> list[tuple[list, str | None]]:
+    """Run independent SELECTs concurrently; results in *jobs* order.
+
+    Each element keeps query_dicts' (rows, error) contract, so callers still
+    do `rows, err = results[i]; if err: return error_page(err)`. For pages
+    whose cost is several unrelated full-table scans (/stats), the wall time
+    becomes the slowest query instead of their sum.
+
+    Bounded at 4 workers against db.py's 10+10 connection pool — the viewer
+    is a ThreadingHTTPServer, so several renders can be in flight at once.
+    """
+    return list(_POOL.map(lambda job: query_dicts(*job), jobs))
 
 
 def query_dicts_nopar(sql: str, params: tuple | None = None) -> tuple[list, str | None]:

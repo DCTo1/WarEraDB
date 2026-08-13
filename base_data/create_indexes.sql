@@ -80,8 +80,18 @@
 -- =============================================================================
 --  Endpoint usage
 --
---  endpoints_used is append-only; the stats page aggregates it. Indexes only
---  matter once it holds a lot of rows.
+--  endpoints_used is append-only; the stats page aggregates it. Both indexes
+--  below stay commented out DELIBERATELY: /stats reports all-time totals, so
+--  each of its two queries reads every row no matter what — an index prunes
+--  nothing there and only taxes the insert path, which every pipeline flush
+--  goes through. Measured 2026-08-13 at 3.5 M rows / 271 MB: the page runs its
+--  two full scans in ~0.7 s wall (in parallel), against 5.0 s for the six
+--  sequential queries it used to issue.
+--
+--  What DOES need doing eventually is bounding the growth (~700 k rows/day):
+--  a daily rollup table + retention on the raw rows, after which a BRIN index
+--  on date_used becomes worth adding (the remaining scans would be
+--  recent-only, and the column is perfectly correlated with physical order).
 -- =============================================================================
 
 -- Per-endpoint history (counts, last used) — covers the stats page's main

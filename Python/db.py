@@ -54,7 +54,7 @@ def engine(db: str | None = None) -> Engine:
     db = db or os.environ.get("BATTLE_DB", "tsdb")
     if db not in _engines:
         _engines[db] = create_engine(
-            db_url(db), pool_size=5, max_overflow=5, pool_pre_ping=True)
+            db_url(db), pool_size=10, max_overflow=10, pool_pre_ping=True)
     return _engines[db]
 
 
