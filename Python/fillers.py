@@ -40,10 +40,11 @@ The fillers:
 import os
 
 from db import query
-from update_transactions import TransactionFiller, _store_stmts
-from update_users_lite import Filler
+from update_transactions import TransactionFiller, _make_buckets, _store_stmts
+from update_users_lite import (Filler, mark_dead_stmts,
+                               pick_created_at_backfill, upsert_stmts)
 from utils import (MAX_BATCH, PAGE_LIMIT, STATE_DIR, read_json, to_unix_ms,
-                   write_json_merged)
+                   write_json, write_json_merged)
 
 ITEM_MARKET_STATE = os.path.join(STATE_DIR, "item_market_state.json")
 USER_TX_STATE = os.path.join(STATE_DIR, "user_tx_state.json")
@@ -100,9 +101,21 @@ USER_TX_POOL_SIZE = 100
 # how far down the XP ranking the walk goes.
 USER_TX_TOTAL_LIMIT = 500
 
+# Max independent time-bucket chains per user (mirrors MAX_BATCH — a user's
+# full history can be walked in as little as one batch when slack allows,
+# instead of the old one-page-per-user-per-cycle single chain).
+USER_TX_BUCKET_COUNT = 50
+
+# Conservative bucket-sizing floor for users whose real account_created_at
+# isn't known yet (not yet backfilled — see update_users_lite.pick_created_at_backfill).
+# Correctness never depends on this: an empty page still terminates a bucket
+# immediately, this only affects how evenly bucket boundaries are spaced.
+USER_TX_FLOOR_MS = to_unix_ms("2024-01-01T00:00:00.000Z")
+
 
 def _step_walk(entry: dict, its: list[dict], no_cursor: bool) -> str:
-    """Advance one page of a full-history walk (UserTxFiller / ItemMarketFiller).
+    """Advance one page of a full-history walk (ItemMarketFiller — UserTxFiller
+    uses its own bucketed state machine, see the UserTxFiller class docstring).
 
     Cursor chains walk DOWN from the newest page. The top of each pass is
     remembered (walk_top_id / walk_top_ms) so the pass's LAST no-cursor page
@@ -315,6 +328,17 @@ class ItemMarketFiller:
         write_json_merged(ITEM_MARKET_STATE, self.state)
 
 
+def _user_bucket_count(span_ms: int) -> int:
+    """Bucket parallelism for one user's history: roughly one bucket per day
+    of account age, capped at USER_TX_BUCKET_COUNT — a brand-new account
+    doesn't need 50 mostly-empty buckets, a year-old veteran gets the full
+    spread (so their history can be walked in as little as one batch)."""
+    if span_ms <= 0:
+        return 1
+    days = span_ms // 86_400_000
+    return max(1, min(USER_TX_BUCKET_COUNT, days))
+
+
 class UserTxFiller:
     """Rides the slack to scrape the FULL transaction history of users picked
     by XP ranking (the API's userId filter bypasses the rolling 72 h window —
@@ -323,23 +347,64 @@ class UserTxFiller:
     Pool = the first USER_TX_POOL_SIZE unfinished users by total_xp DESC
     (users.transactions_scraped_at IS NULL), pulled from the XP ranking
     until USER_TX_TOTAL_LIMIT users have been walked in total (DB-stamped
-    + in flight) — the conveyor stops at that many. Each user is a cursor
-    chain (one page per batch — slots #25 and #26 can walk different users
-    in the same request). A user is marked done ONLY when the walk end's
-    top-of-history re-check confirms nothing new arrived while the walk ran
-    (a downward walk never re-visits its own top, so transactions created
-    mid-walk would otherwise be missing — the re-check starts a bounded
-    catch-up pass over just the new band instead of stamping done). A user
-    with no transactions finishes on the first page. In-band 404s (deleted
-    accounts) drop the user and stamp it done — the API will never serve
-    its history. On any other error the user keeps its cursor and is
-    retried next run.
+    + in flight) — the conveyor stops at that many.
 
-    In-progress cursors + pass metadata live in state/user_tx_state.json
-    ({users: {hex: {cursor_ms, walk_top_id, walk_top_ms, catch_to_ms}},
-    stats: {}}). Finished markers live in the DB, so a state reset only
-    re-walks interrupted users (idempotent, ON CONFLICT + _id dedupe) and
-    never re-walks finished ones.
+    Unlike a single sequential cursor chain (the pre-2026-08-13 design —
+    one page per user per batch, so a heavy user could take hours to drain
+    even with slack to spare), each user's (account_created_at, now] range
+    splits into up to USER_TX_BUCKET_COUNT INDEPENDENT time-bucket chains
+    (mirrors TransactionFiller's window buckets). Independent chains don't
+    wait on each other's responses, so a single user can occupy dozens of
+    slots in ONE batch instead of one page per cycle — the whole point is
+    that no filler call should ever sit idle waiting for a prior response
+    when another ready unit of work (another bucket, another user) could
+    fill that slot instead.
+
+    Per-user state machine (state/user_tx_state.json, {users: {hex: {...}},
+    stats: {}}):
+      1. BOOTSTRAP — one no-cursor probe discovers the user's current newest
+         transaction (walk_top_id/walk_top_ms) and its items are stored.
+         Empty response → the user has no transactions at all → done on the
+         spot. bootstrapped=True either way.
+      2. BUCKETS — once bootstrapped with a real top, (account_created_at or
+         USER_TX_FLOOR_MS, walk_top_ms] splits into buckets (_make_buckets,
+         same shape/semantics as the transaction window's), each walking its
+         own fixed band down to its own bottom_ms independently.
+      3. RECHECK — once every bucket reports done, one more no-cursor probe
+         confirms nothing arrived after the original walk_top_ms (a set of
+         buckets with a fixed top edge can never see transactions created
+         while the walk ran — only the very top of history can drift). Same
+         newest id → the user is FULLY done, stamp transactions_scraped_at.
+         A newer id → mint one small catch-up bucket for (old walk_top_ms,
+         new walk_top_ms] and loop (bounded: real-time traffic for one user
+         is low, this converges in one or two extra rounds).
+    In-band 404s (deleted accounts) drop the user at any phase and stamp it
+    done too — the API will never serve its history. Any other error leaves
+    that one unit of work (the bootstrap probe / a specific bucket / the
+    recheck probe) untouched for retry; nothing else about the user is lost.
+
+    Finished/dead users are marked with done=True rather than removed from
+    the dict: write_json_merged's per-key merge (utils._deep_merge) can only
+    ADD or OVERWRITE keys across concurrent writers, never delete one — a
+    pop() here would silently resurrect on the next merge (this was a real
+    bug in the pre-2026-08-13 version, compounding the pool overshoot below).
+    ItemMarketFiller already uses the same done-flag-not-removal pattern.
+    Finished markers also live in the DB (transactions_scraped_at), which is
+    what actually excludes them from being re-picked — a state reset only
+    re-walks interrupted users from scratch (idempotent, ON CONFLICT + _id
+    dedupe), it never resurrects finished ones.
+
+    Pool-size/total-limit enforcement happens ONLY in save_state(), under
+    FillerPool's flock, against a FRESH re-read of the on-disk state (see
+    _refill). The viewer runs update_battles.py / update_live.py /
+    update_weekly_ranking.py as parallel processes, each building its OWN
+    UserTxFiller from build_filler_pool(db) — refilling off each process's
+    private __init__-time snapshot (the pre-2026-08-13 design) let multiple
+    processes independently decide "I have room for N more" off the same
+    stale baseline and all add their own N, blowing past both caps (observed:
+    291 in flight + 357 already scraped = 648 > USER_TX_TOTAL_LIMIT's 500).
+    Deciding under the lock against a just-read authoritative count closes
+    that race regardless of how many processes run in parallel.
     """
 
     ENDPOINT = "transaction.getPaginatedTransactions"
@@ -352,106 +417,138 @@ class UserTxFiller:
         self.state = read_json(USER_TX_STATE, {"users": {}, "stats": {}})
         self._items: list[dict] = []
         self._marks: list[str] = []
-        self._dead: set[str] = set()
         self._offer = 0       # round-robin position into the active set
+        self._offered: set[tuple] = set()  # (hex, kind[, idx]) offered THIS run
         self._dirty = False
 
-    def _refill(self) -> None:
-        """Bring the active set up to USER_TX_POOL_SIZE from the XP ranking
-        (unfinished users only — the DB stamp excludes finished ones), until
-        USER_TX_TOTAL_LIMIT users have been walked in total. The total =
-        users already stamped transactions_scraped_at in the DB + the users
-        in flight in the state pool: once the limit is reached the refill
-        stops pulling new users and the pool drains as the last ones finish
-        (finishing users keep their DB stamp, so a later restart of the walk
-        never re-pulls them)."""
-        users = self.state.setdefault("users", {})
-        n = USER_TX_POOL_SIZE - len(users)
-        if n <= 0:
-            return
-        (consumed,) = query(
-            "SELECT count(*) FROM users WHERE transactions_scraped_at IS NOT NULL",
-            self.db)[0]
-        n = min(n, USER_TX_TOTAL_LIMIT - consumed - len(users))
-        if n <= 0:
-            return
-        rows = query(
-            "SELECT lower(uuid_to_objectid(user_id)) AS hex FROM users\n"
-            "WHERE transactions_scraped_at IS NULL\n"
-            "ORDER BY total_xp DESC NULLS LAST\n"
-            f"LIMIT {n};", self.db)
-        for (h,) in rows:
-            if h not in users and h not in self._dead:
-                users[h] = {}
-                self._dirty = True
-
-    def top_up(self, calls: list[tuple[str, dict]]) -> tuple[list[int], list[tuple[str, bool]]]:
-        """One page per active user (round-robin); returns (positions, the
-        (user hex, was-cursor-less) pairs in position order — the collect
-        token)."""
+    def top_up(self, calls: list[tuple[str, dict]]) -> tuple[list[int], list[tuple]]:
+        """Fill slack with whatever's ready: a bootstrap probe for
+        not-yet-bootstrapped users, one page per pending bucket for
+        bootstrapped ones, or a recheck probe once a user's buckets have all
+        drained — round-robin over ACTIVE (not done) users so one heavy
+        user's backlog can't starve the rest of the pool forever across
+        cycles. Returns (positions, (hex, kind, bucket-idx|None) tokens)."""
         slots: list[int] = []
-        tokens: list[tuple[str, bool]] = []
+        tokens: list[tuple] = []
         users = self.state.setdefault("users", {})
-        if len(users) < USER_TX_POOL_SIZE:
-            self._refill()
-        keys = list(users.keys())
+        keys = [h for h, e in users.items() if not e.get("done")]
         n = len(keys)
         if not n:
             return slots, tokens
-        base = self._offer
-        last_k = -1
-        for k in range(n):
+        base = self._offer % n
+        order = keys[base:] + keys[:base]
+        for h in order:
             if len(calls) >= MAX_BATCH:
                 break
-            last_k = k
-            h = keys[(base + k) % n]
-            p = {"userId": h, "limit": PAGE_LIMIT, "direction": "forward"}
-            cursor = (users[h] or {}).get("cursor_ms")
-            no_cursor = cursor is None
-            if cursor:
-                p["cursor"] = str(cursor)
-            slots.append(len(calls))
-            tokens.append((h, no_cursor))
-            calls.append((self.ENDPOINT, p))
-        if last_k >= 0:
-            self._offer = (base + last_k + 1) % n
+            e = users[h]
+            if not e.get("bootstrapped"):
+                tok = (h, "bootstrap", None)
+                if tok in self._offered:
+                    continue
+                self._offered.add(tok)
+                slots.append(len(calls))
+                tokens.append(tok)
+                calls.append((self.ENDPOINT,
+                              {"userId": h, "limit": PAGE_LIMIT, "direction": "forward"}))
+                continue
+            pending = [i for i, b in enumerate(e.get("buckets", [])) if not b.get("done")]
+            if pending:
+                for idx in pending:
+                    if len(calls) >= MAX_BATCH:
+                        break
+                    tok = (h, "bucket", idx)
+                    if tok in self._offered:
+                        continue
+                    self._offered.add(tok)
+                    b = e["buckets"][idx]
+                    cursor = b.get("cursor_ms") or b["top_ms"] + 1
+                    slots.append(len(calls))
+                    tokens.append(tok)
+                    calls.append((self.ENDPOINT,
+                                  {"userId": h, "limit": PAGE_LIMIT, "direction": "forward",
+                                   "cursor": str(cursor)}))
+            else:
+                tok = (h, "recheck", None)
+                if tok in self._offered:
+                    continue
+                self._offered.add(tok)
+                slots.append(len(calls))
+                tokens.append(tok)
+                calls.append((self.ENDPOINT,
+                              {"userId": h, "limit": PAGE_LIMIT, "direction": "forward"}))
+        self._offer = (base + 1) % n
         return slots, tokens
 
-    def collect(self, results: list, slots: list[int],
-                tokens: list[tuple[str, bool]]) -> None:
+    def _finish(self, h: str, e: dict) -> None:
+        """Mark a user fully done (finished walk OR 404): flag, not pop —
+        see the class docstring on why removal doesn't survive the merge."""
+        e["done"] = True
+        e["buckets"] = []
+        e.pop("walk_top_id", None)
+        e.pop("walk_top_ms", None)
+        self._marks.append(h)
+
+    def collect(self, results: list, slots: list[int], tokens: list[tuple]) -> None:
         users = self.state.setdefault("users", {})
         stats = self.state.setdefault("stats", {})
-        for pos, (h, no_cursor) in zip(slots, tokens):
+        for pos, (h, kind, idx) in zip(slots, tokens):
             if pos >= len(results):
                 continue
             res = results[pos]
+            e = users.get(h)
+            if e is None:
+                continue
             if "error" in res:
                 if (res["error"].get("data") or {}).get("httpStatus") == 404:
-                    # deleted account: the API will never serve its history
-                    users.pop(h, None)
-                    self._dead.add(h)
-                    self._marks.append(h)
+                    self._finish(h, e)  # deleted account: never served again
                     stats["dead"] = stats.get("dead", 0) + 1
                 else:
                     stats["failed_calls"] = stats.get("failed_calls", 0) + 1
-                continue  # non-404 errors: the user keeps the cursor
-            its = (res["result"]["data"].get("items")) or []
-            if not its:
-                if no_cursor:
-                    # a user with NO transactions at all → done on the spot
-                    users.pop(h, None)
-                    self._marks.append(h)
-                else:
-                    # the user's oldest transaction reached → re-check the
-                    # top for transactions created while the walk ran
-                    users.setdefault(h, {})["cursor_ms"] = None
                 self._dirty = True
                 continue
-            self._items.extend(its)
-            stats["items"] = stats.get("items", 0) + len(its)
-            if _step_walk(users.setdefault(h, {}), its, no_cursor) == "done":
-                users.pop(h, None)
-                self._marks.append(h)
+            its = (res["result"]["data"].get("items")) or []
+            if its:
+                self._items.extend(its)
+                stats["items"] = stats.get("items", 0) + len(its)
+            if kind == "bootstrap":
+                if its:
+                    e["walk_top_id"] = its[0]["_id"]
+                    e["walk_top_ms"] = to_unix_ms(its[0]["createdAt"])
+                    bottom = e.get("created_ms")
+                    if bottom is None:
+                        bottom = USER_TX_FLOOR_MS
+                    span = e["walk_top_ms"] - bottom
+                    e["buckets"] = (_make_buckets(bottom, e["walk_top_ms"],
+                                                  _user_bucket_count(span))
+                                    if span > 0 else [])
+                    e["bootstrapped"] = True
+                else:
+                    self._finish(h, e)  # no transactions at all
+            elif kind == "bucket":
+                buckets = e.get("buckets", [])
+                if idx is not None and 0 <= idx < len(buckets):
+                    b = buckets[idx]
+                    if its:
+                        b["cursor_ms"] = to_unix_ms(its[-1]["createdAt"]) + 1
+                        if b["cursor_ms"] - 1 <= b["bottom_ms"]:
+                            b["done"] = True
+                    else:
+                        b["done"] = True  # empty page = bottom of this band
+            elif kind == "recheck":
+                if its:
+                    top_id, top_ms = its[0]["_id"], to_unix_ms(its[0]["createdAt"])
+                    if top_id == e.get("walk_top_id"):
+                        self._finish(h, e)  # nothing new since the walk started
+                    else:
+                        old_top = e.get("walk_top_ms") or top_ms
+                        new_cursor = to_unix_ms(its[-1]["createdAt"]) + 1
+                        band_done = new_cursor - 1 <= old_top
+                        e["walk_top_id"], e["walk_top_ms"] = top_id, top_ms
+                        e["buckets"] = [{"top_ms": top_ms, "bottom_ms": old_top,
+                                         "cursor_ms": None if band_done else new_cursor,
+                                         "done": band_done}]
+                else:
+                    self._finish(h, e)  # still nothing (a truly empty account)
             self._dirty = True
         if self._dirty:
             stats["pages"] = stats.get("pages", 0) + len(slots)
@@ -462,11 +559,108 @@ class UserTxFiller:
         return out
 
     def save_state(self) -> None:
-        if not self._dirty:
+        """Persist this run's progress (merged against the on-disk copy —
+        the caller holds the filler pool lock, FillerPool.save_state), then
+        refill the pool. Refill always runs (even on a quiet run with
+        nothing collected) so a freshly-drained or freshly-deployed pool
+        gets topped up."""
+        if self._dirty:
+            write_json_merged(USER_TX_STATE, self.state)
+        self._refill()
+
+    def _refill(self) -> None:
+        """Bring the pool up to USER_TX_POOL_SIZE from the XP ranking, bounded
+        by USER_TX_TOTAL_LIMIT total (DB-stamped + in flight) — decided
+        against a FRESH on-disk read taken right here, under the lock, not
+        against __init__'s possibly-stale snapshot. See the class docstring's
+        note on the pre-2026-08-13 overshoot this closes."""
+        disk = read_json(USER_TX_STATE, {"users": {}, "stats": {}})
+        users = disk.setdefault("users", {})
+        active = sum(1 for e in users.values() if not e.get("done"))
+        room = USER_TX_POOL_SIZE - active
+        if room <= 0:
             return
-        # merge against the on-disk copy (concurrent cycle steps) — the
-        # caller holds the filler pool lock (FillerPool.save_state)
-        write_json_merged(USER_TX_STATE, self.state)
+        (consumed,) = query(
+            "SELECT count(*) FROM users WHERE transactions_scraped_at IS NOT NULL",
+            self.db)[0]
+        room = min(room, USER_TX_TOTAL_LIMIT - consumed - active)
+        if room <= 0:
+            return
+        rows = query(
+            "SELECT lower(uuid_to_objectid(user_id)) AS hex,\n"
+            "       (EXTRACT(EPOCH FROM account_created_at) * 1000)::bigint AS created_ms\n"
+            "FROM users\n"
+            "WHERE transactions_scraped_at IS NULL\n"
+            "ORDER BY total_xp DESC NULLS LAST\n"
+            f"LIMIT {room};", self.db)
+        added = False
+        for h, created_ms in rows:
+            if h not in users:
+                users[h] = {"created_ms": created_ms, "bootstrapped": False,
+                            "walk_top_id": None, "walk_top_ms": None,
+                            "buckets": [], "done": False}
+                added = True
+        if added:
+            write_json(USER_TX_STATE, disk)
+
+
+class CreatedAtBackfillFiller:
+    """Refetches user.getUserLite for users already lite-checked (total_xp
+    known) but missing account_created_at (migration_23, added after their
+    last fetch) — backfills the field UserTxFiller's bucket seeding wants.
+
+    Deliberately the LOWEST-priority filler, not folded into
+    update_users_lite.Filler's pools: that was tried and reverted 2026-08-13
+    — with ~107K candidate users in a fresh DB the pool never runs dry, and
+    since Filler sits at the TOP of FillerPool's priority order it
+    monopolized every cycle's slack for hours, starving the transaction
+    window filler entirely (measured: 1,727 user.getUserLite calls vs 0
+    transaction.getPaginatedTransactions calls in 3 minutes). This is purely
+    a nice-to-have for UserTxFiller's bucket-sizing efficiency — correctness
+    never depends on it (USER_TX_FLOOR_MS covers the unknown case) — so it
+    only gets to run AFTER every other filler has taken what it needs.
+
+    No state file: like update_users_lite.Filler, its pool is re-derived
+    from the DB every run (`total_xp IS NOT NULL AND account_created_at IS
+    NULL`), so it just self-drains as the column fills in.
+    """
+
+    ENDPOINT = "user.getUserLite"
+
+    def __init__(self, db: str) -> None:
+        self.db = db
+        self.fetched: dict = {}
+        self.dead: list[str] = []
+
+    def top_up(self, calls: list[tuple[str, dict]]) -> tuple[list[int], list[str]]:
+        slots: list[int] = []
+        hexes: list[str] = []
+        room = MAX_BATCH - len(calls)
+        if room <= 0:
+            return slots, hexes
+        for h in pick_created_at_backfill(self.db, room):
+            slots.append(len(calls))
+            hexes.append(h)
+            calls.append((self.ENDPOINT, {"userId": h}))
+        return slots, hexes
+
+    def collect(self, results: list, slots: list[int], hexes: list[str]) -> None:
+        for pos, h in zip(slots, hexes):
+            if pos >= len(results):
+                continue
+            res = results[pos]
+            if "error" in res:
+                err = res["error"]
+                if (err.get("data") or {}).get("httpStatus") == 404:
+                    self.dead.append(h)
+                continue
+            self.fetched[h] = res["result"]["data"]
+
+    def stmts(self) -> list[str]:
+        return upsert_stmts(self.fetched) + mark_dead_stmts(self.dead)
+
+    def save_state(self) -> None:
+        """No-op: no state file, the pool is re-derived from the DB every run."""
 
 
 def build_filler_pool(db: str) -> FillerPool:
@@ -480,11 +674,17 @@ def build_filler_pool(db: str) -> FillerPool:
          repair;
       4. itemMarket item-code walks — full history per code;
       5. user transaction walks — full history per user (XP-ranked, the
-         infinite slow one — always last).
+         infinite slow one — second-to-last);
+      6. account_created_at backfill (user.getUserLite, migration_23) — a
+         nice-to-have for #5's bucket-sizing efficiency only, deliberately
+         LAST: folding it into #1's pool instead was tried and reverted
+         2026-08-13, it monopolized every cycle's slack for hours with
+         ~107K candidates in a fresh DB (see CreatedAtBackfillFiller).
     Env gates (all default ON): WARERA_TX_FILLER=0 disables the three
     transaction fillers (the viewer's --transactions 0 sets this for every
     spawned script); WARERA_ITEM_MARKET_FILLER=0 / WARERA_USER_TX_FILLER=0
-    disable individual ones.
+    disable individual ones (the created_at backfill follows USER_TX_FILLER
+    since it exists solely to serve UserTxFiller).
     """
     tx = os.environ.get("WARERA_TX_FILLER", "1") != "0"
     fillers: list = [Filler(db)]
@@ -494,4 +694,5 @@ def build_filler_pool(db: str) -> FillerPool:
         fillers.append(ItemMarketFiller())
     if tx and os.environ.get("WARERA_USER_TX_FILLER", "1") != "0":
         fillers.append(UserTxFiller(db))
+        fillers.append(CreatedAtBackfillFiller(db))
     return FillerPool(fillers)

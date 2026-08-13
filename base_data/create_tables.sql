@@ -418,6 +418,14 @@ CREATE TABLE users (
                                                               -- lastConnectionAt when available);
                                                               -- NULL = never fought (inactive).
                                                               -- Refresh pool: within 4 days.
+    account_created_at TIMESTAMPTZ NULL,                     -- real account creation (getUserLite
+                                                              -- dates.createdAt — NOT the ObjectID's
+                                                              -- embedded timestamp, see the note above:
+                                                              -- that one is the 2025-05-01 game restart
+                                                              -- for old users). NULL until the user's
+                                                              -- first post-migration_23 getUserLite
+                                                              -- fetch. Seeds UserTxFiller's per-user
+                                                              -- time buckets.
     transactions_scraped_at TIMESTAMPTZ NULL                  -- full history confirmed scraped via the
                                                               -- userId filter (UserTxFiller stamp;
                                                               -- NULL = still in the scrape pool)
