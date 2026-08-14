@@ -529,9 +529,27 @@ class UserTxFiller:
                 if idx is not None and 0 <= idx < len(buckets):
                     b = buckets[idx]
                     if its:
-                        b["cursor_ms"] = to_unix_ms(its[-1]["createdAt"]) + 1
-                        if b["cursor_ms"] - 1 <= b["bottom_ms"]:
+                        sent = b.get("cursor_ms")
+                        new_cursor = to_unix_ms(its[-1]["createdAt"]) + 1
+                        if sent is not None and new_cursor == sent:
+                            # No progress: the API's cursor is a strict `<`
+                            # upper bound, so `cursor = oldest_ms + 1` always
+                            # re-includes the boundary item — a page whose
+                            # oldest item sits exactly at sent-1 never comes
+                            # back empty (same fixed point _step_walk already
+                            # guards against). Also fires when a single ms
+                            # holds MORE items than PAGE_LIMIT (e.g. a bulk
+                            # dismantle-all logged as 100 same-instant rows):
+                            # every page is full of ties at that ms and the
+                            # cursor can never step past it either way —
+                            # nothing older is reachable from here, so treat
+                            # the bucket as exhausted rather than looping
+                            # forever re-fetching the same page.
                             b["done"] = True
+                        else:
+                            b["cursor_ms"] = new_cursor
+                            if b["cursor_ms"] - 1 <= b["bottom_ms"]:
+                                b["done"] = True
                     else:
                         b["done"] = True  # empty page = bottom of this band
             elif kind == "recheck":
