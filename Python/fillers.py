@@ -369,7 +369,18 @@ class UserTxFiller:
       2. BUCKETS — once bootstrapped with a real top, (account_created_at or
          USER_TX_FLOOR_MS, walk_top_ms] splits into buckets (_make_buckets,
          same shape/semantics as the transaction window's), each walking its
-         own fixed band down to its own bottom_ms independently.
+         own fixed band down to its own bottom_ms independently. A bucket
+         whose plain userId+cursor walk stalls (the computed next cursor
+         equals the one just sent — more transactions share that exact ms
+         than fit in one page, e.g. a bulk "dismantle all" logging 100
+         same-instant rows) enters a SWEEP sub-phase: userId+itemCode filters
+         combine (AND together, extra/docs/TRANSACTIONS_ENDPOINT.md §3), so
+         walking all 36 ITEM_MARKET_CODES at that exact ms splits the tie
+         and pulls everything at the boundary instead of giving up on it
+         (short of 50+ transactions of the SAME item code at the SAME
+         instant, an accepted narrow residual case). Once every code is
+         swept the bucket skips past the whole ms and resumes its normal
+         walk.
       3. RECHECK — once every bucket reports done, one more no-cursor probe
          confirms nothing arrived after the original walk_top_ms (a set of
          buckets with a fixed top edge can never see transactions created
@@ -424,10 +435,14 @@ class UserTxFiller:
     def top_up(self, calls: list[tuple[str, dict]]) -> tuple[list[int], list[tuple]]:
         """Fill slack with whatever's ready: a bootstrap probe for
         not-yet-bootstrapped users, one page per pending bucket for
-        bootstrapped ones, or a recheck probe once a user's buckets have all
+        bootstrapped ones (or, for a stalled bucket, one page per remaining
+        item code in its SWEEP — see the class docstring), or a recheck
+        probe once a user's buckets have all
         drained — round-robin over ACTIVE (not done) users so one heavy
         user's backlog can't starve the rest of the pool forever across
-        cycles. Returns (positions, (hex, kind, bucket-idx|None) tokens)."""
+        cycles. Returns (positions, (hex, kind, payload) tokens) — payload
+        is a bucket index for "bucket", (bucket index, item code) for
+        "sweep", None otherwise."""
         slots: list[int] = []
         tokens: list[tuple] = []
         users = self.state.setdefault("users", {})
@@ -456,11 +471,29 @@ class UserTxFiller:
                 for idx in pending:
                     if len(calls) >= MAX_BATCH:
                         break
+                    b = e["buckets"][idx]
+                    stall_ms = b.get("stall_ms")
+                    if stall_ms is not None:
+                        # Stalled bucket: sweep the remaining item codes at
+                        # the boundary ms instead of the plain userId+cursor
+                        # request (see the class docstring's SWEEP phase).
+                        for code in list(b.get("stall_codes") or []):
+                            if len(calls) >= MAX_BATCH:
+                                break
+                            tok = (h, "sweep", (idx, code))
+                            if tok in self._offered:
+                                continue
+                            self._offered.add(tok)
+                            slots.append(len(calls))
+                            tokens.append(tok)
+                            calls.append((self.ENDPOINT,
+                                          {"userId": h, "itemCode": code, "limit": PAGE_LIMIT,
+                                           "direction": "forward", "cursor": str(stall_ms + 1)}))
+                        continue
                     tok = (h, "bucket", idx)
                     if tok in self._offered:
                         continue
                     self._offered.add(tok)
-                    b = e["buckets"][idx]
                     cursor = b.get("cursor_ms") or b["top_ms"] + 1
                     slots.append(len(calls))
                     tokens.append(tok)
@@ -541,17 +574,44 @@ class UserTxFiller:
                             # holds MORE items than PAGE_LIMIT (e.g. a bulk
                             # dismantle-all logged as 100 same-instant rows):
                             # every page is full of ties at that ms and the
-                            # cursor can never step past it either way —
-                            # nothing older is reachable from here, so treat
-                            # the bucket as exhausted rather than looping
-                            # forever re-fetching the same page.
-                            b["done"] = True
+                            # plain userId cursor can never step past it.
+                            # Enter the SWEEP phase (class docstring) instead
+                            # of giving up: userId+itemCode combine (AND) per
+                            # extra/docs/TRANSACTIONS_ENDPOINT.md §3, so
+                            # walking the 36 item codes at this exact ms
+                            # splits the tie and (short of 50+ of the SAME
+                            # code at the SAME instant) captures all of it.
+                            b["stall_ms"] = sent - 1
+                            b["stall_codes"] = list(ITEM_MARKET_CODES)
                         else:
                             b["cursor_ms"] = new_cursor
                             if b["cursor_ms"] - 1 <= b["bottom_ms"]:
                                 b["done"] = True
                     else:
                         b["done"] = True  # empty page = bottom of this band
+            elif kind == "sweep":
+                bucket_idx, code = idx
+                buckets = e.get("buckets", [])
+                if 0 <= bucket_idx < len(buckets):
+                    b = buckets[bucket_idx]
+                    codes = b.get("stall_codes")
+                    if codes and code in codes:
+                        codes.remove(code)
+                    if b.get("stall_ms") is not None and not codes:
+                        # Every item code swept at this boundary — anything
+                        # item-bearing at stall_ms is captured (idempotent
+                        # upserts already queued via `its` above), so it's
+                        # safe to skip past the whole ms and resume the
+                        # plain walk. Residual risk: a non-item-bearing type
+                        # (wage/donation/articleTip/applicationFee) ALSO
+                        # piling 50+ rows onto this exact instant would still
+                        # be missed — accepted as a much narrower edge case
+                        # than the one this sweep fixes.
+                        b["cursor_ms"] = b["stall_ms"]
+                        b.pop("stall_ms", None)
+                        b.pop("stall_codes", None)
+                        if b["cursor_ms"] - 1 <= b["bottom_ms"]:
+                            b["done"] = True
             elif kind == "recheck":
                 if its:
                     top_id, top_ms = its[0]["_id"], to_unix_ms(its[0]["createdAt"])
