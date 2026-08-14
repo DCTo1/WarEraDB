@@ -388,8 +388,8 @@ def main() -> int:
     ps.add_argument("--include-endpoints", action="store_true",
                     help="Also include endpoints_used data (default: excluded)")
     ps.add_argument("--note", default="", help="Extra text stored in the release body")
-    ps.add_argument("--keep", type=int, default=5,
-                    help="Keep the newest N GitHub releases (default 5; owner-only)")
+    ps.add_argument("--keep", type=int, default=2,
+                    help="Keep the newest N GitHub releases (default 2; owner-only)")
     ps.add_argument("--docker", nargs="?", const="auto", default=None,
                     metavar="CONTAINER",
                     help="Run pg_dump inside the container (default: auto-detect)")
