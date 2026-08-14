@@ -29,6 +29,7 @@ no total-release-storage cap; deleting a release deletes its assets.
 
 import hashlib
 import os
+from datetime import datetime
 
 import requests
 
@@ -93,12 +94,34 @@ def _raise(resp: requests.Response, what: str) -> None:
         raise RuntimeError(
             f"GitHub error (404) while {what}: repository {backup_repo()} "
             "not found — create it or set WARERA_BACKUP_REPO=\"owner/name\"")
+    msg = resp.text.strip().replace("\n", " ")[:300]
+    # A 403 is NOT necessarily an auth problem: GitHub also returns it (and
+    # 429) for quota. list/download run anonymously by design, and the
+    # anonymous quota is per-IP and shared, so a token that just uploaded
+    # fine can be followed seconds later by a 403 that has nothing to do
+    # with it — reporting that as "check your token" sent us chasing a
+    # non-existent credential bug (2026-08-14). Rate limiting is identified
+    # by an exhausted remaining-quota header, a Retry-After (secondary
+    # limits), or the body text; anything else 401/403 really is auth.
+    limited = (resp.headers.get("x-ratelimit-remaining") == "0"
+               or resp.headers.get("retry-after") is not None
+               or "rate limit" in msg.lower())
+    if resp.status_code in (403, 429) and limited:
+        reset = resp.headers.get("x-ratelimit-reset")
+        when = ""
+        if reset and reset.isdigit():
+            when = (" — resets at "
+                    + datetime.fromtimestamp(int(reset)).strftime("%H:%M:%S"))
+        raise RuntimeError(
+            f"GitHub rate limit ({resp.status_code}) while {what}{when}. "
+            "This is a quota limit, not a bad token; anonymous requests "
+            "share a per-IP quota. Retry later, or set WARERA_GITHUB_TOKEN "
+            "for the higher authenticated limit.")
     if resp.status_code in (401, 403):
         raise RuntimeError(
             f"GitHub auth error ({resp.status_code}) while {what}: check the "
             "token in WARERA_GITHUB_TOKEN / ~/.config/warera/github_token.txt "
             "(owner actions need Contents read/write on the backup repo)")
-    msg = resp.text.strip().replace("\n", " ")[:300]
     raise RuntimeError(f"GitHub error ({resp.status_code}) while {what}: {msg}")
 
 

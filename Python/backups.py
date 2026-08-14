@@ -181,9 +181,14 @@ def cmd_save(args) -> int:
     out = args.out or os.path.join(BACKUP_DIR, f"tsdb_backup_{stamp}.dump")
     os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
 
-    excludes = [f"--exclude-table-data={t}" for t in EXCLUDED_DATA
-                if args.include_endpoints or t != "endpoints_used"]
-    excluded = [t for t in EXCLUDED_DATA if args.include_endpoints or t != "endpoints_used"]
+    # One list drives BOTH the pg_dump flags and the printed message — they
+    # used to be built by two separate comprehensions, and the flag test was
+    # inverted in both: --include-endpoints EXCLUDED endpoints_used and the
+    # default SHIPPED it (caught 2026-08-14, a 957 MB dump carrying 1 M rows
+    # of API log the docs promise are left out).
+    excluded = [t for t in EXCLUDED_DATA
+                if t != "endpoints_used" or not args.include_endpoints]
+    excludes = [f"--exclude-table-data={t}" for t in excluded]
     print(f"  dumping {args.db} → {out} (excluding data of {', '.join(excluded)})",
           flush=True)
     if docker:
