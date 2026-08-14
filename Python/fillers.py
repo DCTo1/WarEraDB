@@ -99,7 +99,7 @@ USER_TX_POOL_SIZE = 100
 # from the XP ranking once this many have been consumed, so the walk drains
 # quietly when the last of them finishes. Raise/lower this manually to change
 # how far down the XP ranking the walk goes.
-USER_TX_TOTAL_LIMIT = 500
+USER_TX_TOTAL_LIMIT = 1000
 
 # Max independent time-bucket chains per user (mirrors MAX_BATCH — a user's
 # full history can be walked in as little as one batch when slack allows,
@@ -664,20 +664,35 @@ class UserTxFiller:
         room = min(room, USER_TX_TOTAL_LIMIT - consumed - active)
         if room <= 0:
             return
+        # Over-fetch by len(users), then skip-and-count instead of trusting
+        # LIMIT room to yield room NEW users: a user already in the dict but
+        # not yet DB-stamped (in flight, or dropped as a 404) still matches
+        # this WHERE, and since the pool is picked by XP DESC those
+        # collisions sit at the very TOP of the candidate list. A plain
+        # LIMIT room could therefore return nothing but users we already
+        # hold and add zero (measured 2026-08-14: active=1, room=1, and the
+        # one row returned WAS the in-flight user — the pool sat a user
+        # short of the cap indefinitely; mid-run, with the top `active`
+        # rows always colliding, it pinned the pool near
+        # USER_TX_POOL_SIZE/2 instead of USER_TX_POOL_SIZE).
         rows = query(
             "SELECT lower(uuid_to_objectid(user_id)) AS hex,\n"
             "       (EXTRACT(EPOCH FROM account_created_at) * 1000)::bigint AS created_ms\n"
             "FROM users\n"
             "WHERE transactions_scraped_at IS NULL\n"
             "ORDER BY total_xp DESC NULLS LAST\n"
-            f"LIMIT {room};", self.db)
+            f"LIMIT {room + len(users)};", self.db)
         added = False
         for h, created_ms in rows:
-            if h not in users:
-                users[h] = {"created_ms": created_ms, "bootstrapped": False,
-                            "walk_top_id": None, "walk_top_ms": None,
-                            "buckets": [], "done": False}
-                added = True
+            if h in users:
+                continue
+            users[h] = {"created_ms": created_ms, "bootstrapped": False,
+                        "walk_top_id": None, "walk_top_ms": None,
+                        "buckets": [], "done": False}
+            added = True
+            room -= 1
+            if room == 0:
+                break
         if added:
             write_json(USER_TX_STATE, disk)
 
