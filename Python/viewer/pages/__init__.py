@@ -10,11 +10,13 @@ from .battles import page_battles
 from .bounties import page_bounties
 from .countries import page_countries
 from .overview import page_overview
+from .snipes import page_snipes
 from .sql import page_sql
 from .stats import page_stats
 from .tracker import page_tracker
 from .transactions import page_transactions
 from .transactions_coverage import page_transactions_coverage
+from .tx_priority import page_tx_priority
 from .usage import page_usage
 from .user import page_user
 from .users import page_users
@@ -24,5 +26,6 @@ __all__ = [
     "page_overview", "page_battles", "page_battle", "page_users", "page_user",
     "page_bounties", "page_countries", "page_stats", "page_sql", "page_weekly",
     "page_tracker", "page_transactions",
-    "page_transactions_coverage", "page_usage",
+    "page_transactions_coverage", "page_usage", "page_tx_priority",
+    "page_snipes",
 ]

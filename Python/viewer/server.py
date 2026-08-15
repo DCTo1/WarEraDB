@@ -9,9 +9,9 @@ Page cache (2026-08-08): the heavy user pages are TTL-cached per URL (30 s)
 so repeated views — and the requests of concurrent users — mostly skip the
 DB. This matters because the 15 s auto-updater's write bursts stall reads
 for ~1 s (measured p99 ~1.1 s at 10-25 users); cached pages ride out the
-burst. Errors are never cached. Operator pages (/stats, /usage,
-/update-status, /sql) and live pages (/battle, /timer, /search) stay
-uncached.
+burst. Errors are never cached. Operator pages (/stats, /usage, /update-status,
+/sql, /tx-priority — the last one also WRITES, so a cached render would show
+a stale list) and live pages (/battle, /timer, /search) stay uncached.
 """
 
 import json
@@ -26,8 +26,9 @@ from urllib.parse import parse_qs
 from . import usage
 from .pages import (
     page_battle, page_battles, page_bounties, page_countries, page_overview,
-    page_sql, page_stats, page_tracker, page_transactions,
-    page_transactions_coverage, page_user, page_users, page_usage, page_weekly,
+    page_snipes, page_sql, page_stats, page_tracker, page_transactions,
+    page_transactions_coverage, page_tx_priority, page_user, page_users,
+    page_usage, page_weekly,
 )
 from .search import search
 from .updater import log_events, page_update_status, timer_events, timer_state
@@ -43,11 +44,13 @@ ROUTES = {
     "/weekly": page_weekly,
     "/transactions": page_transactions,
     "/transactions/coverage": page_transactions_coverage,
+    "/snipes": page_snipes,
     "/bounties": page_bounties,
     "/countries": page_countries,
     "/stats": page_stats,
     "/usage": page_usage,
     "/sql": page_sql,
+    "/tx-priority": page_tx_priority,
     "/update-status": page_update_status,
 }
 
@@ -72,7 +75,7 @@ _PAGE_CACHE: dict[str, tuple[float, str]] = {}
 # battles — it must stay fresh) and the JSON/operator routes above.
 CACHED_ROUTES = frozenset({
     "/", "/overview", "/battles", "/users", "/user", "/tracker", "/weekly",
-    "/transactions", "/bounties", "/countries",
+    "/transactions", "/bounties", "/countries", "/snipes",
 })
 
 
