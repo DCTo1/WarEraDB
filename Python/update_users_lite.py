@@ -77,7 +77,8 @@ import requests
 
 from api import NotFoundError, make_session, mixed_fetch
 from db import esc, exec_many, flush_endpoint_log, query
-from utils import MAX_BATCH, STATE_DIR, read_json, write_json
+from utils import (MAX_BATCH, STATE_DIR, filler_shard, read_json,
+                   write_json)
 
 BATCH_CAP = MAX_BATCH      # 50 calls per tRPC request
 FLUSH = 500
@@ -90,25 +91,34 @@ CHECK_INTERVAL_MIN = 3600  # never run the activity check more often than hourly
 STATE_FILE = os.path.join(STATE_DIR, "users_lite_state.json")
 
 
-def pick_hexes(db: str, limit: int) -> list[str]:
+def pick_hexes(db: str, limit: int, offset: int = 0) -> list[str]:
     """Up to *limit* hex user ids that were never getUserLite'd — the true
     "unchecked" set is lite_checked_at IS NULL, username or not: rows
     backfilled by the OLD update_users.py era have a username but no
     lite_checked_at (the column did not exist then), and a username-only
-    filter would skip them forever. Wealth and damage rankings first."""
+    filter would skip them forever. Wealth and damage rankings first.
+
+    *offset* is the filler shard's slice of the queue (utils.filler_shard):
+    every cycle step used to get this same first page and fetch the same
+    users. user_id is the ORDER BY tiebreaker so the slices are disjoint —
+    without it the ties (NULL wealth/damages) make OFFSET meaningless."""
     return [r[0] for r in query(
         "SELECT lower(uuid_to_objectid(user_id)) AS hex FROM users\n"
         "WHERE lite_checked_at IS NULL\n"
-        "ORDER BY user_wealth DESC NULLS LAST, user_damages DESC NULLS LAST\n"
-        f"LIMIT {limit};", db)]
+        "ORDER BY user_wealth DESC NULLS LAST, user_damages DESC NULLS LAST,\n"
+        "         user_id\n"
+        f"LIMIT {limit} OFFSET {offset};", db)]
 
 
-def pick_active_hexes(db: str, limit: int) -> list[str]:
+def pick_active_hexes(db: str, limit: int, offset: int = 0) -> list[str]:
     """Up to *limit* hexes from the active pool: users whose last_active_at
     is within ACTIVE_WINDOW_HOURS (they fought a round recently) and whose
     last getUserLite is older than STALE_HOURS. Users whose last check is
     older than PRIORITY_HOURS (or never) — they just came back — come first,
-    then wealth, then damages. Pure DB read — no API requests."""
+    then wealth, then damages. Pure DB read — no API requests.
+
+    *offset* is the filler shard's slice (see pick_hexes); user_id breaks the
+    ties so the slices don't overlap."""
     return [r[0] for r in query(
         "SELECT lower(uuid_to_objectid(user_id)) AS hex FROM users\n"
         f"WHERE last_active_at > NOW() - INTERVAL '{ACTIVE_WINDOW_HOURS} hours'\n"
@@ -116,8 +126,9 @@ def pick_active_hexes(db: str, limit: int) -> list[str]:
         f"      OR lite_checked_at < NOW() - INTERVAL '{STALE_HOURS} hours')\n"
         "ORDER BY (lite_checked_at IS NULL\n"
         f"          OR lite_checked_at < NOW() - INTERVAL '{PRIORITY_HOURS} hours') DESC,\n"
-        "         user_wealth DESC NULLS LAST, user_damages DESC NULLS LAST\n"
-        f"LIMIT {limit};", db)]
+        "         user_wealth DESC NULLS LAST, user_damages DESC NULLS LAST,\n"
+        "         user_id\n"
+        f"LIMIT {limit} OFFSET {offset};", db)]
 
 
 def _fetch_chunk(s: requests.Session, chunk: list[str]) -> tuple[dict, list[str]]:
@@ -162,7 +173,7 @@ def fetch_lite(s: requests.Session, hexs: list[str]) -> tuple[dict, list[str]]:
     return out, dead
 
 
-def pick_created_at_backfill(db: str, limit: int) -> list[str]:
+def pick_created_at_backfill(db: str, limit: int, offset: int = 0) -> list[str]:
     """Up to *limit* hexes with total_xp already known (→ getUserLite fetched
     at least once, i.e. eligible for UserTxFiller's XP-ranked pool) but no
     account_created_at (migration_23, added after their last fetch) —
@@ -172,8 +183,8 @@ def pick_created_at_backfill(db: str, limit: int) -> list[str]:
     return [r[0] for r in query(
         "SELECT lower(uuid_to_objectid(user_id)) AS hex FROM users\n"
         "WHERE total_xp IS NOT NULL AND account_created_at IS NULL\n"
-        "ORDER BY total_xp DESC NULLS LAST\n"
-        f"LIMIT {limit};", db)]
+        "ORDER BY total_xp DESC NULLS LAST, user_id\n"
+        f"LIMIT {limit} OFFSET {offset};", db)]
 
 
 def mark_dead_stmts(dead: list[str]) -> list[str]:
@@ -231,20 +242,30 @@ class Filler:
         self._seen: set[str] = set()
         self._backfill_exhausted = False
         self._active_exhausted = False
+        self._shard_i, self._shard_n = filler_shard()
+
+    def _refill(self, pick) -> list[str]:
+        """Bulk pick from *pick*, this shard's slice first (utils.filler_shard
+        — otherwise every cycle step fetches the identical first REFILL rows),
+        falling back to the head of the queue when the slice is empty. The
+        fallback is what keeps a shard working once the queue is shorter than
+        shards × REFILL; it costs duplicates only in that drained case."""
+        rows = pick(self.db, self.REFILL, self._shard_i * self.REFILL)
+        if not rows and self._shard_i:
+            rows = pick(self.db, self.REFILL, 0)
+        return [h for h in rows if h not in self._seen]
 
     def _next_hex(self) -> str | None:
         """One hex from the pools (backfill first), refilling a pool only
         when empty; an exhausted pool is not re-queried within the run."""
         if not self.backfill and not self._backfill_exhausted:
-            self.backfill = [h for h in pick_hexes(self.db, self.REFILL)
-                             if h not in self._seen]
+            self.backfill = self._refill(pick_hexes)
             if not self.backfill:
                 self._backfill_exhausted = True
         if self.backfill:
             return self.backfill.pop(0)
         if not self.active and not self._active_exhausted:
-            self.active = [h for h in pick_active_hexes(self.db, self.REFILL)
-                           if h not in self._seen]
+            self.active = self._refill(pick_active_hexes)
             if not self.active:
                 self._active_exhausted = True
         if self.active:
@@ -286,6 +307,12 @@ class Filler:
     def stmts(self) -> list[str]:
         """Upsert statements for the fetched fillers + dead markers."""
         return upsert_stmts(self.fetched) + mark_dead_stmts(self.dead)
+
+    def take_stmts(self) -> list[str]:
+        """stmts() + hand over the buffers (see fillers.FillerPool.take_stmts)."""
+        out = self.stmts()
+        self.fetched, self.dead = {}, []
+        return out
 
     def save_state(self) -> None:
         """No-op: this filler has no state file — its pools are re-derived

@@ -24,13 +24,24 @@ A call without a request_id logs 0 — such rows are counted by the fallback
 request made through api.mixed_fetch carries a real id since 2026-08-08.
 """
 
+import threading
+
 QUEUE: list[tuple[str, int]] = []
+
+# The queue is written from the API worker threads (api.mixed_fetch logs each
+# call of a batched request) and drained by whoever flushes — which since
+# 2026-08-15 can be a BACKGROUND writer thread running while more requests are
+# in flight (update_filler_boost.py overlaps its flush with the next wave).
+# The drains below are copy-then-clear, so without this lock a call logged
+# between the two would be dropped.
+_LOCK = threading.Lock()
 
 
 def log(name: str, request_id: int = 0) -> None:
     """Queue one endpoint call for the next flush."""
     if name:
-        QUEUE.append((name, request_id))
+        with _LOCK:
+            QUEUE.append((name, request_id))
 
 
 def _sql(names: list[tuple[str, int]]) -> str:
@@ -40,10 +51,11 @@ def _sql(names: list[tuple[str, int]]) -> str:
 
 def drain_sql() -> str:
     """SQL for all queued calls (clears the queue). Empty string when idle."""
-    if not QUEUE:
-        return ""
-    names = QUEUE[:]
-    QUEUE.clear()
+    with _LOCK:
+        if not QUEUE:
+            return ""
+        names = QUEUE[:]
+        QUEUE.clear()
     return _sql(names)
 
 
@@ -53,9 +65,10 @@ def drain_statements() -> list[str]:
     Used by db.py, which executes each statement separately inside the same
     transaction instead of piping one multi-statement string.
     """
-    if not QUEUE:
-        return []
-    names = QUEUE[:]
-    QUEUE.clear()
+    with _LOCK:
+        if not QUEUE:
+            return []
+        names = QUEUE[:]
+        QUEUE.clear()
     return [f"SELECT insert_endpoint_used('{n.replace(chr(39), chr(39) * 2)}', {r});"
             for n, r in names]

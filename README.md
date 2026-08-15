@@ -241,7 +241,22 @@ cycle, ≥48 h apart, real lastConnectionAt stored on fetch, activity check
 every 2 h; the transaction work rides the mixed batches' slack via the
 priority-ordered filler pool (`Python/fillers.py` — window probes/buckets +
 per-item-code itemMarket walks + XP-ranked per-user walks, see
-`extra/docs/FILLERS.md`) — `--transactions 0` disables). `/stats` shows the
+`extra/docs/FILLERS.md`) — `--transactions 0` disables. The one exception
+is the `/tx-priority` list: those users are excluded from the slack fillers
+and walked by `Python/update_priority_tx.py`, a cycle step that buys up to
+`--priority-tx` (default 2) dedicated 50-call requests per cycle for them —
+leftover slots go back to the ordinary fillers, and nothing is requested
+when the list has no pending user), and the ordinary fillers can be sped up
+the same way on demand — `/stats`'s "Cycle config" panel switches
+`Python/update_filler_boost.py` on and sets how many EMPTY 50-call requests
+it buys per cycle for them (`--filler-boost N`, off by default, capped at 20
+≈ +80 requests/min, sent in parallel with their statements flushed by a
+background writer while the next request is in flight, persisted in
+`state/viewer_settings.json` and applied on the next cycle without a
+restart). The cycle's filler-carrying steps take DISJOINT shards of the
+pools (`WARERA_FILLER_SHARD`, handed out by the updater) — before that they
+all fetched the same pages, and the boost's flush was inserting 7-33% new
+rows against 82-104% after. `/stats` shows the
 filler health at the top (window buckets, itemMarket codes, user walks,
 history rows) plus exact request counts — every `api.mixed_fetch` POST logs
 one `request_id` (`endpoints_used.request_id`, migration_22), so a 50-call
@@ -336,6 +351,7 @@ this link always resolves to the newest backup:
 | `user_battle_stats` | Per (user, battle, side) ranking totals — the /user page reads this instead of scanning the compressed hypertable per entity | PK `(user_id, battle_id, side)`, damage/points/money/entries sums; maintained by the ranking writers (rebuild per touched battle, exact) |
 | `weekly_ranking_snapshots` | Official copies of the game's weekly ranking (hourly `ranking.getRanking` fetches; current week displayed, finished weeks pruned to per-entity finals at rollover) | PK `(entity_type, entity_id, week_start, snapshot_at)`, `value`, `rank`, `tier`; hypertable, compressed |
 | `user_weekly_damage` | Derived per-user weekly damage (bucketed by the week of the round's start; damage tracker + fallback) | PK `(user_id, week_start)`, `damage`; rebuilt at battle end + `--backfill`; = round rows + `user_weekly_corrections` |
+| `tx_priority_users` | Operator-curated priority list for the full-history transaction scrape (viewer's `/tx-priority` page) — listed users skip the XP-ranked slack filler and get dedicated requests | `user_id UUID PK` (FK `users`), `added_at`, `note` |
 | `user_weekly_corrections` | Signed per-week adjustments fixing the reset-straddling attribution (from official snapshots, only for settled users) | PK `(user_id, week_start)`, `damage` signed, `corrected_at`, `verified_at` (audit stamp); applied by every rebuild |
 
 Naming convention: `*_id` columns are INT FKs into `inventory_ids`; bare UUID

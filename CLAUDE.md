@@ -34,6 +34,8 @@ done
 # Run a single pipeline script (all read WARERA_DB_URL / WARERA_API_KEY env vars)
 .venv/bin/python Python/update_battles.py
 .venv/bin/python Python/update_transactions.py --verify   # coverage report, no API calls
+.venv/bin/python Python/update_priority_tx.py --verify   # /tx-priority list state, no API calls
+.venv/bin/python Python/update_filler_boost.py --verify  # what a boost request would carry
 
 # Web viewer (auto-updates the DB every 15s; must set WARERA_DB_URL)
 WARERA_DB_URL='postgresql+psycopg://postgres:postgres@localhost:5432/{db}' \
@@ -99,12 +101,49 @@ total), and `Python/fillers.py`'s `FillerPool` fills that slack in strict priori
 5. **user walk** by XP rank (`userId` filter bypasses the window — full lifetime history)
 
 Fillers never start additional requests — they only ride slots that would otherwise go unused.
+The one deliberate exception is the **priority list** (`tx_priority_users`, migration_24, managed
+from the viewer's `/tx-priority` page): those users are excluded from filler 5's pool entirely and
+walked by `Python/update_priority_tx.py`, a cycle step that BUYS up to 2 dedicated 50-call requests
+per cycle for them (`--priority-tx N` on `db_web.py`, `WARERA_PRIORITY_TX_FILLER=0`) and hands the
+slots the list can't fill to the ordinary fillers — zero requests when the list has nothing pending.
+The ordinary fillers can be given the same treatment on demand: `Python/update_filler_boost.py`
+is a cycle step that buys N **empty** 50-call requests (no essential calls at all, so
+`FillerPool` fills all 50 slots) purely to drain the fillers faster — off by default, switched on
+and sized from the viewer's `/stats` "Cycle config" panel (persisted in
+`state/viewer_settings.json`, applied on the next cycle without a restart; also `--filler-boost N`
+on `db_web.py`, `WARERA_FILLER_BOOST=0`, cap `config.FILLER_BOOST_MAX` = 20 ≈ +80 requests/min,
+~110/min in total against the API's ~200/min). Unlike the priority step its "nothing pending → no request" guarantee
+is weak: the user-lite refresh and the window probes nearly always have something to ask for, so
+check `update_filler_boost.py --verify` before raising N. Wall time stays small because both
+halves are pipelined: the requests go out in PARALLEL (like `update_live.py`'s ranking walk) and
+each wave's statements are flushed by a background writer thread while the next wave is in flight
+(`FillerPool.take_stmts` hands the buffers over; `stmts()` stays non-destructive for the other four
+consumers). A failed flush skips `save_state`, so cursors never advance past unstored pages.
+Measured 2026-08-15 at N=4: ~5s wall for ~2.8s of API + ~3.6s of flush, ~15K statements.
 Pools stop naturally once drained. State lives in `state/*.json` (gitignored, regenerable); since
 the viewer's cycle steps run as parallel subprocesses, filler state writes are serialized under a
-flock (`state/.filler_pool.lock`) and merged against the on-disk copy (`write_json_merged`) —
+flock (`state/.filler_pool.lock`) —
 **don't run `update_transactions.py` standalone while a viewer cycle is running**, it skips the
-lock. Env gates: `WARERA_TX_FILLER=0` (all three transaction fillers), `WARERA_ITEM_MARKET_FILLER=0`,
-`WARERA_USER_TX_FILLER=0`.
+lock.
+
+**Filler shards (2026-08-15, load-bearing).** All five filler-carrying steps build their pools from
+the SAME state files, each filler's in-flight dedupe is per-process, and the files are read once at
+start-up — so before sharding every step offered the *identical* page (verified: two `UserTxFiller`s
+from one state file produce byte-identical 50-call batches; the boost's flush was inserting 7-33%
+new rows). `viewer/updater.py` now gives each of those steps a distinct `WARERA_FILLER_SHARD` of
+`WARERA_FILLER_SHARDS`, and every filler takes its shard's units first, falling back to the common
+pool only when that leaves the batch half empty (`utils.filler_shard` / `shard_owns`, crc32 — never
+`hash()`, which is per-process randomized). Shard 0 is always `update_battles` and owns the window
+probes (one global unit). Measured after: 82-104% new rows. `WARERA_FILLER_SHARDS=1` disables it.
+
+Sharding makes the state write-back **targeted**: each filler now merges only the units it advanced
+(`_touched`) into a *fresh* on-disk read under the flock, with stats folded in as this run's delta.
+Writing the whole in-memory snapshot (what `write_json_merged` did until 2026-08-15) rolls back
+every unit another shard advanced while we ran — measured as two good cycles followed by 0% new
+rows. `TransactionFiller` keys its buckets by `(top_ms, bottom_ms)` for the same reason: the
+done-filtering reindexes the list, so positions mean different things in different processes. Env gates: `WARERA_TX_FILLER=0` (all three transaction fillers), `WARERA_ITEM_MARKET_FILLER=0`,
+`WARERA_USER_TX_FILLER=0`, `WARERA_PRIORITY_TX_FILLER=0` (the dedicated /tx-priority step),
+`WARERA_FILLER_BOOST=0` (the extra empty requests), `WARERA_FILLER_SHARDS=1` (undo the shard split).
 
 ### Cursor pagination (API quirk — load-bearing, don't "fix" this)
 
@@ -136,11 +175,17 @@ before writing new SQL against tables you haven't touched before.
 
 `db_web.py` is a thin entry point into the package: `config.py`, `updater.py` (the auto-update
 scheduler — spawns `update_battles.py` / `update_live.py` / `insert_ranking_sample.py` /
-`update_weekly_ranking.py` / `update_users_lite.py` as parallel subprocesses every 15s, staggered
+`update_weekly_ranking.py` / `update_users_lite.py` / `update_priority_tx.py` /
+`update_filler_boost.py` (only while the /stats boost switch is on) as parallel
+subprocesses every 15s, staggered
 by `LAUNCH_STAGGER` (0.2s) to stay under API rate limits), `queries.py`, `search.py`, `ui.py`
 (pjax navigation, dark/light theme, SSE clients), `server.py`, and `pages/` (battles, users, transactions,
-weekly, tracker, stats, SQL console). Reads go through `db.py` the same way the pipeline scripts
-write. The only write path into the DB is the automatic updater cycle.
+weekly, tracker, snipes, stats, tx-priority, SQL console). Reads go through `db.py` the same way the pipeline scripts
+write. The only write paths into the DB are the automatic updater cycle and the `/tx-priority`
+page's three list statements (`viewer/queries.exec_write` — parameterized and idempotent; read
+its docstring before using it anywhere else). `/stats` also mutates the *process's* config (never
+the DB): its "Cycle config" panel shows the live `config.settings` and edits the filler-boost
+switch/count, persisted to `state/viewer_settings.json` (`config.load_settings/save_settings`).
 
 The header countdown and the `/update-status` log are pushed over SSE
 (`/timer/stream`, `/update-status/stream`) rather than polled: every `UPDATE_STATE` mutation in

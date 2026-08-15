@@ -4,7 +4,10 @@ Every UPDATE_INTERVAL seconds (default 15) a scheduler thread runs
 Python/update_battles.py --force-active, then Python/update_live.py, then
 Python/insert_ranking_sample.py --latest N (skipped when N == 0), then
 Python/update_weekly_ranking.py (hourly self-throttled snapshot fetch),
-then Python/update_users_lite.py, then Python/rollup_endpoint_usage.py
+then Python/update_users_lite.py, then Python/update_priority_tx.py
+(dedicated requests for the /tx-priority list), then — only while the
+/stats page's filler-boost switch is on — Python/update_filler_boost.py
+(N empty 50-call requests bought for the fillers), then Python/rollup_endpoint_usage.py
 (daily self-throttled endpoints_used rollup + retention). A run is skipped
 (retried half an interval later) if a previous run is still going. Output
 is tee'd into UPDATE_STATE and shown on /update-status; /timer serves the
@@ -49,7 +52,7 @@ import threading
 import time
 from typing import Iterator
 
-from .config import (LIVE_SCRIPT, MAX_UPDATE_LINES, RANKING_SCRIPT, ROLLUP_SCRIPT, UPDATE_INTERVAL, UPDATE_SCRIPT, USER_LITE_SCRIPT, WEEKLY_SCRIPT, settings)
+from .config import (FILLER_BOOST_SCRIPT, LIVE_SCRIPT, MAX_UPDATE_LINES, PRIORITY_TX_SCRIPT, RANKING_SCRIPT, ROLLUP_SCRIPT, UPDATE_INTERVAL, UPDATE_SCRIPT, USER_LITE_SCRIPT, WEEKLY_SCRIPT, settings)
 from .queries import query_dicts
 from .ui import esc, layout
 
@@ -203,46 +206,82 @@ def _run_updater() -> None:
         rc0 = _boot_check(db, env) if settings.ranking_latest else 0
         # The cycle steps, launched staggered: battles first (it is the
         # longest step, ~5 s; the short steps finish during its run).
-        steps: list[tuple[str, str, list[str]]] = [
+        # (key, label, argv, carries a filler pool). The last field decides
+        # who gets a WARERA_FILLER_SHARD below: only the steps that build a
+        # FillerPool can pick the same page as another step.
+        steps: list[tuple[str, str, list[str], bool]] = [
             ("rc", "battles: update_battles.py",
-             [sys.executable, UPDATE_SCRIPT, "--db", db, "--force-active"]),
+             [sys.executable, UPDATE_SCRIPT, "--db", db, "--force-active"], True),
             ("rc3", "live sync: update_live.py",
-             [sys.executable, LIVE_SCRIPT, "--db", db]),
+             [sys.executable, LIVE_SCRIPT, "--db", db], True),
         ]
         if settings.ranking_latest:
             steps.append(("rc2",
                           f"rankings: insert_ranking_sample.py --latest {settings.ranking_latest}",
                           [sys.executable, RANKING_SCRIPT, "--latest",
-                           str(settings.ranking_latest)]))
+                           str(settings.ranking_latest)], False))
         if settings.weekly_enabled:
             steps.append(("rc5", "weekly snapshots: update_weekly_ranking.py",
-                          [sys.executable, WEEKLY_SCRIPT, "--db", db]))
+                          [sys.executable, WEEKLY_SCRIPT, "--db", db], True))
         if settings.user_lite_limit:
             steps.append(("rc4",
                           f"user lite: update_users_lite.py --limit {settings.user_lite_limit}",
                           [sys.executable, USER_LITE_SCRIPT, "--limit",
-                           str(settings.user_lite_limit)]))
+                           str(settings.user_lite_limit)], False))
+        if settings.transactions_enabled and settings.priority_tx_requests:
+            # The ONLY step that buys API requests for transaction history
+            # instead of riding slack: up to N dedicated 50-call requests for
+            # the /tx-priority list (their leftover slots go to the ordinary
+            # fillers). Makes no request at all when the list has nothing
+            # pending — see Python/update_priority_tx.py.
+            steps.append(("rc7",
+                          f"priority tx: update_priority_tx.py --requests "
+                          f"{settings.priority_tx_requests}",
+                          [sys.executable, PRIORITY_TX_SCRIPT, "--db", db,
+                           "--requests", str(settings.priority_tx_requests)], True))
+        if settings.filler_boost_enabled and settings.filler_boost_requests:
+            # The /stats "extra filler requests" switch: N EMPTY 50-call
+            # requests whose every slot is filler work, bought instead of
+            # waiting for the other steps' slack. Last of the API steps, so
+            # LAUNCH_STAGGER puts its burst furthest from the cycle's first
+            # request — see Python/update_filler_boost.py.
+            steps.append(("rc8",
+                          f"filler boost: update_filler_boost.py --requests "
+                          f"{settings.filler_boost_requests}",
+                          [sys.executable, FILLER_BOOST_SCRIPT, "--db", db,
+                           "--requests", str(settings.filler_boost_requests)], True))
         # Self-throttled to ~once/day (Python/rollup_endpoint_usage.py) — makes
         # no API calls, so it always runs; almost every invocation is a
         # single cheap MAX(day) check that finds nothing due.
         steps.append(("rc6", "endpoint usage rollup: rollup_endpoint_usage.py",
-                      [sys.executable, ROLLUP_SCRIPT, "--db", db]))
+                      [sys.executable, ROLLUP_SCRIPT, "--db", db], False))
         rcs: dict[str, int] = {}
         procs: dict[str, subprocess.Popen] = {}
-        for i, (key, label, argv) in enumerate(steps):
+        # Filler shards: every step below builds its pool from the SAME
+        # state files, and each pool's in-flight dedupe is per-process, so
+        # without a distinct shard they all offer the identical page (see
+        # utils.filler_shard — measured as a 7-59% statement-to-row ratio in
+        # the boost's flush before this). Shard 0 is always update_battles,
+        # which also makes it the owner of the window probes.
+        shards = [k for k, _l, _a, f in steps if f]
+        for i, (key, label, argv, uses_fillers) in enumerate(steps):
             if i:
                 time.sleep(LAUNCH_STAGGER)
             _log(f"\n=== {label} ===")
+            step_env = dict(env)
+            if uses_fillers:
+                step_env["WARERA_FILLER_SHARDS"] = str(len(shards))
+                step_env["WARERA_FILLER_SHARD"] = str(shards.index(key))
             try:
                 procs[key] = subprocess.Popen(
                     argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                    text=True, bufsize=1, env=env)
+                    text=True, bufsize=1, env=step_env)
             except OSError as exc:
                 rcs[key] = -1
                 _log(f"  launch failed: {exc}")
         if not rcs:
             with UPDATE_LOCK:
-                UPDATE_STATE["rc"] = _first_nonzero(rc0, 0, 0, 0, 0, 0, 0)
+                UPDATE_STATE["rc"] = _first_nonzero(rc0, 0, 0, 0, 0, 0, 0, 0, 0)
                 _bump()
 
         def _record(key: str) -> None:
@@ -250,7 +289,7 @@ def _run_updater() -> None:
                 UPDATE_STATE["rc"] = _first_nonzero(
                     rc0, rcs.get("rc", 0), rcs.get("rc3", 0),
                     rcs.get("rc2", 0), rcs.get("rc5", 0), rcs.get("rc4", 0),
-                    rcs.get("rc6", 0))
+                    rcs.get("rc7", 0), rcs.get("rc8", 0), rcs.get("rc6", 0))
                 _bump()
 
         def _tee_one(key: str, proc: subprocess.Popen) -> None:

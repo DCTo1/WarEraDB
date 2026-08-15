@@ -78,7 +78,7 @@ REPORT_TABLES = (
     "battle_ranking_entries", "round_ranking_entries", "items", "users",
     "inventory_ids", "battles", "rounds", "battle_bounties", "countries",
     "transactions", "parties", "weekly_ranking_snapshots",
-    "user_weekly_corrections",
+    "user_weekly_corrections", "tx_priority_users",
     "user_battle_stats (rebuilt on load)")
 
 

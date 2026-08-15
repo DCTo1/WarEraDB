@@ -35,6 +35,15 @@ The fillers:
       the DB once their scrape is confirmed finished and replaced by the
       next-in-line (a conveyor capped at USER_TX_TOTAL_LIMIT total users,
       USER_TX_POOL_SIZE in parallel).
+
+PriorityUserTxFiller (migration_24, 2026-08-14) is the odd one out: same
+shape, same state machine as UserTxFiller, but it is NOT part of
+build_filler_pool's set and never rides another step's slack. Its pool is
+the operator-curated tx_priority_users list (the viewer's /tx-priority
+page), and Python/update_priority_tx.py drives it in up to 2 DEDICATED
+50-call requests per updater cycle — the slots the list cannot fill are
+handed to the ordinary fillers above. Listed users are excluded from
+UserTxFiller entirely (its _excluded set and its candidate query).
 """
 
 import os
@@ -43,11 +52,12 @@ from db import query
 from update_transactions import TransactionFiller, _make_buckets, _store_stmts
 from update_users_lite import (Filler, mark_dead_stmts,
                                pick_created_at_backfill, upsert_stmts)
-from utils import (MAX_BATCH, PAGE_LIMIT, STATE_DIR, read_json, to_unix_ms,
-                   write_json, write_json_merged)
+from utils import (MAX_BATCH, PAGE_LIMIT, STATE_DIR, filler_shard, read_json,
+                   shard_owns, to_unix_ms, write_json)
 
 ITEM_MARKET_STATE = os.path.join(STATE_DIR, "item_market_state.json")
 USER_TX_STATE = os.path.join(STATE_DIR, "user_tx_state.json")
+PRIORITY_TX_STATE = os.path.join(STATE_DIR, "priority_tx_state.json")
 
 # Lock file serializing the filler state writes of the viewer's PARALLEL
 # cycle steps (viewer/updater.py launches them staggered since 2026-08-08;
@@ -99,7 +109,13 @@ USER_TX_POOL_SIZE = 100
 # from the XP ranking once this many have been consumed, so the walk drains
 # quietly when the last of them finishes. Raise/lower this manually to change
 # how far down the XP ranking the walk goes.
-USER_TX_TOTAL_LIMIT = 1000
+USER_TX_TOTAL_LIMIT = 10000
+
+# Safety cap on the /tx-priority walk's in-flight pool (PriorityUserTxFiller).
+# The list is operator-curated and normally a handful of users, so this only
+# bounds a pathological paste of thousands of names — the rest wait their turn
+# (the candidate query is ordered by added_at, so the list drains FIFO).
+PRIORITY_TX_POOL_SIZE = 200
 
 # Max independent time-bucket chains per user (mirrors MAX_BATCH — a user's
 # full history can be walked in as little as one batch when slack allows,
@@ -212,6 +228,24 @@ class FillerPool:
             out.extend(f.stmts())
         return out
 
+    def take_stmts(self) -> list[str]:
+        """stmts() ONCE — the statements are handed over and the fillers'
+        buffers cleared, so the next call returns only what arrived since.
+
+        stmts() is deliberately left non-destructive (update_battles /
+        update_live / update_weekly_ranking / update_priority_tx call it once
+        at the end of their run and expect everything). This variant exists
+        for update_filler_boost.py, which flushes each request's results while
+        the next request is still in flight: without the hand-over every
+        flush would re-send all previous ones. Statement DEDUPE is per call
+        (_store_stmts dedupes by _id within one list), so an item fetched in
+        two different waves is now sent twice instead of once — harmless,
+        insert_transaction is an idempotent upsert."""
+        out: list[str] = []
+        for f in self.fillers:
+            out.extend(f.take_stmts())
+        return out
+
     def save_state(self) -> None:
         """Persist all state files, serialized against the other cycle steps.
 
@@ -252,11 +286,21 @@ class ItemMarketFiller:
         self.state = read_json(ITEM_MARKET_STATE, {"codes": {}, "stats": {}})
         self._items: list[dict] = []
         self._offer = 0       # round-robin position into ITEM_MARKET_CODES
+        self._shard_i, self._shard_n = filler_shard()
+        self._touched: set[str] = set()    # codes THIS run advanced
+        self._stats0 = dict(self.state.get("stats", {}))
         self._dirty = False
 
     def top_up(self, calls: list[tuple[str, dict]]) -> tuple[list[int], list[tuple[str, bool]]]:
         """One page per pending code (round-robin); returns (positions, the
-        (code, was-cursor-less) pairs in position order — the collect token)."""
+        (code, was-cursor-less) pairs in position order — the collect token).
+
+        Two passes: this process's shard of the codes first, then — only if
+        the batch still has room — the rest. The second pass is what keeps a
+        shard whose codes are all done from riding along empty; it re-admits
+        the duplicate fetches sharding exists to prevent, but only once the
+        pool is too small to fill the batch, i.e. when a duplicate costs a
+        slot that had nothing else to do anyway."""
         slots: list[int] = []
         tokens: list[tuple[str, bool]] = []
         state = self.state.setdefault("codes", {})
@@ -265,23 +309,35 @@ class ItemMarketFiller:
             return slots, tokens
         base = self._offer
         last_k = -1
-        for k in range(n):
+        taken: set[str] = set()   # per REQUEST: pass 2 must not re-offer what
+                                  # pass 1 took (a LATER request re-offering a
+                                  # code is how its pages chain, so this set
+                                  # deliberately does not outlive the call)
+        for shard_only in (True, False):
             if len(calls) >= MAX_BATCH:
                 break
-            last_k = k
-            code = ITEM_MARKET_CODES[(base + k) % n]
-            entry = state.get(code) or {}
-            if entry.get("done"):
-                continue
-            p = {"transactionType": "itemMarket", "itemCode": code,
-                 "limit": PAGE_LIMIT, "direction": "forward"}
-            cursor = entry.get("cursor_ms")
-            no_cursor = cursor is None
-            if cursor:
-                p["cursor"] = str(cursor)
-            slots.append(len(calls))
-            tokens.append((code, no_cursor))
-            calls.append((self.ENDPOINT, p))
+            if shard_only and self._shard_n < 2:
+                continue          # sharding off: one unfiltered pass is enough
+            for k in range(n):
+                if len(calls) >= MAX_BATCH:
+                    break
+                code = ITEM_MARKET_CODES[(base + k) % n]
+                entry = state.get(code) or {}
+                if entry.get("done") or code in taken:
+                    continue
+                if shard_only and not shard_owns(code, self._shard_i, self._shard_n):
+                    continue
+                last_k = k
+                taken.add(code)
+                p = {"transactionType": "itemMarket", "itemCode": code,
+                     "limit": PAGE_LIMIT, "direction": "forward"}
+                cursor = entry.get("cursor_ms")
+                no_cursor = cursor is None
+                if cursor:
+                    p["cursor"] = str(cursor)
+                slots.append(len(calls))
+                tokens.append((code, no_cursor))
+                calls.append((self.ENDPOINT, p))
         if last_k >= 0:
             self._offer = (base + last_k + 1) % n
         return slots, tokens
@@ -299,6 +355,7 @@ class ItemMarketFiller:
                 continue  # retried by the next run — the code keeps its cursor
             its = (res["result"]["data"].get("items")) or []
             entry = state.setdefault(code, {})
+            self._touched.add(code)   # save_state writes back only these
             if its:
                 self._items.extend(its)
                 stats["items"] = stats.get("items", 0) + len(its)
@@ -320,12 +377,33 @@ class ItemMarketFiller:
     def stmts(self) -> list[str]:
         return _store_stmts(self._items)
 
+    def take_stmts(self) -> list[str]:
+        """stmts() + hand over the buffer (see FillerPool.take_stmts)."""
+        out = self.stmts()
+        self._items = []
+        return out
+
     def save_state(self) -> None:
+        """Write this run's codes into a fresh on-disk copy — same rule (and
+        same reason) as UserTxFiller.save_state: with filler shards our
+        untouched entries are another step's fresh progress, so only
+        ``_touched`` may be written back."""
         if not self._dirty:
             return
-        # merge against the on-disk copy (concurrent cycle steps) — the
-        # caller holds the filler pool lock (FillerPool.save_state)
-        write_json_merged(ITEM_MARKET_STATE, self.state)
+        # the caller holds the filler pool lock (FillerPool.save_state), so
+        # this read-modify-write is atomic against the other cycle steps
+        disk = read_json(ITEM_MARKET_STATE, None) or {"codes": {}, "stats": {}}
+        codes = disk.setdefault("codes", {})
+        mine = self.state.get("codes", {})
+        for c in self._touched:
+            if c in mine:
+                codes[c] = mine[c]
+        st = disk.setdefault("stats", {})
+        for k, v in self.state.get("stats", {}).items():
+            delta = v - self._stats0.get(k, 0)
+            if delta:
+                st[k] = st.get(k, 0) + delta
+        write_json(ITEM_MARKET_STATE, disk)
 
 
 def _user_bucket_count(span_ms: int) -> int:
@@ -423,14 +501,41 @@ class UserTxFiller:
                 "WHERE user_id = objectid_to_uuid('{hex}')\n"
                 "  AND transactions_scraped_at IS NULL")
 
+    STATE_PATH = USER_TX_STATE
+    # Whether _refill deletes state entries this walk is no longer allowed to
+    # touch (see PriorityUserTxFiller — the XP walk keeps them, so a user
+    # taken off the /tx-priority list resumes here instead of restarting).
+    PRUNE_EXCLUDED = False
+
+    # Sharded across the cycle's filler-carrying processes (utils.filler_shard).
+    # PriorityUserTxFiller turns this OFF: only one process ever runs it, so
+    # a shard filter there would just hide work from the single owner.
+    SHARDED = True
+
     def __init__(self, db: str) -> None:
         self.db = db
-        self.state = read_json(USER_TX_STATE, {"users": {}, "stats": {}})
+        self.state = read_json(self.STATE_PATH, {"users": {}, "stats": {}})
         self._items: list[dict] = []
         self._marks: list[str] = []
         self._offer = 0       # round-robin position into the active set
         self._offered: set[tuple] = set()  # (hex, kind[, idx]) offered THIS run
+        self._shard_i, self._shard_n = filler_shard() if self.SHARDED else (0, 1)
+        self._touched: set[str] = set()    # users THIS run advanced
+        self._stats0 = dict(self.state.get("stats", {}))   # for the delta below
         self._dirty = False
+        self._skip = self._excluded()
+
+    def _excluded(self) -> set[str]:
+        """Hexes this walk must never touch: the /tx-priority list
+        (tx_priority_users, migration_24). Those users are walked by
+        Python/update_priority_tx.py's DEDICATED requests instead of riding
+        the slack, so they are skipped BOTH here (a user already in flight
+        when they were listed simply stops being offered — state entries are
+        never deleted, see the class docstring) and in the refill's candidate
+        query. PriorityUserTxFiller overrides this with the empty set."""
+        return {r[0] for r in query(
+            "SELECT lower(uuid_to_objectid(user_id)) FROM tx_priority_users;",
+            self.db)}
 
     def top_up(self, calls: list[tuple[str, dict]]) -> tuple[list[int], list[tuple]]:
         """Fill slack with whatever's ready: a bootstrap probe for
@@ -446,19 +551,46 @@ class UserTxFiller:
         slots: list[int] = []
         tokens: list[tuple] = []
         users = self.state.setdefault("users", {})
-        keys = [h for h, e in users.items() if not e.get("done")]
+        keys = [h for h, e in users.items()
+                if not e.get("done") and h not in self._skip]
         n = len(keys)
         if not n:
             return slots, tokens
         base = self._offer % n
         order = keys[base:] + keys[:base]
+        # Pass 1 takes only this process's shard of the units, pass 2 (only
+        # if the batch still has room) takes anything left. Without the
+        # split every cycle step offers the SAME pages — see
+        # utils.filler_shard. With it, a shard that has run dry still fills
+        # its batch from the common pool, which re-admits duplicates exactly
+        # when there is nothing else for those slots to do.
+        for shard_only in (True, False):
+            if len(calls) >= MAX_BATCH:
+                break
+            if shard_only and self._shard_n < 2:
+                continue
+            self._fill(calls, slots, tokens, users, order, shard_only)
+        self._offer = (base + 1) % n
+        return slots, tokens
+
+    def _mine(self, tok: tuple, shard_only: bool) -> bool:
+        """Is this unit takeable in the current pass? (pass 2 takes all)"""
+        return not shard_only or shard_owns(tok, self._shard_i, self._shard_n)
+
+    def _fill(self, calls: list[tuple[str, dict]], slots: list[int],
+              tokens: list[tuple], users: dict, order: list[str],
+              shard_only: bool) -> None:
+        """One pass over the active users, appending every unit of work they
+        have ready (bootstrap probe / bucket page / same-ms sweep / recheck
+        probe) that this pass may take and ``_offered`` has not already
+        handed out in this run."""
         for h in order:
             if len(calls) >= MAX_BATCH:
                 break
             e = users[h]
             if not e.get("bootstrapped"):
                 tok = (h, "bootstrap", None)
-                if tok in self._offered:
+                if tok in self._offered or not self._mine(tok, shard_only):
                     continue
                 self._offered.add(tok)
                 slots.append(len(calls))
@@ -481,7 +613,7 @@ class UserTxFiller:
                             if len(calls) >= MAX_BATCH:
                                 break
                             tok = (h, "sweep", (idx, code))
-                            if tok in self._offered:
+                            if tok in self._offered or not self._mine(tok, shard_only):
                                 continue
                             self._offered.add(tok)
                             slots.append(len(calls))
@@ -491,7 +623,7 @@ class UserTxFiller:
                                            "direction": "forward", "cursor": str(stall_ms + 1)}))
                         continue
                     tok = (h, "bucket", idx)
-                    if tok in self._offered:
+                    if tok in self._offered or not self._mine(tok, shard_only):
                         continue
                     self._offered.add(tok)
                     cursor = b.get("cursor_ms") or b["top_ms"] + 1
@@ -502,15 +634,13 @@ class UserTxFiller:
                                    "cursor": str(cursor)}))
             else:
                 tok = (h, "recheck", None)
-                if tok in self._offered:
+                if tok in self._offered or not self._mine(tok, shard_only):
                     continue
                 self._offered.add(tok)
                 slots.append(len(calls))
                 tokens.append(tok)
                 calls.append((self.ENDPOINT,
                               {"userId": h, "limit": PAGE_LIMIT, "direction": "forward"}))
-        self._offer = (base + 1) % n
-        return slots, tokens
 
     def _finish(self, h: str, e: dict) -> None:
         """Mark a user fully done (finished walk OR 404): flag, not pop —
@@ -531,6 +661,7 @@ class UserTxFiller:
             e = users.get(h)
             if e is None:
                 continue
+            self._touched.add(h)   # save_state writes back only these
             if "error" in res:
                 if (res["error"].get("data") or {}).get("httpStatus") == 404:
                     self._finish(h, e)  # deleted account: never served again
@@ -636,38 +767,74 @@ class UserTxFiller:
         out += [self.MARK_SQL.format(hex=h) for h in self._marks]
         return out
 
+    def take_stmts(self) -> list[str]:
+        """stmts() + hand over the buffers (see FillerPool.take_stmts). The
+        completion marks travel with the items they follow, so a user's
+        transactions_scraped_at stamp is never committed before its rows."""
+        out = self.stmts()
+        self._items = []
+        self._marks = []
+        return out
+
     def save_state(self) -> None:
-        """Persist this run's progress (merged against the on-disk copy —
-        the caller holds the filler pool lock, FillerPool.save_state), then
-        refill the pool. Refill always runs (even on a quiet run with
-        nothing collected) so a freshly-drained or freshly-deployed pool
-        gets topped up."""
+        """Persist this run's progress into a FRESH on-disk copy (the caller
+        holds the filler pool lock, FillerPool.save_state), then refill the
+        pool. Refill always runs (even on a quiet run with nothing collected)
+        so a freshly-drained or freshly-deployed pool gets topped up.
+
+        Only the users this run actually advanced (``_touched``) are written
+        back. Writing the whole in-memory snapshot — what this did until
+        2026-08-15 — lets our start-of-run copy of every OTHER user overwrite
+        the progress a concurrent cycle step made while we ran. That was
+        survivable when every step walked the same users (they wrote the same
+        cursors), and became a data-losing bug the moment filler shards gave
+        each step its own slice: measured on the first sharded run, two good
+        cycles at 71% new rows followed by 0% — the shards were rolling each
+        other's cursors back and re-fetching stored pages. Stats are folded in
+        as this run's DELTA for the same reason."""
         if self._dirty:
-            write_json_merged(USER_TX_STATE, self.state)
+            disk = read_json(self.STATE_PATH, None) or {"users": {}, "stats": {}}
+            users = disk.setdefault("users", {})
+            mine = self.state.get("users", {})
+            for h in self._touched:
+                if h in mine:
+                    users[h] = mine[h]
+            st = disk.setdefault("stats", {})
+            for k, v in self.state.get("stats", {}).items():
+                delta = v - self._stats0.get(k, 0)
+                if delta:
+                    st[k] = st.get(k, 0) + delta
+            write_json(self.STATE_PATH, disk)
         self._refill()
 
     def _refill(self) -> None:
-        """Bring the pool up to USER_TX_POOL_SIZE from the XP ranking, bounded
-        by USER_TX_TOTAL_LIMIT total (DB-stamped + in flight) — decided
-        against a FRESH on-disk read taken right here, under the lock, not
-        against __init__'s possibly-stale snapshot. See the class docstring's
-        note on the pre-2026-08-13 overshoot this closes."""
-        disk = read_json(USER_TX_STATE, {"users": {}, "stats": {}})
+        """Bring the pool up to its size cap from this walk's candidate source
+        (_room / _candidates — the XP ranking here, the /tx-priority list in
+        PriorityUserTxFiller) — decided against a FRESH on-disk read taken
+        right here, under the lock, not against __init__'s possibly-stale
+        snapshot. See the class docstring's note on the pre-2026-08-13
+        overshoot this closes."""
+        disk = read_json(self.STATE_PATH, {"users": {}, "stats": {}})
         users = disk.setdefault("users", {})
+        changed = False
+        if self.PRUNE_EXCLUDED:
+            # Drop entries this walk may no longer touch (de-listed users) so
+            # the file doesn't accumulate them forever. Safe here and only
+            # here: _refill rewrites the whole file (write_json, not the
+            # merge), and this state file has exactly one writer.
+            for h in [h for h in users if h in self._skip]:
+                del users[h]
+                changed = True
         active = sum(1 for e in users.values() if not e.get("done"))
-        room = USER_TX_POOL_SIZE - active
+        room = self._room(active)
         if room <= 0:
-            return
-        (consumed,) = query(
-            "SELECT count(*) FROM users WHERE transactions_scraped_at IS NOT NULL",
-            self.db)[0]
-        room = min(room, USER_TX_TOTAL_LIMIT - consumed - active)
-        if room <= 0:
+            if changed:
+                write_json(self.STATE_PATH, disk)
             return
         # Over-fetch by len(users), then skip-and-count instead of trusting
         # LIMIT room to yield room NEW users: a user already in the dict but
         # not yet DB-stamped (in flight, or dropped as a 404) still matches
-        # this WHERE, and since the pool is picked by XP DESC those
+        # the candidate WHERE, and since the pool is picked by XP DESC those
         # collisions sit at the very TOP of the candidate list. A plain
         # LIMIT room could therefore return nothing but users we already
         # hold and add zero (measured 2026-08-14: active=1, room=1, and the
@@ -675,16 +842,10 @@ class UserTxFiller:
         # short of the cap indefinitely; mid-run, with the top `active`
         # rows always colliding, it pinned the pool near
         # USER_TX_POOL_SIZE/2 instead of USER_TX_POOL_SIZE).
-        rows = query(
-            "SELECT lower(uuid_to_objectid(user_id)) AS hex,\n"
-            "       (EXTRACT(EPOCH FROM account_created_at) * 1000)::bigint AS created_ms\n"
-            "FROM users\n"
-            "WHERE transactions_scraped_at IS NULL\n"
-            "ORDER BY total_xp DESC NULLS LAST\n"
-            f"LIMIT {room + len(users)};", self.db)
-        added = False
-        for h, created_ms in rows:
-            if h in users:
+        added = changed
+        for h, created_ms in self._candidates(room + len(users)):
+            e = users.get(h)
+            if e is not None and not self._restart(e):
                 continue
             users[h] = {"created_ms": created_ms, "bootstrapped": False,
                         "walk_top_id": None, "walk_top_ms": None,
@@ -694,7 +855,118 @@ class UserTxFiller:
             if room == 0:
                 break
         if added:
-            write_json(USER_TX_STATE, disk)
+            write_json(self.STATE_PATH, disk)
+
+    def _restart(self, entry: dict) -> bool:
+        """Whether a candidate we already hold state for should be walked
+        again from scratch. Never here: a held entry is either in flight or
+        finished, and finished ones are DB-stamped so they aren't candidates.
+        PriorityUserTxFiller overrides it — the /tx-priority page's re-scrape
+        clears the stamp, which must revive its done state entry."""
+        return False
+
+    def _room(self, active: int) -> int:
+        """Free slots: USER_TX_POOL_SIZE in parallel, USER_TX_TOTAL_LIMIT
+        ever (DB-stamped + in flight)."""
+        room = USER_TX_POOL_SIZE - active
+        if room <= 0:
+            return 0
+        (consumed,) = query(
+            "SELECT count(*) FROM users WHERE transactions_scraped_at IS NOT NULL",
+            self.db)[0]
+        return min(room, USER_TX_TOTAL_LIMIT - consumed - active)
+
+    def _candidates(self, limit: int) -> list:
+        """(hex, created_ms) rows for the pool: unfinished users by XP, minus
+        the /tx-priority list (walked by update_priority_tx.py instead)."""
+        return query(
+            "SELECT lower(uuid_to_objectid(user_id)) AS hex,\n"
+            "       (EXTRACT(EPOCH FROM account_created_at) * 1000)::bigint AS created_ms\n"
+            "FROM users u\n"
+            "WHERE transactions_scraped_at IS NULL\n"
+            "  AND NOT EXISTS (SELECT 1 FROM tx_priority_users p\n"
+            "                  WHERE p.user_id = u.user_id)\n"
+            "ORDER BY total_xp DESC NULLS LAST\n"
+            f"LIMIT {limit};", self.db)
+
+
+class PriorityUserTxFiller(UserTxFiller):
+    """The /tx-priority walk: same per-user bucket state machine as
+    UserTxFiller, but its pool is the operator-curated tx_priority_users list
+    (migration_24) instead of the XP ranking, and it does NOT ride other
+    steps' slack — Python/update_priority_tx.py drives it in up to 2
+    DEDICATED 50-call requests per updater cycle, and only the slots the list
+    cannot fill go to the ordinary fillers.
+
+    Everything else is inherited: bootstrap → buckets (+ the same-ms sweep) →
+    recheck, the 404 drop, and the users.transactions_scraped_at stamp that
+    marks a user fully scraped. A listed user that is already stamped is
+    simply not a candidate (it shows as done on the page and costs nothing);
+    clearing the stamp from the page re-walks the whole history.
+
+    Own state file (state/priority_tx_state.json) so the two pools never
+    share bucket progress, and an inverted _excluded(): the base class skips
+    LISTED users (they belong to this walk), this one skips the DE-LISTED
+    leftovers of its own state — and prunes them on the next refill
+    (PRUNE_EXCLUDED).
+    """
+
+    SHARDED = False
+
+    STATE_PATH = PRIORITY_TX_STATE
+    PRUNE_EXCLUDED = True
+
+    def _excluded(self) -> set[str]:
+        """Held hexes that are no longer listed: the page's remove button
+        deletes the row, and state entries can't be deleted (write_json_merged
+        never removes a key), so an in-flight walk of a de-listed user is
+        stopped by skipping it here instead."""
+        listed = {r[0] for r in query(
+            "SELECT lower(uuid_to_objectid(user_id)) FROM tx_priority_users;",
+            self.db)}
+        return {h for h in self.state.get("users", {}) if h not in listed}
+
+    def _restart(self, entry: dict) -> bool:
+        """A listed user the DB says is NOT scraped but our state calls done
+        was re-queued from /tx-priority (the page cleared
+        transactions_scraped_at): walk the whole history again from scratch."""
+        return bool(entry.get("done"))
+
+    def _room(self, active: int) -> int:
+        """The list is the cap; PRIORITY_TX_POOL_SIZE only bounds a
+        pathological one (the rest wait, the candidate query is FIFO)."""
+        return PRIORITY_TX_POOL_SIZE - active
+
+    def _candidates(self, limit: int) -> list:
+        """(hex, created_ms) for listed users not yet fully scraped, oldest
+        entry first."""
+        return query(
+            "SELECT lower(uuid_to_objectid(u.user_id)) AS hex,\n"
+            "       (EXTRACT(EPOCH FROM u.account_created_at) * 1000)::bigint AS created_ms\n"
+            "FROM tx_priority_users p\n"
+            "JOIN users u ON u.user_id = p.user_id\n"
+            "WHERE u.transactions_scraped_at IS NULL\n"
+            "ORDER BY p.added_at\n"
+            f"LIMIT {limit};", self.db)
+
+    def has_work(self) -> bool:
+        """True when some LISTED user still has a unit of work pending — the
+        driver script checks this before building a request (de-listed
+        leftovers don't count: top_up skips them)."""
+        return any(not e.get("done")
+                   for h, e in self.state.get("users", {}).items()
+                   if h not in self._skip)
+
+    def start_request(self) -> None:
+        """Reset the per-run offer dedupe between the driver's requests.
+
+        _offered exists so one request can't offer the same bucket twice
+        (its response hasn't been processed yet). Across the driver's
+        requests that no longer holds — request N's results are collected
+        before request N+1 is built — so clearing it lets a short list keep
+        chaining the same buckets' pages instead of leaving the second
+        request half empty."""
+        self._offered.clear()
 
 
 class CreatedAtBackfillFiller:
@@ -724,6 +996,7 @@ class CreatedAtBackfillFiller:
         self.db = db
         self.fetched: dict = {}
         self.dead: list[str] = []
+        self._shard_i, self._shard_n = filler_shard()
 
     def top_up(self, calls: list[tuple[str, dict]]) -> tuple[list[int], list[str]]:
         slots: list[int] = []
@@ -731,7 +1004,12 @@ class CreatedAtBackfillFiller:
         room = MAX_BATCH - len(calls)
         if room <= 0:
             return slots, hexes
-        for h in pick_created_at_backfill(self.db, room):
+        # This shard's slice of the XP-ranked queue, head of the queue as the
+        # fallback when the slice is empty (utils.filler_shard).
+        pool = pick_created_at_backfill(self.db, room, self._shard_i * room)
+        if not pool and self._shard_i:
+            pool = pick_created_at_backfill(self.db, room)
+        for h in pool:
             slots.append(len(calls))
             hexes.append(h)
             calls.append((self.ENDPOINT, {"userId": h}))
@@ -751,6 +1029,12 @@ class CreatedAtBackfillFiller:
 
     def stmts(self) -> list[str]:
         return upsert_stmts(self.fetched) + mark_dead_stmts(self.dead)
+
+    def take_stmts(self) -> list[str]:
+        """stmts() + hand over the buffers (see FillerPool.take_stmts)."""
+        out = self.stmts()
+        self.fetched, self.dead = {}, []
+        return out
 
     def save_state(self) -> None:
         """No-op: no state file, the pool is re-derived from the DB every run."""
@@ -773,6 +1057,10 @@ def build_filler_pool(db: str) -> FillerPool:
          LAST: folding it into #1's pool instead was tried and reverted
          2026-08-13, it monopolized every cycle's slack for hours with
          ~107K candidates in a fresh DB (see CreatedAtBackfillFiller).
+    PriorityUserTxFiller is deliberately NOT here: the /tx-priority list gets
+    its own dedicated requests (Python/update_priority_tx.py), and this pool
+    fills whatever slots that step's list can't — see the module docstring.
+
     Env gates (all default ON): WARERA_TX_FILLER=0 disables the three
     transaction fillers (the viewer's --transactions 0 sets this for every
     spawned script); WARERA_ITEM_MARKET_FILLER=0 / WARERA_USER_TX_FILLER=0

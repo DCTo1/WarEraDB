@@ -596,3 +596,28 @@ CREATE TABLE user_weekly_corrections (
 
     PRIMARY KEY (user_id, week_start)
 );
+
+
+-- =============================================================================
+-- 12. Transaction scrape priority list (migration_24, 2026-08-14)
+--
+-- Operator-curated list of users whose FULL transaction history should be
+-- scraped first (the API's userId filter bypasses the rolling 72 h window).
+-- Managed from the viewer's /tx-priority page; consumed by
+-- fillers.PriorityUserTxFiller, which Python/update_priority_tx.py drives in
+-- up to 2 DEDICATED 50-call requests per updater cycle.
+--
+-- Listed users are deliberately EXCLUDED from the ordinary XP-ranked
+-- UserTxFiller pool (both its refill and its top_up): they are walked by the
+-- dedicated requests instead of riding other steps' slack, so a manual pick
+-- never waits behind the XP conveyor. Completion is still tracked by
+-- users.transactions_scraped_at — a listed user that is already stamped shows
+-- as done and costs nothing; clearing the stamp (/tx-priority re-scrape)
+-- re-walks the whole history.
+-- =============================================================================
+
+CREATE TABLE tx_priority_users (
+    user_id  UUID PRIMARY KEY REFERENCES users(user_id),  -- the prioritized user
+    added_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),          -- FIFO order of the walk
+    note     TEXT NULL                                    -- free-form operator note
+);

@@ -129,7 +129,7 @@ def exec_many(stmts: list[str], db: str | None = None, pre: str = "") -> int:
 
 @_as_db_error
 def exec_batch(stmts: list[str], db: str | None = None, pre: str = "",
-               chunk: int = 1000) -> None:
+               chunk: int = 1000, post: str = "") -> int | None:
     """Run statements in ONE transaction, `chunk` of them per round trip.
 
     For pure-INSERT batches (upsert function calls) where per-statement
@@ -138,6 +138,15 @@ def exec_batch(stmts: list[str], db: str | None = None, pre: str = "",
     statements as 1000-per-string turns 20K round trips into 20 — the live
     ranking walk's flush used to spend 8-12 s per 20K statements purely in
     round trips (exec_many sends each statement individually).
+
+    *post* is one extra query run LAST inside the same transaction, whose
+    first column of the first row is returned (None without it). It exists
+    because the per-statement rowcounts are exactly what this shape throws
+    away: pairing the batch with a pg_stat_xact_all_tables read tells the
+    caller how many rows the batch really inserted vs. how many statements
+    it sent — see update_filler_boost.ROWS_SQL. Transaction-local, so no
+    before/after snapshot and no interference from the other cycle steps
+    writing concurrently.
     """
     with engine(db).begin() as conn:
         _flush_endpoint_log(conn)
@@ -145,6 +154,10 @@ def exec_batch(stmts: list[str], db: str | None = None, pre: str = "",
             conn.exec_driver_sql(pre)
         for i in range(0, len(stmts), chunk):
             conn.exec_driver_sql(";\n".join(stmts[i:i + chunk]) + ";")
+        if post:
+            row = conn.exec_driver_sql(post).fetchone()
+            return int(row[0]) if row and row[0] is not None else 0
+    return None
 
 
 @_as_db_error

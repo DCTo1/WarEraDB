@@ -70,8 +70,9 @@ from datetime import datetime, timezone
 
 from api import NotFoundError, batched_fetch, make_session
 from db import exec_batch, query
-from utils import (MAX_BATCH, PAGE_LIMIT, STATE_DIR, prepare_transaction,
-                   read_json, to_unix_ms, write_json_merged)
+from utils import (MAX_BATCH, PAGE_LIMIT, STATE_DIR, filler_shard,
+                   prepare_transaction, read_json, shard_owns, to_unix_ms,
+                   write_json, write_json_merged)
 
 ENDPOINT = "transaction.getPaginatedTransactions"
 STATE_FILE = os.path.join(STATE_DIR, "transactions_state.json")
@@ -343,6 +344,9 @@ class TransactionFiller:
         self._offered: set[int] = set()
         self._items: list[dict] = []
         self._newest_ms: int | None = None
+        self._shard_i, self._shard_n = filler_shard()
+        self._probed = False       # did THIS run touch the live-probe anchor?
+        self._stats0 = dict(self.state.get("stats", {}))
         self._dirty = False
 
     def _probes_due(self, now_ms: int) -> bool:
@@ -374,7 +378,13 @@ class TransactionFiller:
         # must stay covered even while a large bucket pile is draining —
         # buckets first starve the probes (their gap detection is what keeps
         # the newest data flowing, and the pile only shrinks by draining).
-        if self._probes_due(now_ms):
+        # Probes are ONE global unit of work, not a pool: every cycle step
+        # reads the same last_probe_ms at start-up, so before sharding all
+        # five of them fired their own round at the same newest ~26 s and
+        # four of the five landed entirely on ON CONFLICT DO NOTHING. Shard 0
+        # (always update_battles — the first filler-carrying step) owns them.
+        if self._shard_i == 0 and self._probes_due(now_ms):
+            self._probed = True
             for i in range(DEFAULT_PROBE_DEPTH):
                 if len(calls) >= MAX_BATCH:
                     break
@@ -385,18 +395,28 @@ class TransactionFiller:
                 tokens.append(("probe", i))
                 slots.append(len(calls))
                 calls.append(("transaction.getPaginatedTransactions", p))
-        for i, b in enumerate(buckets):
+        # Shard pass then fallback pass — same contract as the other fillers
+        # (utils.filler_shard): this process's buckets first, anything left
+        # only once the batch would otherwise ride along half empty.
+        for shard_only in (True, False):
             if len(calls) >= MAX_BATCH:
                 break
-            if b.get("done") or i in self._offered:
+            if shard_only and self._shard_n < 2:
                 continue
-            cursor = b.get("cursor_ms") or b["top_ms"] + 1
-            tokens.append(("bucket", i))
-            slots.append(len(calls))
-            self._offered.add(i)
-            calls.append(("transaction.getPaginatedTransactions",
-                          {"limit": PAGE_LIMIT, "direction": "forward",
-                           "cursor": str(cursor)}))
+            for i, b in enumerate(buckets):
+                if len(calls) >= MAX_BATCH:
+                    break
+                if b.get("done") or i in self._offered:
+                    continue
+                if shard_only and not shard_owns(i, self._shard_i, self._shard_n):
+                    continue
+                cursor = b.get("cursor_ms") or b["top_ms"] + 1
+                tokens.append(("bucket", i))
+                slots.append(len(calls))
+                self._offered.add(i)
+                calls.append(("transaction.getPaginatedTransactions",
+                              {"limit": PAGE_LIMIT, "direction": "forward",
+                               "cursor": str(cursor)}))
         return slots, tokens
 
     def collect(self, results: list, slots: list[int],
@@ -473,19 +493,56 @@ class TransactionFiller:
         (deduped by _id; idempotent ON CONFLICT on insert)."""
         return _store_stmts(self._items)
 
+    def take_stmts(self) -> list[str]:
+        """stmts() + hand over the buffer (see fillers.FillerPool.take_stmts)."""
+        out = self.stmts()
+        self._items = []
+        return out
+
     def save_state(self) -> None:
-        """Filter done buckets and persist the shared state (atomic write,
-        merged against the on-disk copy — the viewer's updater runs the
-        consuming scripts as PARALLEL subprocesses since 2026-08-08, and the
-        pool's save_state serializes the writes under a lock; see
-        fillers.FillerPool.save_state). No-op when nothing was fetched or
-        processed this run."""
+        """Merge THIS run's buckets into a fresh on-disk copy and drop the
+        finished ones. No-op when nothing was fetched or processed this run.
+
+        The caller holds the filler pool lock (fillers.FillerPool.save_state),
+        so this read-modify-write is atomic against the other cycle steps —
+        which is what makes a targeted merge possible. It replaced a
+        write_json_merged of the whole snapshot on 2026-08-15, when filler
+        shards (utils.filler_shard) gave each step its own buckets: the merge
+        overlays lists WHOLESALE, so the last writer's bucket list won and
+        every other shard's advanced cursors were rolled back, re-fetching
+        pages already stored.
+
+        Buckets are matched by their immutable (top_ms, bottom_ms) span
+        rather than by list position — the done-filtering below reindexes the
+        list, so positions mean different things in different processes. Ours
+        wins for a bucket we fetched a page for this run (``_offered``) or
+        minted (gap detection); the disk copy wins otherwise. ``live`` (the
+        probe anchor) is only written by the shard that owns the probes, and
+        stats are folded in as this run's delta."""
         if not self._dirty:
             return
-        state = self.state
-        state["buckets"][:] = [b for b in state.get("buckets", []) if not b.get("done")]
-        state["done"] = not state["buckets"]
-        write_json_merged(STATE_FILE, state)
+        disk = read_json(STATE_FILE, None) or {"live": {}, "buckets": [], "stats": {}}
+        span = lambda b: (b.get("top_ms"), b.get("bottom_ms"))
+        mine = {span(b) for i, b in enumerate(self.state.get("buckets", []))
+                if i in self._offered}
+        merged = {span(b): b for b in disk.get("buckets", [])}
+        for b in self.state.get("buckets", []):
+            k = span(b)
+            if k not in merged or k in mine:
+                merged[k] = b
+        buckets = [b for b in merged.values() if not b.get("done")]
+        disk["buckets"] = buckets
+        disk["done"] = not buckets
+        disk["window_hours"] = self.state.get(
+            "window_hours", disk.get("window_hours", DEFAULT_WINDOW_HOURS))
+        if self._probed:
+            disk["live"] = self.state.get("live", {})
+        st = disk.setdefault("stats", {})
+        for k2, v in self.state.get("stats", {}).items():
+            delta = v - self._stats0.get(k2, 0)
+            if delta:
+                st[k2] = st.get(k2, 0) + delta
+        write_json(STATE_FILE, disk)
 
 
 def verify(db: str) -> int:

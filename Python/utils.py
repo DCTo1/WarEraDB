@@ -22,6 +22,7 @@ Usage
 
 import json
 import os
+import zlib
 from datetime import datetime, timezone
 
 # Python/ directory — the root for the pipeline's shared modules. Scripts
@@ -68,6 +69,43 @@ def parse_until_ms(value: str) -> int:
     if value.isdigit():
         return int(value)
     return to_unix_ms(value)
+
+
+def filler_shard() -> tuple[int, int]:
+    """This process's (index, count) slice of the shared filler pools.
+
+    The viewer runs FIVE processes per cycle that all build a filler pool
+    from the SAME state files (update_battles / update_live /
+    update_weekly_ranking / update_priority_tx / update_filler_boost). Each
+    filler's in-flight dedupe (`_offered`) is per-process and in-memory, and
+    the state files are only read at process start, so without a shard split
+    every one of them offers the IDENTICAL page (measured 2026-08-15: two
+    UserTxFillers built from one state file produced byte-identical 50-call
+    batches). The duplicates are invisible from the API side — every page is
+    valid, it just lands on ON CONFLICT DO NOTHING — and showed up as a
+    7-59% statement-to-row ratio in update_filler_boost's flush.
+
+    viewer/updater.py hands each filler-carrying step a distinct
+    WARERA_FILLER_SHARD; WARERA_FILLER_SHARDS=1 (the default, and what every
+    standalone run gets) restores the old undivided behavior.
+    """
+    try:
+        n = max(1, int(os.environ.get("WARERA_FILLER_SHARDS", "1")))
+        i = int(os.environ.get("WARERA_FILLER_SHARD", "0")) % n
+    except ValueError:
+        return 0, 1
+    return i, n
+
+
+def shard_owns(key, i: int, n: int) -> bool:
+    """Does shard *i* of *n* own this unit of filler work?
+
+    crc32, never Python's hash(): PYTHONHASHSEED randomizes str hashing per
+    process, so hash() would put the same unit in different shards in every
+    process — exactly the property this must not have. n < 2 → everything is
+    owned (sharding off).
+    """
+    return n < 2 or zlib.crc32(repr(key).encode()) % n == i
 
 
 def read_json(path: str, default):
