@@ -14,12 +14,14 @@ the per-request parse+plan (~1.5 ms each).
 from concurrent.futures import ThreadPoolExecutor
 from time import monotonic
 
+from sqlalchemy.exc import SQLAlchemyError
+
 from db import engine, query_dicts as _db_query_dicts
 
 from .config import settings
 
 __all__ = ["query_dicts", "query_dicts_nopar", "parallel_query_dicts",
-           "first_val", "country_cond", "cached_query_dicts"]
+           "first_val", "country_cond", "cached_query_dicts", "exec_write"]
 
 
 def query_dicts(sql: str, params: tuple | None = None) -> tuple[list, str | None]:
@@ -83,6 +85,26 @@ def cached_query_dicts(key: tuple, ttl: float, sql: str,
     if not err:
         _TTL_CACHE[key] = (now, rows)
     return rows, err
+
+
+def exec_write(sql: str, params: tuple | None = None) -> tuple[int, str | None]:
+    """Run ONE parameterized write; return (rows affected, error).
+
+    The viewer is read-only by design — the updater cycle owns the write path
+    (Python/db_web.py's docstring) — with exactly one exception: the
+    /tx-priority page's three list statements (add / remove / clear a user's
+    transactions_scraped_at). They touch only tx_priority_users and a single
+    users column, are parameterized (never string-built from query params),
+    and every one of them is idempotent, so a re-submitted URL is harmless.
+    Do not widen this helper's use without the same reasoning.
+    """
+    try:
+        with engine(settings.db).begin() as conn:
+            return conn.exec_driver_sql(sql, params).rowcount, None
+    except SQLAlchemyError as exc:
+        # engine().begin() raises SQLAlchemy's own errors — db.py's
+        # RuntimeError translation only wraps its own query helpers.
+        return 0, f"DB error: {exc}"
 
 
 def first_val(rows: list, key: str):
