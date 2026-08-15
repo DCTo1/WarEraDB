@@ -25,10 +25,10 @@ from urllib.parse import parse_qs
 
 from . import usage
 from .pages import (
-    page_battle, page_battles, page_bounties, page_countries, page_overview,
-    page_snipes, page_sql, page_stats, page_tracker, page_transactions,
-    page_transactions_coverage, page_tx_priority, page_user, page_users,
-    page_usage, page_weekly,
+    page_battle, page_battles, page_bounties, page_countries,
+    page_overview, page_snipes, page_sql, page_stats,
+    page_tracker, page_transactions, page_transactions_coverage,
+    page_tx_priority, page_user, page_users, page_usage, page_weekly,
 )
 from .search import search
 from .updater import log_events, page_update_status, timer_events, timer_state
@@ -51,6 +51,7 @@ ROUTES = {
     "/usage": page_usage,
     "/sql": page_sql,
     "/tx-priority": page_tx_priority,
+
     "/update-status": page_update_status,
 }
 

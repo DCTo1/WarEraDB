@@ -9,6 +9,7 @@ from .battle import page_battle
 from .battles import page_battles
 from .bounties import page_bounties
 from .countries import page_countries
+
 from .overview import page_overview
 from .snipes import page_snipes
 from .sql import page_sql
