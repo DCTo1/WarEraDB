@@ -1,5 +1,6 @@
 """Stats page: endpoint usage analytics + filler health from endpoints /
-endpoints_used and the fillers' state files.
+endpoints_used and the fillers' state files, plus the updater's live config
+and the one knob on it that is editable from the browser (the filler boost).
 
 Requests: every api.mixed_fetch POST gets one request_id (endpoint_log.log
 with the id) — a 50-call batch shares the id, so count(DISTINCT request_id)
@@ -15,7 +16,8 @@ import json
 import os
 import time
 
-from ..config import REPO
+from ..config import (FILLER_BOOST_MAX, REPO, UPDATE_INTERVAL, save_settings,
+                      settings)
 from ..queries import parallel_query_dicts
 from ..ui import esc, error_page, layout
 
@@ -172,8 +174,124 @@ def _filler_table(f: dict, tx: dict, im: dict, ut: dict, ul: dict) -> str:
     return "".join(out)
 
 
+def _boost_act(q: dict) -> str:
+    """Apply the filler-boost form in *q* (see config.Settings); return a banner.
+
+    The only mutation the viewer accepts from a browser besides /tx-priority's
+    list statements — and unlike those it touches no DB at all: it edits this
+    process's `settings` and persists the two fields to
+    state/viewer_settings.json. updater.py rebuilds its step list from
+    `settings` on every run, so a change lands on the NEXT cycle without a
+    restart. Idempotent, so a re-submitted URL is harmless.
+    """
+    changed = False
+    if "boost_n" in q:
+        raw = q.get("boost_n", [""])[0].strip()
+        try:
+            n = int(raw)
+        except ValueError:
+            return f'<p class="err">“{esc(raw)}” is not a number.</p>'
+        clamped = max(0, min(FILLER_BOOST_MAX, n))
+        changed = clamped != settings.filler_boost_requests
+        settings.filler_boost_requests = clamped
+        note = (f' <span class="muted">(clamped to {clamped}; the cap is '
+                f'{FILLER_BOOST_MAX} — see config.FILLER_BOOST_MAX)</span>'
+                if clamped != n else "")
+    else:
+        note = ""
+    if "boost" in q:
+        want = q.get("boost", [""])[0].lower() in ("on", "1", "true", "yes")
+        changed = changed or want != settings.filler_boost_enabled
+        settings.filler_boost_enabled = want
+    if "boost" not in q and "boost_n" not in q:
+        return ""
+    err = save_settings()
+    if err:
+        return f'<p class="err">Settings applied for this process only — {esc(err)}</p>'
+    state = ("on" if settings.filler_boost_enabled else "off")
+    if not changed:
+        return f'<p class="muted">Filler boost unchanged ({state}).</p>'
+    return (f'<p class="ok">Filler boost {state} at '
+            f'{settings.filler_boost_requests} request(s) per cycle{note} — '
+            f'active from the next cycle.</p>')
+
+
+def _config_panel(banner: str) -> str:
+    """The updater's live config + the filler-boost form.
+
+    Everything here reads the running process's `settings`, so it is the
+    actual configuration of the cycle that is about to fire — not what the
+    command line said at boot (the boost fields can have changed since).
+    """
+    # The cost columns describe the CONFIGURED number either way ("while on"),
+    # so switching off doesn't blank the numbers you are about to switch on.
+    n = settings.filler_boost_requests
+    per_min = n * (60.0 / UPDATE_INTERVAL)
+    calls = n * 50
+    state = ('<span class="ok">on</span>' if settings.filler_boost_enabled
+             else '<span class="muted">off</span>')
+    opts = "".join(
+        f'<option value="{v}"{" selected" if (v == "on") == settings.filler_boost_enabled else ""}>{v}</option>'
+        for v in ("on", "off"))
+    form = f"""
+        <form method="get">
+          <label>Filler boost <select name="boost">{opts}</select></label>
+          <label>extra requests per cycle
+            <input name="boost_n" type="number" min="0" max="{FILLER_BOOST_MAX}"
+                   value="{n}" style="width:4em;"></label>
+          <button>Apply</button>
+        </form>"""
+    rows = [
+        ("filler boost", f"{state} — {n} request(s)/cycle",
+         f"+{calls} filler calls and +{per_min:.0f} requests/min while on"),
+        ("priority tx", f"{settings.priority_tx_requests} request(s)/cycle",
+         "dedicated requests for the /tx-priority list"),
+        ("database", esc(settings.db), "BATTLE_DB / --db"),
+        ("cycle", f"{UPDATE_INTERVAL}s", "updater interval"),
+        ("ranking pass", f"latest {settings.ranking_latest}" if settings.ranking_latest else "off",
+         "--ranking"),
+        ("user-lite pass", f"{settings.user_lite_limit}/cycle" if settings.user_lite_limit else "off",
+         "--user-lite"),
+        ("weekly snapshots", "on" if settings.weekly_enabled else "off", "--weekly"),
+        ("transaction fillers", "on" if settings.transactions_enabled else "off",
+         "--transactions (window probes + buckets + itemMarket + user walks)"),
+    ]
+    body = "".join(
+        f"<tr><td class='k'>{k}</td><td>{v}</td>"
+        f"<td class='muted'>{esc(d) if k != 'filler boost' else d}</td></tr>"
+        for k, v, d in rows)
+    return f"""
+        <h2>Cycle config</h2>
+        {banner}{form}
+        <table>{body}</table>
+        <p class="muted">Only the <b>filler boost</b> is editable here; the rest
+        are boot flags of <code>Python/db_web.py</code>. The boost buys
+        <b>empty</b> 50-call requests whose every slot is filler work
+        (<code>Python/update_filler_boost.py</code>) instead of waiting for the
+        other steps' slack — the fillers drain faster at the cost of
+        {60 // UPDATE_INTERVAL} extra requests/min per configured request. The
+        cycle already makes ~24-32 requests/min and the API allows roughly
+        200/min, hence the cap of {FILLER_BOOST_MAX}. The setting survives a
+        viewer restart (<code>state/viewer_settings.json</code>) and takes
+        effect on the next cycle — watch it run on
+        <a href="/update-status">/update-status</a>.<br>
+The requests go out in <b>parallel</b> and their statements are
+        flushed by a background writer while the next request is still in
+        flight, so both halves of the step overlap — measured at 4 requests:
+        ~5 s wall for ~2.8 s of API and ~3.6 s of DB writes, well inside the
+        {UPDATE_INTERVAL} s cycle. If a run does overrun, the updater simply
+        starts the next one when it ends.<br>
+        The step's line on <a href="/update-status">/update-status</a> reports
+        <code>N statements, M rows (x%)</code>: how much of what it fetched
+        was actually NEW. Since the cycle's steps take disjoint shards of the
+        filler pools (2026-08-15) that runs at 80-100%; a sustained low
+        percentage means the walks are re-fetching stored pages and is worth
+        investigating before raising the number above.</p>"""
+
+
 def page_stats(q: dict) -> str:
-    """Endpoint usage analytics + filler health."""
+    """Endpoint usage analytics + filler health + the cycle's live config."""
+    banner = _boost_act(q)
     results = parallel_query_dicts([
         (CALLS_ALLTIME_SQL, None), (CALLS_RECENT_SQL, None),
         (REQUESTS_ROLLED_SQL, None), (REQUESTS_RAW_SQL, None),
@@ -273,6 +391,7 @@ def page_stats(q: dict) -> str:
           {_card(f"{len(per_ep)}", "endpoints used")}
           {_card(f"{len(eps)}", "endpoints registered")}
         </div>
+        {_config_panel(banner)}
         <h2>Fillers</h2>
         <div class="cards">
           {_card(f"{len(pending)}", window_lbl)}
