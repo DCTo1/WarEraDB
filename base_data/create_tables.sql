@@ -442,14 +442,17 @@ CREATE TABLE users (
                                                               -- lastConnectionAt when available);
                                                               -- NULL = never fought (inactive).
                                                               -- Refresh pool: within 4 days.
-    account_created_at TIMESTAMPTZ NULL,                     -- real account creation (getUserLite
-                                                              -- dates.createdAt — NOT the ObjectID's
-                                                              -- embedded timestamp, see the note above:
-                                                              -- that one is the 2025-05-01 game restart
-                                                              -- for old users). NULL until the user's
-                                                              -- first post-migration_23 getUserLite
-                                                              -- fetch. Seeds UserTxFiller's per-user
-                                                              -- time buckets.
+    account_created_at TIMESTAMPTZ NULL,                     -- account DOCUMENT creation, derived from
+                                                              -- the ObjectID's embedded seconds
+                                                              -- (migration_25, 2026-08-16). getUserLite
+                                                              -- dates.createdAt was the source until
+                                                              -- then, but the API stopped serving that
+                                                              -- field and the column was NULL for all
+                                                              -- 116K rows. For pre-2025-05-01 accounts
+                                                              -- this is the game restart, not the
+                                                              -- original signup — right for transaction
+                                                              -- ranges and activity windows, not a
+                                                              -- claim about how long someone played.
     transactions_scraped_at TIMESTAMPTZ NULL                  -- full history confirmed scraped via the
                                                               -- userId filter (UserTxFiller stamp;
                                                               -- NULL = still in the scrape pool)

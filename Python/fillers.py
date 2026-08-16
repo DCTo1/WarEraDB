@@ -50,8 +50,7 @@ import os
 
 from db import query
 from update_transactions import TransactionFiller, _make_buckets, _store_stmts
-from update_users_lite import (Filler, mark_dead_stmts,
-                               pick_created_at_backfill, upsert_stmts)
+from update_users_lite import Filler
 from utils import (MAX_BATCH, PAGE_LIMIT, STATE_DIR, filler_shard, read_json,
                    shard_owns, to_unix_ms, write_json)
 
@@ -1032,77 +1031,6 @@ class PriorityUserTxFiller(UserTxFiller):
         self._offered.clear()
 
 
-class CreatedAtBackfillFiller:
-    """Refetches user.getUserLite for users already lite-checked (total_xp
-    known) but missing account_created_at (migration_23, added after their
-    last fetch) — backfills the field UserTxFiller's bucket seeding wants.
-
-    Deliberately the LOWEST-priority filler, not folded into
-    update_users_lite.Filler's pools: that was tried and reverted 2026-08-13
-    — with ~107K candidate users in a fresh DB the pool never runs dry, and
-    since Filler sits at the TOP of FillerPool's priority order it
-    monopolized every cycle's slack for hours, starving the transaction
-    window filler entirely (measured: 1,727 user.getUserLite calls vs 0
-    transaction.getPaginatedTransactions calls in 3 minutes). This is purely
-    a nice-to-have for UserTxFiller's bucket-sizing efficiency — correctness
-    never depends on it (USER_TX_FLOOR_MS covers the unknown case) — so it
-    only gets to run AFTER every other filler has taken what it needs.
-
-    No state file: like update_users_lite.Filler, its pool is re-derived
-    from the DB every run (`total_xp IS NOT NULL AND account_created_at IS
-    NULL`), so it just self-drains as the column fills in.
-    """
-
-    ENDPOINT = "user.getUserLite"
-
-    def __init__(self, db: str) -> None:
-        self.db = db
-        self.fetched: dict = {}
-        self.dead: list[str] = []
-        self._shard_i, self._shard_n = filler_shard()
-
-    def top_up(self, calls: list[tuple[str, dict]]) -> tuple[list[int], list[str]]:
-        slots: list[int] = []
-        hexes: list[str] = []
-        room = MAX_BATCH - len(calls)
-        if room <= 0:
-            return slots, hexes
-        # This shard's slice of the XP-ranked queue, head of the queue as the
-        # fallback when the slice is empty (utils.filler_shard).
-        pool = pick_created_at_backfill(self.db, room, self._shard_i * room)
-        if not pool and self._shard_i:
-            pool = pick_created_at_backfill(self.db, room)
-        for h in pool:
-            slots.append(len(calls))
-            hexes.append(h)
-            calls.append((self.ENDPOINT, {"userId": h}))
-        return slots, hexes
-
-    def collect(self, results: list, slots: list[int], hexes: list[str]) -> None:
-        for pos, h in zip(slots, hexes):
-            if pos >= len(results):
-                continue
-            res = results[pos]
-            if "error" in res:
-                err = res["error"]
-                if (err.get("data") or {}).get("httpStatus") == 404:
-                    self.dead.append(h)
-                continue
-            self.fetched[h] = res["result"]["data"]
-
-    def stmts(self) -> list[str]:
-        return upsert_stmts(self.fetched) + mark_dead_stmts(self.dead)
-
-    def take_stmts(self) -> list[str]:
-        """stmts() + hand over the buffers (see FillerPool.take_stmts)."""
-        out = self.stmts()
-        self.fetched, self.dead = {}, []
-        return out
-
-    def save_state(self) -> None:
-        """No-op: no state file, the pool is re-derived from the DB every run."""
-
-
 def build_filler_pool(db: str) -> FillerPool:
     """The pipeline's filler set in one declared priority order (first =
     highest):
@@ -1114,12 +1042,16 @@ def build_filler_pool(db: str) -> FillerPool:
          repair;
       4. itemMarket item-code walks — full history per code;
       5. user transaction walks — full history per user (XP-ranked, the
-         infinite slow one — second-to-last);
-      6. account_created_at backfill (user.getUserLite, migration_23) — a
-         nice-to-have for #5's bucket-sizing efficiency only, deliberately
-         LAST: folding it into #1's pool instead was tried and reverted
-         2026-08-13, it monopolized every cycle's slack for hours with
-         ~107K candidates in a fresh DB (see CreatedAtBackfillFiller).
+         infinite slow one — LAST).
+    Until 2026-08-16 a sixth filler (CreatedAtBackfillFiller) refetched
+    getUserLite for users missing account_created_at, to seed #5's bucket
+    bottoms. It was deleted as dead code: the API no longer serves
+    getUserLite dates.createdAt at all (verified on 10 users), so its
+    candidate query — total_xp IS NOT NULL AND account_created_at IS NULL —
+    matched all 116,483 users and could never shrink no matter how many
+    calls it spent. #5 derives each user's bottom from the ObjectID instead
+    (fillers._user_floor_ms), which needs no API call at all, and
+    migration_25 filled the column the same way.
     PriorityUserTxFiller is deliberately NOT here: the /tx-priority list gets
     its own dedicated requests (Python/update_priority_tx.py), and this pool
     fills whatever slots that step's list can't — see the module docstring.
@@ -1127,8 +1059,7 @@ def build_filler_pool(db: str) -> FillerPool:
     Env gates (all default ON): WARERA_TX_FILLER=0 disables the three
     transaction fillers (the viewer's --transactions 0 sets this for every
     spawned script); WARERA_ITEM_MARKET_FILLER=0 / WARERA_USER_TX_FILLER=0
-    disable individual ones (the created_at backfill follows USER_TX_FILLER
-    since it exists solely to serve UserTxFiller).
+    disable individual ones.
     """
     tx = os.environ.get("WARERA_TX_FILLER", "1") != "0"
     fillers: list = [Filler(db)]
@@ -1138,5 +1069,4 @@ def build_filler_pool(db: str) -> FillerPool:
         fillers.append(ItemMarketFiller())
     if tx and os.environ.get("WARERA_USER_TX_FILLER", "1") != "0":
         fillers.append(UserTxFiller(db))
-        fillers.append(CreatedAtBackfillFiller(db))
     return FillerPool(fillers)

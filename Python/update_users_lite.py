@@ -42,9 +42,8 @@ The web viewer's auto-updater runs this every cycle. Two phases:
    sources, and both stay <= the real connection time.
 
 getUserLite returns everything the users table stores about a user:
-username, militaryRank, mu, leveling.totalXp, dates.lastConnectionAt,
-dates.createdAt (real account creation, migration_23) and the exact API
-lifetime rankings (userDamages / userBounty / userWealth) — so fetched users
+username, militaryRank, mu, leveling.totalXp, dates.lastConnectionAt and the
+exact API lifetime rankings (userDamages / userBounty / userWealth) — so fetched users
 get their derived sums replaced by the API's exact values (same semantics as
 update_users.py: exact API values win). Success sets lite_checked_at, so
 backfill users are only picked once.
@@ -173,20 +172,6 @@ def fetch_lite(s: requests.Session, hexs: list[str]) -> tuple[dict, list[str]]:
     return out, dead
 
 
-def pick_created_at_backfill(db: str, limit: int, offset: int = 0) -> list[str]:
-    """Up to *limit* hexes with total_xp already known (→ getUserLite fetched
-    at least once, i.e. eligible for UserTxFiller's XP-ranked pool) but no
-    account_created_at (migration_23, added after their last fetch) —
-    refetched once to backfill the column, XP-ranked so the exact
-    population UserTxFiller draws from gets it first. Self-limiting: once
-    every such user has been refetched the query returns empty forever."""
-    return [r[0] for r in query(
-        "SELECT lower(uuid_to_objectid(user_id)) AS hex FROM users\n"
-        "WHERE total_xp IS NOT NULL AND account_created_at IS NULL\n"
-        "ORDER BY total_xp DESC NULLS LAST, user_id\n"
-        f"LIMIT {limit} OFFSET {offset};", db)]
-
-
 def mark_dead_stmts(dead: list[str]) -> list[str]:
     """One UPDATE per 404'd hex: stamp lite_checked_at = NOW() so the user
     leaves the fetch pools (pick_hexes only sees lite_checked_at IS NULL).
@@ -215,14 +200,20 @@ class Filler:
     Both pools are refilled in bulk only when empty, so no user is picked
     twice within one run; backfill always beats active.
 
-    NOTE: account_created_at backfill (pick_created_at_backfill, migration_23)
-    is deliberately NOT a third pool here — it was tried and reverted
-    2026-08-13: with ~107K candidate users in a fresh DB it never runs dry,
-    and since this Filler sits at the TOP of FillerPool's priority order it
-    monopolized every cycle's slack for hours, starving the transaction
-    window filler entirely (measured: 1,727 user.getUserLite calls vs 0
-    transaction.getPaginatedTransactions calls in 3 minutes). It rides as
-    its own LOWEST-priority filler instead — see fillers.CreatedAtBackfillFiller.
+    NOTE: there is no third pool for account_created_at (migration_23). The
+    API stopped serving getUserLite dates.createdAt, so no fetch can ever
+    fill it — upsert_stmts derives the column from the user's ObjectID
+    instead, and fillers.CreatedAtBackfillFiller (whose candidate query could
+    never shrink, since every fetch left the column NULL) was deleted
+    2026-08-16.
+
+    KNOWN INEFFICIENCY (measured 2026-08-16, not yet fixed): _refill falls
+    back to the head of the queue when this shard's slice is empty, so once a
+    pool is shorter than shards x REFILL every filler-carrying cycle step
+    picks the SAME users — 148 getUserLite calls for 41 distinct users in 5
+    minutes (~3.6x). Harmless (idempotent upserts) but it is most of the
+    endpoint's current traffic; a shard_owns() filter on the fallback rows
+    would collapse it.
 
     Results are collected per run: docs go to upsert_stmts (idempotent, sets
     lite_checked_at); in-band 404s (dead users — a partial-fail mixed batch
@@ -382,10 +373,15 @@ def upsert_stmts(fetched: dict) -> list[str]:
     replaces the round-creation approximation when the user really did
     connect later, but never lowers it and never invents a date.
 
-    account_created_at (dates.createdAt, migration_23) is the user's real
-    account creation date — set once, plain overwrite is fine since the
-    value never changes. Seeds UserTxFiller's (Python/fillers.py) per-user
-    time buckets."""
+    account_created_at (migration_23) is derived from the user's ObjectID
+    (leading 4 bytes = Unix seconds), NOT from the API: getUserLite's
+    dates.createdAt no longer exists (verified 2026-08-16 on 10 users; the
+    column was NULL for all 116,483 rows). Plain overwrite is fine — the
+    value never changes. For accounts that predate the 2025-05-01 game
+    restart this is the restart's document date rather than the original
+    signup, which is the right value for every use it has (transaction
+    ranges, activity windows) but not a claim about how long someone has
+    played."""
     stmts = []
     for h, d in fetched.items():
         rank = d.get("rankings") or {}
@@ -393,7 +389,6 @@ def upsert_stmts(fetched: dict) -> list[str]:
         lvl = d.get("leveling") or {}
         dates = d.get("dates") or {}
         conn = dates.get("lastConnectionAt")
-        created = dates.get("createdAt")
         cols = ["user_id"]
         vals = [f"objectid_to_uuid('{h}')"]
         sets = []
@@ -402,7 +397,7 @@ def upsert_stmts(fetched: dict) -> list[str]:
             ("military_rank", val_sql(d.get("militaryRank"), "smallint")),
             ("mu_id", f"(SELECT get_inventory_id('{esc(mu)}'))" if mu else None),
             ("total_xp", val_sql(lvl.get("totalXp"), "int")),
-            ("account_created_at", f"'{esc(created)}'::TIMESTAMPTZ" if created else None),
+            ("account_created_at", f"to_timestamp({int(h[:8], 16)})"),
             ("user_damages", val_sql(rank.get("userDamages", {}).get("value"), "bigint")),
             ("user_bounty", val_sql(rank.get("userBounty", {}).get("value"), "float8")),
             ("user_wealth", val_sql(rank.get("userWealth", {}).get("value"), "float8")),
