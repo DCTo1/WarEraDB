@@ -57,6 +57,7 @@ from utils import (MAX_BATCH, PAGE_LIMIT, STATE_DIR, filler_shard, read_json,
 ITEM_MARKET_STATE = os.path.join(STATE_DIR, "item_market_state.json")
 USER_TX_STATE = os.path.join(STATE_DIR, "user_tx_state.json")
 PRIORITY_TX_STATE = os.path.join(STATE_DIR, "priority_tx_state.json")
+USER_TX_REFRESH_STATE = os.path.join(STATE_DIR, "user_tx_refresh_state.json")
 
 # Lock file serializing the filler state writes of the viewer's PARALLEL
 # cycle steps (viewer/updater.py launches them staggered since 2026-08-08;
@@ -115,6 +116,20 @@ USER_TX_TOTAL_LIMIT = 10000
 # bounds a pathological paste of thousands of names — the rest wait their turn
 # (the candidate query is ordered by added_at, so the list drains FIFO).
 PRIORITY_TX_POOL_SIZE = 200
+
+# UserTxRefreshFiller: how many already-scraped users are re-walked in
+# parallel, and how far a user's activity must outrun their completion stamp
+# before they are picked up. The 24 h lag matches the "done (stale)" marker on
+# the /tx-priority page, so the two never disagree; raising the pool only
+# raises how fast the backlog drains (the walk itself is 1-3 pages per user).
+USER_TX_REFRESH_POOL_SIZE = 50
+USER_TX_REFRESH_LAG_HOURS = 24
+
+# How far BELOW the completion stamp a refresh starts, to absorb pages that
+# were in flight when the stamp was written (the stamp is committed with the
+# rows it follows, but a bucket that finished a second later belongs to the
+# same walk).
+USER_TX_REFRESH_OVERLAP_MS = 3_600_000
 
 # Max independent time-bucket chains per user (mirrors MAX_BATCH — a user's
 # full history can be walked in as little as one batch when slack allows,
@@ -550,6 +565,12 @@ class UserTxFiller:
     # a shard filter there would just hide work from the single owner.
     SHARDED = True
 
+    # Whether the FLOORCHECK probe runs (see the class docstring).
+    # UserTxRefreshFiller turns it OFF: its floor is a completion watermark,
+    # not the start of history, so "there is something below it" is the
+    # expected state, not a problem to repair.
+    FLOORCHECK = True
+
     def __init__(self, db: str) -> None:
         self.db = db
         self.state = read_json(self.STATE_PATH, {"users": {}, "stats": {}})
@@ -611,6 +632,16 @@ class UserTxFiller:
         self._offer = (base + 1) % n
         return slots, tokens
 
+    def _floor(self, h: str, e: dict) -> int:
+        """Bottom of this walk for user *h*: their whole history here
+        (UserTxRefreshFiller overrides it with the last completion stamp)."""
+        return _user_floor_ms(h)
+
+    def _new_entry(self, h: str) -> dict:
+        """A fresh state entry for a user the refill just picked up."""
+        return {"bootstrapped": False, "walk_top_id": None,
+                "walk_top_ms": None, "buckets": [], "done": False}
+
     def _mine(self, tok: tuple, shard_only: bool) -> bool:
         """Is this unit takeable in the current pass? (pass 2 takes all)"""
         return not shard_only or shard_owns(tok, self._shard_i, self._shard_n)
@@ -670,7 +701,7 @@ class UserTxFiller:
                     calls.append((self.ENDPOINT,
                                   {"userId": h, "limit": PAGE_LIMIT, "direction": "forward",
                                    "cursor": str(cursor)}))
-            elif not e.get("floor_checked"):
+            elif self.FLOORCHECK and not e.get("floor_checked"):
                 # One probe BELOW the derived floor before the recheck can
                 # finish the user (class docstring, FLOORCHECK) — makes
                 # _user_floor_ms self-verifying instead of trusted.
@@ -682,7 +713,7 @@ class UserTxFiller:
                 tokens.append(tok)
                 calls.append((self.ENDPOINT,
                               {"userId": h, "limit": PAGE_LIMIT, "direction": "forward",
-                               "cursor": str(_user_floor_ms(h))}))
+                               "cursor": str(self._floor(h, e))}))
             else:
                 tok = (h, "recheck", None)
                 if tok in self._offered or not self._mine(tok, shard_only):
@@ -729,7 +760,7 @@ class UserTxFiller:
                 if its:
                     e["walk_top_id"] = its[0]["_id"]
                     e["walk_top_ms"] = to_unix_ms(its[0]["createdAt"])
-                    bottom = _user_floor_ms(h)
+                    bottom = self._floor(h, e)
                     span = e["walk_top_ms"] - bottom
                     e["buckets"] = (_make_buckets(bottom, e["walk_top_ms"],
                                                   _user_bucket_count(span))
@@ -800,7 +831,7 @@ class UserTxFiller:
                     # one place it would silently cost history): keep
                     # walking below it. The items themselves are already
                     # queued for storage above.
-                    floor = _user_floor_ms(h)
+                    floor = self._floor(h, e)
                     e.setdefault("buckets", []).append(
                         {"top_ms": floor,
                          "bottom_ms": TX_EPOCH_MS if floor > TX_EPOCH_MS else 0,
@@ -910,9 +941,7 @@ class UserTxFiller:
             e = users.get(h)
             if e is not None and not self._restart(e):
                 continue
-            users[h] = {"bootstrapped": False,
-                        "walk_top_id": None, "walk_top_ms": None,
-                        "buckets": [], "done": False}
+            users[h] = self._new_entry(h)
             added = True
             room -= 1
             if room == 0:
@@ -1031,6 +1060,108 @@ class PriorityUserTxFiller(UserTxFiller):
         self._offered.clear()
 
 
+class UserTxRefreshFiller(UserTxFiller):
+    """Keeps ALREADY-scraped users honest: re-walks the gap between a user's
+    completion stamp and now, then moves the stamp.
+
+    users.transactions_scraped_at used to mean "walked once, never again".
+    Everything such a user did afterwards reached the DB only because the
+    unfiltered 72 h window walk (TransactionFiller) happened to sweep it up —
+    which it does, verified 2026-08-16 (2,000 rows sampled at 20 random
+    cursors across the whole window, 0 missing; danii's 47,330 rows complete
+    months after their walk finished). But that is ONE mechanism with no
+    backup: anything it ever misses — the viewer down for more than 72 h, a
+    stalled window bucket, an API outage — ages out of the unfiltered window
+    and, for a finished user, nothing would ever look again. This filler is
+    that second mechanism, and it makes each user's coverage independently
+    complete up to their own last refresh.
+
+    Everything is inherited from UserTxFiller except where the walk STARTS
+    and how it ENDS:
+      * _candidates — users whose last_active_at outruns their stamp by
+        USER_TX_REFRESH_LAG_HOURS (exactly the rows /tx-priority shows as
+        "done (stale)"), oldest stamp first;
+      * _floor — the stamp minus USER_TX_REFRESH_OVERLAP_MS instead of the
+        account's ObjectID second, so the walk covers only the gap. For a
+        user refreshed daily that is 1-3 pages; for one who stopped playing,
+        one empty page and they leave the candidate set until they return;
+      * FLOORCHECK is OFF — the base class probes below its floor to prove
+        nothing predates the account, but here "there is history below the
+        floor" is the normal state (it is the part already stored), and
+        minting a bucket for it would re-walk the user's whole lifetime;
+      * MARK_SQL drops the base class's `AND transactions_scraped_at IS NULL`
+        guard — the whole point is to MOVE a stamp that is already set;
+      * _restart revives a done entry, because a user becomes a candidate
+        again every time their activity outruns the stamp we just wrote.
+        Entries are kept (done=True), never popped, for the same reason as
+        in the base class.
+
+    Deliberately LAST in build_filler_pool: first-pass coverage of a user who
+    has never been walked always beats a top-up of one who has. Note the
+    practical consequence — while the XP conveyor still has users to walk
+    (USER_TX_TOTAL_LIMIT not yet consumed) this filler sees very few slots.
+
+    Own state file (state/user_tx_refresh_state.json) so a refresh walk can
+    never be confused with the lifetime walk of the same user.
+    """
+
+    STATE_PATH = USER_TX_REFRESH_STATE
+    FLOORCHECK = False
+    MARK_SQL = ("UPDATE users SET transactions_scraped_at = NOW()\n"
+                "WHERE user_id = objectid_to_uuid('{hex}')")
+
+    def __init__(self, db: str) -> None:
+        self._bottoms: dict[str, int] = {}
+        super().__init__(db)
+
+    def _excluded(self) -> set[str]:
+        """Nothing is excluded. The base class skips the /tx-priority list
+        because those users belong to the dedicated walker — but that walker
+        only picks users whose stamp is NULL, so a LISTED user that is
+        already done is exactly as stale as any other and is ours to refresh
+        (that gap is what made the whole /tx-priority list look inert in the
+        2026-08-16 bug report)."""
+        return set()
+
+    def _floor(self, h: str, e: dict) -> int:
+        """The user's completion stamp, minus the overlap. Falls back to the
+        full-history floor only if the bottom is somehow missing, which is
+        strictly safe (it re-walks history we already hold — idempotent
+        upserts — instead of skipping the gap)."""
+        b = e.get("bottom_ms")
+        return max(int(b), TX_EPOCH_MS) if b else _user_floor_ms(h)
+
+    def _new_entry(self, h: str) -> dict:
+        e = super()._new_entry(h)
+        e["bottom_ms"] = self._bottoms.get(h)
+        return e
+
+    def _restart(self, entry: dict) -> bool:
+        """A candidate we already hold is a user who went stale AGAIN after
+        an earlier refresh: walk the new gap from scratch."""
+        return bool(entry.get("done"))
+
+    def _room(self, active: int) -> int:
+        """Own pool cap; no lifetime total (a user can go stale forever)."""
+        return USER_TX_REFRESH_POOL_SIZE - active
+
+    def _candidates(self, limit: int) -> list[str]:
+        """Hexes of scraped users whose activity outran their stamp, oldest
+        stamp first, remembering each one's refresh bottom for _new_entry."""
+        rows = query(
+            "SELECT lower(uuid_to_objectid(user_id)) AS hex,\n"
+            "       (EXTRACT(EPOCH FROM transactions_scraped_at) * 1000)::bigint AS stamp_ms\n"
+            "FROM users\n"
+            "WHERE transactions_scraped_at IS NOT NULL\n"
+            "  AND last_active_at > transactions_scraped_at\n"
+            f"      + INTERVAL '{USER_TX_REFRESH_LAG_HOURS} hours'\n"
+            "ORDER BY transactions_scraped_at\n"
+            f"LIMIT {limit};", self.db)
+        for h, stamp_ms in rows:
+            self._bottoms[h] = max(0, int(stamp_ms) - USER_TX_REFRESH_OVERLAP_MS)
+        return [r[0] for r in rows]
+
+
 def build_filler_pool(db: str) -> FillerPool:
     """The pipeline's filler set in one declared priority order (first =
     highest):
@@ -1042,7 +1173,11 @@ def build_filler_pool(db: str) -> FillerPool:
          repair;
       4. itemMarket item-code walks — full history per code;
       5. user transaction walks — full history per user (XP-ranked, the
-         infinite slow one — LAST).
+         infinite slow one);
+      6. user transaction REFRESH — re-walk the gap between an already
+         scraped user's completion stamp and now (UserTxRefreshFiller,
+         2026-08-16) — LAST, because a first pass over a user nobody has
+         walked always beats a top-up of one who has.
     Until 2026-08-16 a sixth filler (CreatedAtBackfillFiller) refetched
     getUserLite for users missing account_created_at, to seed #5's bucket
     bottoms. It was deleted as dead code: the API no longer serves
@@ -1056,7 +1191,8 @@ def build_filler_pool(db: str) -> FillerPool:
     its own dedicated requests (Python/update_priority_tx.py), and this pool
     fills whatever slots that step's list can't — see the module docstring.
 
-    Env gates (all default ON): WARERA_TX_FILLER=0 disables the three
+    Env gates (all default ON): WARERA_USER_TX_REFRESH=0 disables #6;
+    WARERA_TX_FILLER=0 disables the three
     transaction fillers (the viewer's --transactions 0 sets this for every
     spawned script); WARERA_ITEM_MARKET_FILLER=0 / WARERA_USER_TX_FILLER=0
     disable individual ones.
@@ -1069,4 +1205,6 @@ def build_filler_pool(db: str) -> FillerPool:
         fillers.append(ItemMarketFiller())
     if tx and os.environ.get("WARERA_USER_TX_FILLER", "1") != "0":
         fillers.append(UserTxFiller(db))
+        if os.environ.get("WARERA_USER_TX_REFRESH", "1") != "0":
+            fillers.append(UserTxRefreshFiller(db))
     return FillerPool(fillers)

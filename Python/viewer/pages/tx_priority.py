@@ -18,10 +18,9 @@ scraped, the walk's own completion marker) with the walk's live progress from
 state/priority_tx_state.json — queued (not picked up yet), bootstrapping (the
 first no-cursor probe), walking N/M buckets, or done. A done user whose
 last_active_at is more than a day NEWER than the stamp shows as "done
-(stale)": nothing re-walks a finished user, so everything they did since the
-stamp is only in the DB because the 72 h window filler swept it up (verified
-exhaustive 2026-08-16, but it is not a guarantee — see
-extra/USER_TX_REFRESH.md).
+(stale)" — the same rule that puts them in fillers.UserTxRefreshFiller's
+pool, so the marker doubles as "queued for a refresh walk" (that filler is
+last in the priority order, so the queue drains out of leftover slack).
 
 Deliberately NOT shown: per-user stored transaction counts. `transactions` is
 a compressed hypertable whose chunks carry no per-entity index, so counting
@@ -236,6 +235,6 @@ def page_tx_priority(q: dict) -> str:
         XP-ranked slack filler entirely. Re-scrape clears the completion stamp
         and walks the whole history again — a user already marked
         <b>done</b> is otherwise ignored by the walker, listed or not.
-        <b>done (stale)</b> means the user has been active since their stamp;
-        those rows rely on the 72 h window filler alone.</p>
+        <b>done (stale)</b> means the user has been active since their stamp —
+        those rows are queued for a refresh walk of just that gap.</p>
         {banner}{form}{body}""")

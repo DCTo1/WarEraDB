@@ -103,6 +103,11 @@ total), and `Python/fillers.py`'s `FillerPool` fills that slack in strict priori
    clamped to the first transaction in existence) — never at a global floor, and never from
    `account_created_at`, which the API stopped serving. One FLOORCHECK probe per user proves
    there is nothing below that bottom.
+6. **user refresh walk** (`UserTxRefreshFiller`, 2026-08-16) — re-walks the gap between an
+   already-scraped user's `transactions_scraped_at` stamp and now, then moves the stamp, for
+   users whose `last_active_at` outran it by a day. Without it a finished user was frozen
+   forever and depended entirely on filler 3 having swept up their activity.
+   `WARERA_USER_TX_REFRESH=0` disables it.
 
 Fillers never start additional requests — they only ride slots that would otherwise go unused.
 The one deliberate exception is the **priority list** (`tx_priority_users`, migration_24, managed
@@ -130,6 +135,10 @@ flock (`state/.filler_pool.lock`) —
 **don't run `update_transactions.py` standalone while a viewer cycle is running**, it skips the
 lock.
 
+Note the practical consequence of filler 6 being LAST: while the XP conveyor still has users to
+walk (`USER_TX_TOTAL_LIMIT` not yet consumed) it takes essentially every slack slot, so the
+refresh walk only really starts once that conveyor drains. That ordering is deliberate — a first
+pass over a user nobody has ever walked beats a top-up of one who has.
 
 **Filler shards (2026-08-15, load-bearing).** All five filler-carrying steps build their pools from
 the SAME state files, each filler's in-flight dedupe is per-process, and the files are read once at
