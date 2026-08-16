@@ -122,11 +122,43 @@ PRIORITY_TX_POOL_SIZE = 200
 # instead of the old one-page-per-user-per-cycle single chain).
 USER_TX_BUCKET_COUNT = 50
 
-# Conservative bucket-sizing floor for users whose real account_created_at
-# isn't known yet (not yet backfilled — see update_users_lite.pick_created_at_backfill).
-# Correctness never depends on this: an empty page still terminates a bucket
-# immediately, this only affects how evenly bucket boundaries are spaced.
-USER_TX_FLOOR_MS = to_unix_ms("2024-01-01T00:00:00.000Z")
+# Hard floor for every transaction walk: the first transaction in existence
+# (measured 2026-08-16, min(transactions.created_at) = 2025-05-01 19:02:21.982Z
+# — the game's restart). Nothing older is reachable through any filter, so no
+# bucket ever needs to go below it.
+TX_EPOCH_MS = to_unix_ms("2025-05-01T00:00:00.000Z")
+
+
+def _oid_ms(hexid: str) -> int:
+    """Account-document creation time from the ObjectID's leading 4 bytes
+    (Unix seconds, UTC) — the bottom of that user's transaction history.
+
+    Safe as a walk floor: a transaction cannot predate the document that owns
+    it. Verified 2026-08-16 on 190 users (the top-XP 2025-05-01 restart
+    cohort, a random sample of already-scraped users, and accounts created
+    that day) by asking the API for `userId` + `cursor = this value` — NOT ONE
+    returned a single row. Note the restart cohort's ObjectID second
+    (2025-05-01 18:03) predates the first transaction ever (19:02) anyway, so
+    the "the ObjectID is the restart, not the real signup" caveat in
+    extra/AGENTS.md is irrelevant here: it is about account AGE, not about
+    which transactions are reachable.
+
+    Until 2026-08-16 this came from users.account_created_at instead, with a
+    2024-01-01 constant as the fallback — but the API stopped serving
+    getUserLite dates.createdAt, so the column was NULL for all 116K users and
+    every walk started 16 months before the first transaction in existence.
+    Measured on state/user_tx_state.json: an average 39 of each user's 50
+    buckets covered a range where the user could not possibly have a row
+    (~296K wasted calls, ~9% of the walk's pages), and the real history was
+    squeezed into the ~11 buckets that were left.
+    """
+    return int(hexid[:8], 16) * 1000
+
+
+def _user_floor_ms(hexid: str) -> int:
+    """Bottom of *hexid*'s transaction history: their account document's
+    creation, never below the first transaction that exists."""
+    return max(_oid_ms(hexid), TX_EPOCH_MS)
 
 
 def _step_walk(entry: dict, its: list[dict], no_cursor: bool) -> str:
@@ -444,8 +476,8 @@ class UserTxFiller:
          transaction (walk_top_id/walk_top_ms) and its items are stored.
          Empty response → the user has no transactions at all → done on the
          spot. bootstrapped=True either way.
-      2. BUCKETS — once bootstrapped with a real top, (account_created_at or
-         USER_TX_FLOOR_MS, walk_top_ms] splits into buckets (_make_buckets,
+      2. BUCKETS — once bootstrapped with a real top, (_user_floor_ms(hex),
+         walk_top_ms] splits into buckets (_make_buckets,
          same shape/semantics as the transaction window's), each walking its
          own fixed band down to its own bottom_ms independently. A bucket
          whose plain userId+cursor walk stalls (the computed next cursor
@@ -459,7 +491,14 @@ class UserTxFiller:
          instant, an accepted narrow residual case). Once every code is
          swept the bucket skips past the whole ms and resumes its normal
          walk.
-      3. RECHECK — once every bucket reports done, one more no-cursor probe
+      3. FLOORCHECK — once every bucket reports done, ONE probe with
+         cursor = the derived floor confirms there is nothing below it
+         (see _oid_ms: the floor is the account document's own creation
+         second, validated on 190 users but derived, not served by the API).
+         Empty → the floor held, move on; non-empty → store the page and
+         mint a bucket below the floor. One call per user, against the ~39
+         per user the derived floor saves.
+      4. RECHECK — once the floor is checked, one more no-cursor probe
          confirms nothing arrived after the original walk_top_ms (a set of
          buckets with a fixed top edge can never see transactions created
          while the walk ran — only the very top of history can drift). Same
@@ -632,6 +671,19 @@ class UserTxFiller:
                     calls.append((self.ENDPOINT,
                                   {"userId": h, "limit": PAGE_LIMIT, "direction": "forward",
                                    "cursor": str(cursor)}))
+            elif not e.get("floor_checked"):
+                # One probe BELOW the derived floor before the recheck can
+                # finish the user (class docstring, FLOORCHECK) — makes
+                # _user_floor_ms self-verifying instead of trusted.
+                tok = (h, "floorcheck", None)
+                if tok in self._offered or not self._mine(tok, shard_only):
+                    continue
+                self._offered.add(tok)
+                slots.append(len(calls))
+                tokens.append(tok)
+                calls.append((self.ENDPOINT,
+                              {"userId": h, "limit": PAGE_LIMIT, "direction": "forward",
+                               "cursor": str(_user_floor_ms(h))}))
             else:
                 tok = (h, "recheck", None)
                 if tok in self._offered or not self._mine(tok, shard_only):
@@ -678,9 +730,7 @@ class UserTxFiller:
                 if its:
                     e["walk_top_id"] = its[0]["_id"]
                     e["walk_top_ms"] = to_unix_ms(its[0]["createdAt"])
-                    bottom = e.get("created_ms")
-                    if bottom is None:
-                        bottom = USER_TX_FLOOR_MS
+                    bottom = _user_floor_ms(h)
                     span = e["walk_top_ms"] - bottom
                     e["buckets"] = (_make_buckets(bottom, e["walk_top_ms"],
                                                   _user_bucket_count(span))
@@ -743,6 +793,20 @@ class UserTxFiller:
                         b.pop("stall_codes", None)
                         if b["cursor_ms"] - 1 <= b["bottom_ms"]:
                             b["done"] = True
+            elif kind == "floorcheck":
+                e["floor_checked"] = True
+                if its:
+                    # The ObjectID floor was WRONG for this user (never
+                    # observed in the 190-user validation, but this is the
+                    # one place it would silently cost history): keep
+                    # walking below it. The items themselves are already
+                    # queued for storage above.
+                    floor = _user_floor_ms(h)
+                    e.setdefault("buckets", []).append(
+                        {"top_ms": floor,
+                         "bottom_ms": TX_EPOCH_MS if floor > TX_EPOCH_MS else 0,
+                         "cursor_ms": None, "done": False})
+                    stats["below_floor"] = stats.get("below_floor", 0) + 1
             elif kind == "recheck":
                 if its:
                     top_id, top_ms = its[0]["_id"], to_unix_ms(its[0]["createdAt"])
@@ -843,11 +907,11 @@ class UserTxFiller:
         # rows always colliding, it pinned the pool near
         # USER_TX_POOL_SIZE/2 instead of USER_TX_POOL_SIZE).
         added = changed
-        for h, created_ms in self._candidates(room + len(users)):
+        for h in self._candidates(room + len(users)):
             e = users.get(h)
             if e is not None and not self._restart(e):
                 continue
-            users[h] = {"created_ms": created_ms, "bootstrapped": False,
+            users[h] = {"bootstrapped": False,
                         "walk_top_id": None, "walk_top_ms": None,
                         "buckets": [], "done": False}
             added = True
@@ -876,18 +940,19 @@ class UserTxFiller:
             self.db)[0]
         return min(room, USER_TX_TOTAL_LIMIT - consumed - active)
 
-    def _candidates(self, limit: int) -> list:
-        """(hex, created_ms) rows for the pool: unfinished users by XP, minus
-        the /tx-priority list (walked by update_priority_tx.py instead)."""
-        return query(
-            "SELECT lower(uuid_to_objectid(user_id)) AS hex,\n"
-            "       (EXTRACT(EPOCH FROM account_created_at) * 1000)::bigint AS created_ms\n"
+    def _candidates(self, limit: int) -> list[str]:
+        """Hexes for the pool: unfinished users by XP, minus the
+        /tx-priority list (walked by update_priority_tx.py instead). The
+        walk's bottom is derived from the hex itself (_user_floor_ms), so no
+        creation-date column is read here."""
+        return [r[0] for r in query(
+            "SELECT lower(uuid_to_objectid(user_id)) AS hex\n"
             "FROM users u\n"
             "WHERE transactions_scraped_at IS NULL\n"
             "  AND NOT EXISTS (SELECT 1 FROM tx_priority_users p\n"
             "                  WHERE p.user_id = u.user_id)\n"
             "ORDER BY total_xp DESC NULLS LAST\n"
-            f"LIMIT {limit};", self.db)
+            f"LIMIT {limit};", self.db)]
 
 
 class PriorityUserTxFiller(UserTxFiller):
@@ -937,17 +1002,15 @@ class PriorityUserTxFiller(UserTxFiller):
         pathological one (the rest wait, the candidate query is FIFO)."""
         return PRIORITY_TX_POOL_SIZE - active
 
-    def _candidates(self, limit: int) -> list:
-        """(hex, created_ms) for listed users not yet fully scraped, oldest
-        entry first."""
-        return query(
-            "SELECT lower(uuid_to_objectid(u.user_id)) AS hex,\n"
-            "       (EXTRACT(EPOCH FROM u.account_created_at) * 1000)::bigint AS created_ms\n"
+    def _candidates(self, limit: int) -> list[str]:
+        """Hexes of listed users not yet fully scraped, oldest entry first."""
+        return [r[0] for r in query(
+            "SELECT lower(uuid_to_objectid(u.user_id)) AS hex\n"
             "FROM tx_priority_users p\n"
             "JOIN users u ON u.user_id = p.user_id\n"
             "WHERE u.transactions_scraped_at IS NULL\n"
             "ORDER BY p.added_at\n"
-            f"LIMIT {limit};", self.db)
+            f"LIMIT {limit};", self.db)]
 
     def has_work(self) -> bool:
         """True when some LISTED user still has a unit of work pending — the

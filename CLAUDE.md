@@ -98,7 +98,11 @@ total), and `Python/fillers.py`'s `FillerPool` fills that slack in strict priori
 2. transaction window **live probes** (detect gaps at the newest edge)
 3. transaction window **buckets** (time-bucketed walk filling the 72h window)
 4. **itemMarket walk** per equipment code (`itemCode` filter bypasses the window — full history)
-5. **user walk** by XP rank (`userId` filter bypasses the window — full lifetime history)
+5. **user walk** by XP rank (`userId` filter bypasses the window — full lifetime history).
+   Each user's walk starts at their account's ObjectID second (`fillers._user_floor_ms`,
+   clamped to the first transaction in existence) — never at a global floor, and never from
+   `account_created_at`, which the API stopped serving. One FLOORCHECK probe per user proves
+   there is nothing below that bottom.
 
 Fillers never start additional requests — they only ride slots that would otherwise go unused.
 The one deliberate exception is the **priority list** (`tx_priority_users`, migration_24, managed
@@ -125,6 +129,7 @@ the viewer's cycle steps run as parallel subprocesses, filler state writes are s
 flock (`state/.filler_pool.lock`) —
 **don't run `update_transactions.py` standalone while a viewer cycle is running**, it skips the
 lock.
+
 
 **Filler shards (2026-08-15, load-bearing).** All five filler-carrying steps build their pools from
 the SAME state files, each filler's in-flight dedupe is per-process, and the files are read once at
