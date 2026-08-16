@@ -16,7 +16,12 @@ handler has no do_POST (server.py), matching /sql's form style.
 Status per row combines the DB stamp (users.transactions_scraped_at = fully
 scraped, the walk's own completion marker) with the walk's live progress from
 state/priority_tx_state.json — queued (not picked up yet), bootstrapping (the
-first no-cursor probe), walking N/M buckets, or done.
+first no-cursor probe), walking N/M buckets, or done. A done user whose
+last_active_at is more than a day NEWER than the stamp shows as "done
+(stale)": nothing re-walks a finished user, so everything they did since the
+stamp is only in the DB because the 72 h window filler swept it up (verified
+exhaustive 2026-08-16, but it is not a guarantee — see
+extra/USER_TX_REFRESH.md).
 
 Deliberately NOT shown: per-user stored transaction counts. `transactions` is
 a compressed hypertable whose chunks carry no per-entity index, so counting
@@ -25,6 +30,7 @@ one user's rows scans the whole table (~seconds per row of this table) — the
 """
 
 import os
+from datetime import timedelta
 from urllib.parse import urlencode
 
 from utils import STATE_DIR, read_json
@@ -40,6 +46,7 @@ SELECT lower(uuid_to_objectid(u.user_id)) AS hex,
        u.username,
        u.total_xp,
        u.account_created_at,
+       u.last_active_at,
        u.transactions_scraped_at,
        p.added_at,
        p.note
@@ -54,6 +61,13 @@ BY_HEX_SQL = ("SELECT lower(uuid_to_objectid(user_id)) AS hex, username FROM use
               " WHERE user_id = objectid_to_uuid(%s)")
 BY_NAME_SQL = ("SELECT lower(uuid_to_objectid(user_id)) AS hex, username FROM users"
                " WHERE lower(username) = lower(%s) LIMIT 2")
+
+# Is this user already stamped fully scraped? Adding one to the list is a
+# silent no-op otherwise — PriorityUserTxFiller._candidates() only picks
+# users with transactions_scraped_at IS NULL, by design (that filter is what
+# stops a finished user from being walked forever). The page has to say so.
+SCRAPED_SQL = ("SELECT transactions_scraped_at IS NOT NULL AS done FROM users"
+               " WHERE user_id = objectid_to_uuid(%s)")
 
 ADD_SQL = ("INSERT INTO tx_priority_users (user_id, note)"
            " VALUES (objectid_to_uuid(%s), NULLIF(%s, ''))"
@@ -96,8 +110,23 @@ def _act(q: dict) -> str:
         n, err = exec_write(ADD_SQL, (hexid, q.get("note", [""])[0].strip()[:200]))
         if err:
             return f'<p class="err">{esc(err)}</p>'
-        return (f'<p class="ok">Added {esc(hexid)} to the priority list.</p>'
-                if n else '<p class="muted">Already on the list.</p>')
+        added = (f'<p class="ok">Added {esc(hexid)} to the priority list.</p>'
+                 if n else '<p class="muted">Already on the list.</p>')
+        srows, err = query_dicts(SCRAPED_SQL, (hexid,))
+        if err or not srows or not srows[0]["done"]:
+            return added
+        # Already stamped done: the walker will not touch this user at all.
+        if q.get("fresh", [""])[0]:
+            _, err = exec_write(RESCRAPE_SQL, (hexid,))
+            if err:
+                return added + f'<p class="err">{esc(err)}</p>'
+            return added + ('<p class="ok">It was already marked fully scraped — '
+                            'the stamp is cleared, so the whole history is walked '
+                            'again from the next cycle.</p>')
+        return added + ('<p class="err">…but this user is already marked fully '
+                        'scraped, so <b>nothing will be walked</b>. Use '
+                        '<b>re-scrape</b> below (or tick “re-scrape if already '
+                        'done” when adding) to walk the whole history again.</p>')
     if "remove" in q:
         hexid = q.get("remove", [""])[0].lower()
         if not HEX_RE.match(hexid):
@@ -123,9 +152,16 @@ def _act(q: dict) -> str:
 def _status(row: dict, entry: dict | None) -> str:
     """Walk state of one listed user: DB stamp first (that IS the completion
     marker), then the state file's live progress."""
-    if row["transactions_scraped_at"] is not None:
-        return ("<span class='ok'>done</span> "
-                f"<span class='muted'>{row['transactions_scraped_at']:%Y-%m-%d %H:%M}</span>")
+    stamp = row["transactions_scraped_at"]
+    if stamp is not None:
+        active = row.get("last_active_at")
+        stale = (active is not None
+                 and (active - stamp) > timedelta(days=1))
+        label = ("<span class='err'>done (stale)</span>" if stale
+                 else "<span class='ok'>done</span>")
+        tail = (f" <span class='muted'>· active {active:%Y-%m-%d}</span>"
+                if stale else "")
+        return (f"{label} <span class='muted'>{stamp:%Y-%m-%d %H:%M}</span>{tail}")
     if entry is None:
         return "<span class='muted'>queued</span>"
     if entry.get("done"):
@@ -155,6 +191,8 @@ def page_tx_priority(q: dict) -> str:
           <input name="add" placeholder="username or 24-hex user id" size="34"
                  autocomplete="off">
           <input name="note" placeholder="note (optional)" size="24">
+          <label><input type="checkbox" name="fresh" value="1">
+            re-scrape if already done</label>
           <button>Add to priority list</button>
         </form>"""
 
@@ -196,5 +234,8 @@ def page_tx_priority(q: dict) -> str:
         <p class="muted">Users listed here have their FULL transaction history
         scraped first, via dedicated requests — they are excluded from the
         XP-ranked slack filler entirely. Re-scrape clears the completion stamp
-        and walks the whole history again.</p>
+        and walks the whole history again — a user already marked
+        <b>done</b> is otherwise ignored by the walker, listed or not.
+        <b>done (stale)</b> means the user has been active since their stamp;
+        those rows rely on the 72 h window filler alone.</p>
         {banner}{form}{body}""")
