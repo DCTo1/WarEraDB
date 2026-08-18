@@ -179,18 +179,27 @@ done
 .venv/bin/python Python/update_weekly_ranking.py
 .venv/bin/python Python/update_weekly_ranking.py --backfill
 
-# Live transaction window — NO dedicated step (2026-08-07): the rolling 72 h
-# window is filled/kept live by TransactionFiller (update_transactions.py)
-# riding the slack of update_battles/update_live/update_weekly_ranking mixed
-# batches on the web viewer's cycle; the same slack also carries full-history
-# backfills via the bypass filters: per-item-code itemMarket walks and
-# per-user walks (XP-ranked, users.transactions_scraped_at marks finished
-# ones; see Python/fillers.py + extra/docs/FILLERS.md). The fillers never
-# start additional requests. WARERA_TX_FILLER=0 disables the transaction
-# fillers (viewer --transactions 0); WARERA_ITEM_MARKET_FILLER=0 /
-# WARERA_USER_TX_FILLER=0 disable individual ones.
-# Coverage report (no API calls) still works standalone:
-.venv/bin/python Python/update_transactions.py --verify   # coverage report
+# Live transaction window — a dedicated step since 2026-08-18: the rolling
+# 72 h window is owned by update_tx_window.py, which walks (watermark, now]
+# every cycle as N parallel bands (Python/tx_walk.walk_range) and advances
+# the watermark ONLY when every band retires, so downtime of any length
+# self-heals instead of being skipped. It replaced the old TransactionFiller,
+# which rode the other steps' slack and silently dropped whatever its page
+# cap could not reach.
+.venv/bin/python Python/update_tx_window.py              # one cycle
+.venv/bin/python Python/update_tx_window.py --verify     # walk state, no API calls
+# Manual recovery of an explicit range still inside the 72 h window:
+.venv/bin/python Python/recover_tx_gap.py --from 2026-08-18T02:00:00Z --to 2026-08-18T12:05:00Z
+.venv/bin/python Python/recover_tx_gap.py --verify --from … --to …   # per-minute holes
+# Full-history backfills DO still ride the slack of update_battles/update_live/
+# update_weekly_ranking mixed batches, via the bypass filters: per-item-code
+# itemMarket walks and per-user walks (XP-ranked, users.transactions_scraped_at
+# marks finished ones; see Python/fillers.py + extra/docs/FILLERS.md). Those
+# fillers never start additional requests. WARERA_FILLERS=0 kills the whole
+# pool; WARERA_TX_FILLER=0 disables the transaction-history fillers (viewer
+# --transactions 0); WARERA_ITEM_MARKET_FILLER=0 / WARERA_USER_TX_FILLER=0
+# disable individual ones.
+.venv/bin/python Python/update_transactions.py --verify   # per-type coverage report
 
 # Seed the endpoint registry (idempotent; new endpoints auto-register anyway)
 .venv/bin/python Python/seed_endpoints.py
@@ -412,6 +421,6 @@ ORDER BY r.rank LIMIT 20;
 | `warera_gui.py` | Control panel (stdlib-only Tkinter GUI + `--setup` headless mode): one-command first-time setup (venv, TimescaleDB container, schema, latest backup), start/stop/restart the web viewer, local backups + backup restore, API token storage |
 | `docker-compose.yml` | Manual alternative to the GUI's container setup (`docker compose up -d` — same image/port/volume) |
 | `base_data/` | Schema DDL (`create_tables.sql`), PL/pgSQL functions (`functions.sql`), indexes, views |
-| `Python/` | Battle tooling: shared modules (`api.py` WarEra API client, `db.py` SQLAlchemy DB access + SQL helpers, `utils.py` time/state/constants + `prepare_transaction()`, `endpoint_log.py`, `fillers.py` — the priority-ordered filler pool + the itemMarket/user-history fillers) + the CLI scripts (`update_battles.py`, `update_live.py`, `update_countries.py`, `insert_ranking_sample.py`, `update_users.py`, `update_users_lite.py`, `update_weekly_ranking.py`, `update_transactions.py` (TransactionFiller — the transaction-window filler riding the mixed batches), `seed_endpoints.py`) + the web viewer (`db_web.py` entry point and the `viewer/` package with its pages, incl. the `/tracker` damage tracker, the `/weekly` rankings and the `/transactions` browser — full stored history via preset/custom ranges, keyset pagination and a day-jump strip, defaulting to the last 24 h) |
+| `Python/` | Battle tooling: shared modules (`api.py` WarEra API client, `db.py` SQLAlchemy DB access + SQL helpers, `utils.py` time/state/constants + `prepare_transaction()`, `endpoint_log.py`, `fillers.py` — the priority-ordered filler pool + the itemMarket/user-history fillers) + the CLI scripts (`update_battles.py`, `update_live.py`, `update_countries.py`, `insert_ranking_sample.py`, `update_users.py`, `update_users_lite.py`, `update_weekly_ranking.py`, `update_tx_window.py` (the 72 h transaction-window tracker) + `tx_walk.py` (its parallel band-walk primitive) + `recover_tx_gap.py` (manual range recovery) + `update_transactions.py` (the retired scraper's coverage report), `seed_endpoints.py`) + the web viewer (`db_web.py` entry point and the `viewer/` package with its pages, incl. the `/tracker` damage tracker, the `/weekly` rankings and the `/transactions` browser — full stored history via preset/custom ranges, keyset pagination and a day-jump strip, defaulting to the last 24 h) |
 | `state/` | Runtime state files (gitignored, regenerable — `backups.py load` resets them): scraper cursors / throttle stamps / audit trails (`battles_state.json`, `live_state.json`, `transactions_state.json`, `item_market_state.json`, `user_tx_state.json`, `users_lite_state.json`, `weekly_ranking_state.json`, `weekly_reconcile_state.json`, `ranking_sample_state.json`, `ranking_sample_rate.json`) |
 | `data/battle_timestamps.json` | Battle timestamp index for batched pagination (oldest-first, append-only) |

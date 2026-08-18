@@ -25,6 +25,9 @@ Cost: 2 requests / 15 s cycle = ~8 requests/min on top of the existing
 cycle, comfortably inside the API's limits (~200/min). If that ever needs
 trimming, run with --requests 1 or disable the step (--priority-tx 0 on
 Python/db_web.py, or WARERA_PRIORITY_TX_FILLER=0 in the environment).
+WARERA_FILLERS=0 (the pool-wide kill switch) also stops it — its filler is
+built here rather than by build_filler_pool, so until 2026-08-18 it was the
+one walk the master switch did not reach.
 
 Usage:
     .venv/bin/python Python/update_priority_tx.py
@@ -88,6 +91,14 @@ def main() -> int:
             return 0
         if os.environ.get("WARERA_PRIORITY_TX_FILLER", "1") == "0":
             print("priority tx walk disabled (WARERA_PRIORITY_TX_FILLER=0)")
+            return 0
+        if os.environ.get("WARERA_FILLERS", "1") == "0":
+            # PriorityUserTxFiller is built here, not by build_filler_pool, so
+            # without this it kept walking while the master switch said every
+            # filler was off — the exact shape that would have 500'd on every
+            # cycle the moment anyone added a user to /tx-priority during the
+            # 2026-08-17 cursor outage (extra/BUGFIX_PLAN.md section 3.4).
+            print("priority tx walk disabled (WARERA_FILLERS=0)")
             return 0
         # Refill the pool from the list up front (under the filler lock, via
         # a one-filler FillerPool) so a user added since the last run is

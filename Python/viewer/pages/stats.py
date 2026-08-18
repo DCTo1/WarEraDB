@@ -152,19 +152,19 @@ def _filler_table(f: dict, tx: dict, im: dict, ut: dict, ul: dict) -> str:
     im_done = sum(1 for c in imcodes.values() if c.get("done"))
     ut_done = f["users_scraped"]
 
-    live = tx.get("live", {})
-    last_probe = live.get("last_probe_ms")
-    probe_age = (f"{max(0, int(time.time() * 1000) - last_probe) // 1000}s ago"
-                 if last_probe else "never")
-    pending = [b for b in tx.get("buckets", []) if not b.get("done")]
-    window_state = ("up to date" if tx.get("done") and not pending
-                    else f"{len(pending)} buckets pending")
+    pending = tx.get("pending") or []
+    watermark = tx.get("newest_ms")
+    lag = (f"{max(0, int(time.time() * 1000) - watermark) // 1000}s behind"
+           if watermark else "cold")
+    window_state = ("up to date" if not pending
+                    else f"⚠ {len(pending)} catch-up band(s) still open — "
+                         f"watermark HELD until they close")
 
     rows = [
-        ("window", f"72 h window, probes {probe_age}",
-         f"done={bool(tx.get('done'))}, {window_state}",
-         f"{tstats.get('pages', 0):,} pages · {tstats.get('probe_items', 0) + tstats.get('bucket_items', 0):,} items · "
-         f"{tstats.get('gaps', 0)} gaps · {tstats.get('failed_calls', 0)} failed"),
+        ("tx window", f"72 h window, watermark {lag}",
+         f"backfill {'done' if tx.get('backfill_done') else 'in progress'}, {window_state}",
+         f"{tstats.get('cycles', 0):,} cycles · {tstats.get('pages', 0):,} pages · "
+         f"{tstats.get('items', 0):,} items"),
         ("itemMarket", f"{im_done}/{len(imcodes) or '?'} codes done",
          f"{len(imcodes)}/{f['item_codes_total']} codes started",
          f"{imstats.get('pages', 0):,} pages · {imstats.get('items', 0):,} items · "
@@ -341,20 +341,20 @@ def page_stats(q: dict) -> str:
                       if today_row else 0)
     avg_batch = requests and f"{total_calls / requests:.1f}" or "—"
 
-    tx = _read_state("transactions_state.json", {})
+    # The 72 h window is NOT a filler any more (2026-08-18) — it is the
+    # update_tx_window.py cycle step, so its health comes from that step's
+    # state file. A non-empty `pending` means its catch-up walk ran out of
+    # waves and is holding the watermark: transactions are NOT being lost
+    # (that was the pre-2026-08-18 bug), but the edge is falling behind.
+    tx = _read_state("tx_window_state.json", {})
     im = _read_state("item_market_state.json", {})
     ut = _read_state("user_tx_state.json", {})
     ul = _read_state("users_lite_state.json", {})
     imcodes = im.get("codes", {})
     im_done = sum(1 for c in imcodes.values() if c.get("done"))
-    live = tx.get("live", {})
-    last_probe = live.get("last_probe_ms")
-    probe_age = (f"{max(0, int(time.time() * 1000) - last_probe) // 1000}s" if last_probe else "never")
-    pending = [b for b in tx.get("buckets", []) if not b.get("done")]
-    if tx.get("done") and not pending:
-        window_lbl = "window up to date"
-    else:
-        window_lbl = f"{len(pending)} bucket(s) pending"
+    pending = tx.get("pending") or []
+    window_lbl = ("window up to date" if not pending
+                  else "catch-up band(s) open")
     oldest = f["txn_oldest"]
     oldest_lbl = str(oldest)[:10] if oldest else "—"
 

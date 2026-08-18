@@ -25,12 +25,9 @@ The fillers:
 
   1. user-lite (update_users_lite.Filler) — user.getUserLite backfill queue
      + active-user refresh;
-  2. transaction window (update_transactions.TransactionFiller) — live
-     probes (the newest ~26 s tiling + gap detection) and the finite 72 h
-     window fill / gap-repair buckets;
-  3. ItemMarketFiller — full itemMarket history per equipment item code
+  2. ItemMarketFiller — full itemMarket history per equipment item code
      (the API's itemCode filter bypasses the rolling 72 h window);
-   4. UserTxFiller — full transaction history per user, picked by XP ranking
+   3. UserTxFiller — full transaction history per user, picked by XP ranking
       (the API's userId filter bypasses the window too); users are marked in
       the DB once their scrape is confirmed finished and replaced by the
       next-in-line (a conveyor capped at USER_TX_TOTAL_LIMIT total users,
@@ -49,10 +46,10 @@ UserTxFiller entirely (its _excluded set and its candidate query).
 import os
 
 from db import query
-from update_transactions import TransactionFiller, _make_buckets, _store_stmts
+from tx_walk import build_stmts
 from update_users_lite import Filler
-from utils import (MAX_BATCH, PAGE_LIMIT, STATE_DIR, filler_shard, read_json,
-                   shard_owns, to_unix_ms, write_json)
+from utils import (MAX_BATCH, MIN_OID, PAGE_LIMIT, STATE_DIR, filler_shard,
+                   make_cursor, read_json, shard_owns, to_unix_ms, write_json)
 
 ITEM_MARKET_STATE = os.path.join(STATE_DIR, "item_market_state.json")
 USER_TX_STATE = os.path.join(STATE_DIR, "user_tx_state.json")
@@ -109,7 +106,7 @@ USER_TX_POOL_SIZE = 100
 # from the XP ranking once this many have been consumed, so the walk drains
 # quietly when the last of them finishes. Raise/lower this manually to change
 # how far down the XP ranking the walk goes.
-USER_TX_TOTAL_LIMIT = 20000
+USER_TX_TOTAL_LIMIT = 50000
 
 # Safety cap on the /tx-priority walk's in-flight pool (PriorityUserTxFiller).
 # The list is operator-curated and normally a handful of users, so this only
@@ -207,6 +204,14 @@ def _step_walk(entry: dict, its: list[dict], no_cursor: bool) -> str:
     stuck at first_tx_ms + 1). A page whose oldest item is at sent_cursor-1
     proves nothing older exists → oldest reached.
 
+    `cursor_ms` is an integer POSITION, not the wire value: since
+    2026-08-17 the API takes an opaque v2 token, which the send sites build
+    from this number with utils.make_cursor(cursor_ms, MIN_OID) — exactly
+    the old `cursor = str(cursor_ms)`. The arithmetic below (equality tests,
+    band bookkeeping) is unchanged and deliberately NOT converted to echoing
+    nextCursor: these walks jump to arbitrary points rather than following
+    one chain (extra/BUGFIX_PLAN.md section 3.1).
+
     Returns:
       "done"    — the no-cursor page's newest item is the pass's own top:
                   the walk covered everything → caller marks finished;
@@ -295,7 +300,7 @@ class FillerPool:
         for update_filler_boost.py, which flushes each request's results while
         the next request is still in flight: without the hand-over every
         flush would re-send all previous ones. Statement DEDUPE is per call
-        (_store_stmts dedupes by _id within one list), so an item fetched in
+        (tx_walk.build_stmts dedupes by _id within one list), so an item fetched in
         two different waves is now sent twice instead of once — harmless,
         insert_transaction is an idempotent upsert."""
         out: list[str] = []
@@ -328,8 +333,9 @@ class ItemMarketFiller:
     confirms the walk covered everything (its oldest row reached AND no new
     rows appeared while the walk ran). Payload per page:
         {"transactionType": "itemMarket", "itemCode": <code>, limit: 100,
-         direction: "forward", cursor: <last item ms + 1>}
-    (no-cursor first page = the newest of the code's history). Items flow
+         direction: "forward", cursor: make_cursor(<last item ms + 1>, MIN_OID)}
+    (no-cursor first page = the newest of the code's history; the cursor is
+    a v2 token built from the stored cursor_ms position — see _step_walk). Items flow
     through the same idempotent insert_transaction upsert as the window.
 
     State: state/item_market_state.json — {codes: {<code>: {cursor_ms,
@@ -391,7 +397,7 @@ class ItemMarketFiller:
                 cursor = entry.get("cursor_ms")
                 no_cursor = cursor is None
                 if cursor:
-                    p["cursor"] = str(cursor)
+                    p["cursor"] = make_cursor(cursor, MIN_OID)
                 slots.append(len(calls))
                 tokens.append((code, no_cursor))
                 calls.append((self.ENDPOINT, p))
@@ -432,7 +438,7 @@ class ItemMarketFiller:
             stats["pages"] = stats.get("pages", 0) + len(slots)
 
     def stmts(self) -> list[str]:
-        return _store_stmts(self._items)
+        return build_stmts(self._items)
 
     def take_stmts(self) -> list[str]:
         """stmts() + hand over the buffer (see FillerPool.take_stmts)."""
@@ -463,6 +469,33 @@ class ItemMarketFiller:
         write_json(ITEM_MARKET_STATE, disk)
 
 
+def _make_buckets(bottom_ms: int, top_ms: int, n: int) -> list[dict]:
+    """Split (bottom_ms, top_ms] into n time buckets with their own cursor
+    chains. Bucket i covers (bottom + i*step, bottom + (i+1)*step]; the top
+    bucket ends at top_ms. Adjacent buckets overlap at boundaries by design
+    (the +1 ms cursor) — deduped on insert.
+
+    Lived in update_transactions.py until 2026-08-18, when TransactionFiller
+    was retired and this became UserTxFiller's alone. `cursor_ms` stays an
+    INTEGER POSITION here: the cascade, the stall detection and the bucket
+    bookkeeping are all arithmetic on it, and only the four send sites
+    encode it as a v2 token (utils.make_cursor). See extra/BUGFIX_PLAN.md
+    section 3.1 for why these walks do NOT switch to echoing nextCursor.
+    """
+    span = top_ms - bottom_ms
+    if span <= 0:
+        return []
+    step = max(1, span // n)
+    out = []
+    for i in range(n):
+        lo = bottom_ms + i * step
+        hi = min(top_ms, bottom_ms + (i + 1) * step)
+        if hi <= lo:
+            continue
+        out.append({"top_ms": hi, "bottom_ms": lo, "cursor_ms": None, "done": False})
+    return out
+
+
 def _user_bucket_count(span_ms: int) -> int:
     """Bucket parallelism for one user's history: roughly one bucket per day
     of account age, capped at USER_TX_BUCKET_COUNT — a brand-new account
@@ -488,7 +521,7 @@ class UserTxFiller:
     one page per user per batch, so a heavy user could take hours to drain
     even with slack to spare), each user's (account_created_at, now] range
     splits into up to USER_TX_BUCKET_COUNT INDEPENDENT time-bucket chains
-    (mirrors TransactionFiller's window buckets). Independent chains don't
+    (mirrors the retired TransactionFiller's window buckets). Independent chains don't
     wait on each other's responses, so a single user can occupy dozens of
     slots in ONE batch instead of one page per cycle — the whole point is
     that no filler call should ever sit idle waiting for a prior response
@@ -744,7 +777,8 @@ class UserTxFiller:
                             tokens.append(tok)
                             calls.append((self.ENDPOINT,
                                           {"userId": h, "itemCode": code, "limit": PAGE_LIMIT,
-                                           "direction": "forward", "cursor": str(stall_ms + 1)}))
+                                           "direction": "forward",
+                                           "cursor": make_cursor(stall_ms + 1, MIN_OID)}))
                         continue
                     tok = (h, "bucket", idx)
                     if tok in self._offered or not self._mine(tok, shard_only):
@@ -755,7 +789,7 @@ class UserTxFiller:
                     tokens.append(tok)
                     calls.append((self.ENDPOINT,
                                   {"userId": h, "limit": PAGE_LIMIT, "direction": "forward",
-                                   "cursor": str(cursor)}))
+                                   "cursor": make_cursor(cursor, MIN_OID)}))
             elif self.FLOORCHECK and not e.get("floor_checked"):
                 # One probe BELOW the derived floor before the recheck can
                 # finish the user (class docstring, FLOORCHECK) — makes
@@ -768,7 +802,7 @@ class UserTxFiller:
                 tokens.append(tok)
                 calls.append((self.ENDPOINT,
                               {"userId": h, "limit": PAGE_LIMIT, "direction": "forward",
-                               "cursor": str(self._floor(h, e))}))
+                               "cursor": make_cursor(self._floor(h, e), MIN_OID)}))
             else:
                 tok = (h, "recheck", None)
                 if tok in self._offered or not self._mine(tok, shard_only):
@@ -1023,7 +1057,7 @@ class UserTxFiller:
             stats["walk_pages"] = stats.get("walk_pages", 0) + len(slots)
 
     def stmts(self) -> list[str]:
-        out = _store_stmts(self._items)
+        out = build_stmts(self._items)
         out += [self.MARK_SQL.format(hex=h) for h in self._marks]
         return out
 
@@ -1236,7 +1270,7 @@ class UserTxRefreshFiller(UserTxFiller):
 
     users.transactions_scraped_at used to mean "walked once, never again".
     Everything such a user did afterwards reached the DB only because the
-    unfiltered 72 h window walk (TransactionFiller) happened to sweep it up —
+    unfiltered 72 h window walk (now update_tx_window.py) happened to sweep it up —
     which it does, verified 2026-08-16 (2,000 rows sampled at 20 random
     cursors across the whole window, 0 missing; danii's 47,330 rows complete
     months after their walk finished). But that is ONE mechanism with no
@@ -1337,17 +1371,18 @@ def build_filler_pool(db: str) -> FillerPool:
     highest):
       1. user-lite (user.getUserLite backfill + active refresh) — cheap,
          idempotent, per-user upserts;
-      2. transaction window live probes — the newest ~26 s tiling + gap
-         detection (the top edge must stay covered);
-      3. transaction window buckets — the finite 72 h window fill / gap
-         repair;
-      4. itemMarket item-code walks — full history per code;
-      5. user transaction walks — full history per user (XP-ranked, the
+      2. itemMarket item-code walks — full history per code;
+      3. user transaction walks — full history per user (XP-ranked, the
          infinite slow one);
-      6. user transaction REFRESH — re-walk the gap between an already
+      4. user transaction REFRESH — re-walk the gap between an already
          scraped user's completion stamp and now (UserTxRefreshFiller,
          2026-08-16) — LAST, because a first pass over a user nobody has
          walked always beats a top-up of one who has.
+    The 72 h transaction window used to be #2/#3 here (TransactionFiller's
+    live probes + gap buckets). It was RETIRED on 2026-08-18, not repaired:
+    Python/update_tx_window.py owns the window as a dedicated cycle step,
+    and a second writer for the same rows with its own state file is what
+    let the two diverge before (see extra/BUGFIX_PLAN.md section 3.3).
     Until 2026-08-16 a sixth filler (CreatedAtBackfillFiller) refetched
     getUserLite for users missing account_created_at, to seed #5's bucket
     bottoms. It was deleted as dead code: the API no longer serves
@@ -1361,31 +1396,26 @@ def build_filler_pool(db: str) -> FillerPool:
     its own dedicated requests (Python/update_priority_tx.py), and this pool
     fills whatever slots that step's list can't — see the module docstring.
 
-    MASTER SWITCH (2026-08-18, default OFF): WARERA_FILLERS=1 re-enables the
-    whole pool; everything below stays wired up for when that happens. WarEra
-    changed transaction.getPaginatedTransactions' (and battle.getBattles')
-    cursor from a plain ms-epoch we could compute ourselves to an opaque
-    server-issued token — TransactionFiller (#2/#3) computes its own cursor
-    everywhere and now gets HTTP 500 on every call, so it is disabled outright
-    (see Python/update_tx_window.py, its simple replacement for the 72 h
-    window, wired into the viewer's cycle independently of this pool).
-    #1/#4/#5/#6 use a userId/itemCode filter and were NOT observed failing —
-    they are bundled into the same switch anyway to keep the pipeline simple
-    while the transaction pagination change is being sorted out; flip
-    WARERA_FILLERS=1 to bring them back individually via the gates below.
+    MASTER SWITCH (WARERA_FILLERS, added 2026-08-18 when WarEra swapped the
+    ms-epoch cursor for an opaque v2 token and every filler started getting
+    HTTP 500 — filtered userId/itemCode calls included, verified). The four
+    send sites now go through utils.make_cursor, so the switch defaults ON
+    again; set WARERA_FILLERS=0 to silence the whole pool in one move if the
+    format changes under us a second time. Re-enabled 2026-08-18 after the
+    staged rollout in extra/BUGFIX_PLAN.md 3.5: 350 filler calls through the
+    bucket / FLOORCHECK paths and a direct probe of the SWEEP and itemMarket
+    payload shapes, all 200, zero added failed_calls.
 
-    Env gates below this master switch (all default ON once WARERA_FILLERS=1):
-    WARERA_USER_TX_REFRESH=0 disables #6; WARERA_TX_FILLER=0 disables the
-    three transaction fillers (the viewer's --transactions 0 sets this for
-    every spawned script); WARERA_ITEM_MARKET_FILLER=0 / WARERA_USER_TX_FILLER=0
-    disable individual ones.
+    Env gates below this master switch (all default ON):
+    WARERA_USER_TX_REFRESH=0 disables #4; WARERA_TX_FILLER=0 disables every
+    transaction-history filler (the viewer's --transactions 0 sets this for
+    every spawned script); WARERA_ITEM_MARKET_FILLER=0 /
+    WARERA_USER_TX_FILLER=0 disable individual ones.
     """
-    if os.environ.get("WARERA_FILLERS", "0") == "0":
+    if os.environ.get("WARERA_FILLERS", "1") == "0":
         return FillerPool([])
     tx = os.environ.get("WARERA_TX_FILLER", "1") != "0"
     fillers: list = [Filler(db)]
-    if tx:
-        fillers.append(TransactionFiller(db))
     if tx and os.environ.get("WARERA_ITEM_MARKET_FILLER", "1") != "0":
         fillers.append(ItemMarketFiller())
     if tx and os.environ.get("WARERA_USER_TX_FILLER", "1") != "0":

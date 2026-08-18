@@ -33,7 +33,9 @@ done
 
 # Run a single pipeline script (all read WARERA_DB_URL / WARERA_API_KEY env vars)
 .venv/bin/python Python/update_battles.py
-.venv/bin/python Python/update_transactions.py --verify   # coverage report, no API calls
+.venv/bin/python Python/update_tx_window.py --verify      # 72h window walk state, no API calls
+.venv/bin/python Python/update_transactions.py --verify   # per-type coverage report, no API calls
+.venv/bin/python Python/recover_tx_gap.py --verify --from … --to …   # per-minute holes
 .venv/bin/python Python/update_priority_tx.py --verify   # /tx-priority list state, no API calls
 .venv/bin/python Python/update_filler_boost.py --verify  # what a boost request would carry
 
@@ -86,19 +88,46 @@ formats regardless of who calls them):
   caller's writes (zero extra round trips); feeds the `/stats` page.
 - `fillers.py` — the priority-ordered `FillerPool` (see below).
 
-### The 72h transaction window + filler pool
+### The 72h transaction window
 
 The WarEra API only serves the rolling **72h window** of unfiltered transaction history (older
-data is reachable only via per-entity filters: `userId` / `itemCode`). There is no dedicated
-transaction-scraping step; instead every mixed API batch made by `update_battles.py` /
-`update_live.py` / `update_weekly_ranking.py` has slack capacity (batches are capped at 50 calls
-total), and `Python/fillers.py`'s `FillerPool` fills that slack in strict priority order:
+data is reachable only via per-entity filters: `userId` / `itemCode`). It is owned by
+`Python/update_tx_window.py`, a dedicated cycle step (NOT a filler — it was one until
+2026-08-18, see below), built on one primitive:
+
+- `Python/tx_walk.py`'s **`walk_range(session, db, from_ms, to_ms, …)`** — fill an arbitrary
+  `[from, to]` range with N parallel **bands**, one page each per wave, 50 pages per tRPC
+  request (~195 items/s vs. ~36 items/s for a sequential chain). Each band is seeded with
+  `utils.make_cursor(band_top_ms)` and thereafter echoes only its own `nextCursor`. It returns
+  `(rows stored, bands still incomplete)` — **the empty second element is the only proof the
+  range is covered**, and callers must treat "I stopped early" as "not covered".
+- `update_tx_window.py` — per cycle: a **catch-up** `walk_range(newest_ms, now)` (band count
+  scales with the gap: 1 band for a 15 s-fresh watermark, 50 for a multi-hour outage, bounded
+  by `--max-waves`, default 6) plus the cold-start **backfill**, a resumable sequential walk
+  that fills the 72h window once on a fresh DB. The watermark advances **only when every band
+  retires**; unfinished bands are parked in `state["pending"]` and resumed next cycle, so any
+  length of downtime self-heals. `pending` non-empty for more than a couple of cycles is the
+  "not keeping up" signal and is shown on `/stats`.
+- `Python/recover_tx_gap.py` — the manual escape hatch over the same primitive: an explicit
+  `--from/--to`, a resumable state file, and `--verify` (per-minute + thin-minute coverage of a
+  range). Run it after any suspected loss; it is idempotent and safe alongside the live cycle.
+
+Until 2026-08-18 the window was `update_transactions.TransactionFiller` (live probes + gap
+buckets riding the other steps' slack), and its catch-up **advanced the watermark even when its
+page cap was hit without reconnecting** — silently dropping ~20-35 min of transactions per stall,
+twice observed. It was retired rather than repaired: two writers for the same rows with two state
+files is what let them diverge. `update_transactions.py` is now the `--verify` report only, and
+`state/transactions_state.json` is simply no longer read.
+
+### The filler pool
+
+Every mixed API batch made by `update_battles.py` / `update_live.py` /
+`update_weekly_ranking.py` has slack capacity (batches are capped at 50 calls total), and
+`Python/fillers.py`'s `FillerPool` fills that slack in strict priority order:
 
 1. `user.getUserLite` (backfill unchecked users, then refresh active ones)
-2. transaction window **live probes** (detect gaps at the newest edge)
-3. transaction window **buckets** (time-bucketed walk filling the 72h window)
-4. **itemMarket walk** per equipment code (`itemCode` filter bypasses the window — full history)
-5. **user walk** by XP rank (`userId` filter bypasses the window — full lifetime history).
+2. **itemMarket walk** per equipment code (`itemCode` filter bypasses the window — full history)
+3. **user walk** by XP rank (`userId` filter bypasses the window — full lifetime history).
    Each user's walk starts at their account's ObjectID second (`fillers._user_floor_ms`,
    clamped to the first transaction in existence) — never at a global floor, and never from
    `account_created_at`, which the API stopped serving. One FLOORCHECK probe per user proves
@@ -108,15 +137,20 @@ total), and `Python/fillers.py`'s `FillerPool` fills that slack in strict priori
    (a short page proves exhaustion below its cursor), and the same-ms SWEEP only fires on a
    FULL page. 170.6 → 80.4 calls/user in production; `WARERA_USER_TX_STAGED=0` reverts.
    See `extra/USER_TX_BUCKET_SIZING_PLAN.md`.
-6. **user refresh walk** (`UserTxRefreshFiller`, 2026-08-16) — re-walks the gap between an
+4. **user refresh walk** (`UserTxRefreshFiller`, 2026-08-16) — re-walks the gap between an
    already-scraped user's `transactions_scraped_at` stamp and now, then moves the stamp, for
    users whose `last_active_at` outran it by a day. Without it a finished user was frozen
-   forever and depended entirely on filler 3 having swept up their activity.
+   forever and depended entirely on the 72h window step having swept up their activity.
    `WARERA_USER_TX_REFRESH=0` disables it.
+
+`WARERA_FILLERS=0` is the pool-wide kill switch (added 2026-08-17 when the cursor format
+changed under every filler at once; default ON again since the four send sites route through
+`utils.make_cursor`). It also stops `update_priority_tx.py`, whose filler is built outside
+`build_filler_pool`.
 
 Fillers never start additional requests — they only ride slots that would otherwise go unused.
 The one deliberate exception is the **priority list** (`tx_priority_users`, migration_24, managed
-from the viewer's `/tx-priority` page): those users are excluded from filler 5's pool entirely and
+from the viewer's `/tx-priority` page): those users are excluded from filler 3's pool entirely and
 walked by `Python/update_priority_tx.py`, a cycle step that BUYS up to 2 dedicated 50-call requests
 per cycle for them (`--priority-tx N` on `db_web.py`, `WARERA_PRIORITY_TX_FILLER=0`) and hands the
 slots the list can't fill to the ordinary fillers — zero requests when the list has nothing pending.
@@ -127,7 +161,7 @@ and sized from the viewer's `/stats` "Cycle config" panel (persisted in
 `state/viewer_settings.json`, applied on the next cycle without a restart; also `--filler-boost N`
 on `db_web.py`, `WARERA_FILLER_BOOST=0`, cap `config.FILLER_BOOST_MAX` = 20 ≈ +80 requests/min,
 ~110/min in total against the API's ~200/min). Unlike the priority step its "nothing pending → no request" guarantee
-is weak: the user-lite refresh and the window probes nearly always have something to ask for, so
+is weak: the user-lite refresh and the user walks nearly always have something to ask for, so
 check `update_filler_boost.py --verify` before raising N. Wall time stays small because both
 halves are pipelined: the requests go out in PARALLEL (like `update_live.py`'s ranking walk) and
 each wave's statements are flushed by a background writer thread while the next wave is in flight
@@ -137,10 +171,11 @@ Measured 2026-08-15 at N=4: ~5s wall for ~2.8s of API + ~3.6s of flush, ~15K sta
 Pools stop naturally once drained. State lives in `state/*.json` (gitignored, regenerable); since
 the viewer's cycle steps run as parallel subprocesses, filler state writes are serialized under a
 flock (`state/.filler_pool.lock`) —
-**don't run `update_transactions.py` standalone while a viewer cycle is running**, it skips the
-lock.
+standalone filler runs skip the lock, so don't fire one while a viewer cycle is running.
+(`update_tx_window.py` and `recover_tx_gap.py` carry no filler state and are safe to run
+alongside — their writes are idempotent upserts.)
 
-Note the practical consequence of filler 6 being LAST: while the XP conveyor still has users to
+Note the practical consequence of the refresh walk being LAST: while the XP conveyor still has users to
 walk (`USER_TX_TOTAL_LIMIT` not yet consumed) it takes essentially every slack slot, so the
 refresh walk only really starts once that conveyor drains. That ordering is deliberate — a first
 pass over a user nobody has ever walked beats a top-up of one who has.
@@ -152,20 +187,20 @@ from one state file produce byte-identical 50-call batches; the boost's flush wa
 new rows). `viewer/updater.py` now gives each of those steps a distinct `WARERA_FILLER_SHARD` of
 `WARERA_FILLER_SHARDS`, and every filler takes its shard's units first, falling back to the common
 pool only when that leaves the batch half empty (`utils.filler_shard` / `shard_owns`, crc32 — never
-`hash()`, which is per-process randomized). Shard 0 is always `update_battles` and owns the window
-probes (one global unit). Measured after: 82-104% new rows. `WARERA_FILLER_SHARDS=1` disables it.
+`hash()`, which is per-process randomized). Shard 0 is always `update_battles`. Measured after:
+82-104% new rows. `WARERA_FILLER_SHARDS=1` disables it.
 
 Sharding makes the state write-back **targeted**: each filler now merges only the units it advanced
 (`_touched`) into a *fresh* on-disk read under the flock, with stats folded in as this run's delta.
 Writing the whole in-memory snapshot (what `write_json_merged` did until 2026-08-15) rolls back
 every unit another shard advanced while we ran — measured as two good cycles followed by 0% new
-rows. `TransactionFiller` keys its buckets by `(top_ms, bottom_ms)` for the same reason: the
-done-filtering reindexes the list, so positions mean different things in different processes. Env gates: `WARERA_TX_FILLER=0` (all three transaction fillers), `WARERA_ITEM_MARKET_FILLER=0`,
+rows. Env gates: `WARERA_FILLERS=0` (the whole pool, plus the /tx-priority step),
+`WARERA_TX_FILLER=0` (every transaction-history filler), `WARERA_ITEM_MARKET_FILLER=0`,
 `WARERA_USER_TX_FILLER=0`, `WARERA_USER_TX_STAGED=0` (undo the staged arming/cascade),
 `WARERA_PRIORITY_TX_FILLER=0` (the dedicated /tx-priority step),
 `WARERA_FILLER_BOOST=0` (the extra empty requests), `WARERA_FILLER_SHARDS=1` (undo the shard split).
 
-### Cursor pagination (API quirk — WarEra changed the format 2026-08-18, mid-migration)
+### Cursor pagination (API quirk — WarEra changed the format 2026-08-17)
 
 The `cursor` param is an **upper bound** (`createdAt < cursor`), not a lower bound, and pages are
 newest-first regardless of the `direction` param — that part still holds. What changed: cursor
@@ -175,21 +210,33 @@ switched it to an **opaque, versioned token** the server hands back as `nextCurs
 `(createdAt, _id)` cursor). Passing a self-computed ms-epoch string now gets **HTTP 500** from the
 server — verified live 2026-08-17/18 against `battle.getBattles` and (unfiltered)
 `transaction.getPaginatedTransactions`, consistently, across `direction`/`limit` variations, not a
-transient blip. **Always pass back the exact `nextCursor` string the previous page returned; never
-compute your own.** `insert_transaction()`/`insert_battle()` etc. are idempotent upserts
-(`ON CONFLICT`), so re-fetching the boundary item is still harmless — the compound cursor doesn't
-drop same-ms ties either, since `_id` breaks them.
+transient blip — and it 500s on **every** endpoint and **every** filter, `userId`- and
+`itemCode`-filtered calls included. `insert_transaction()`/`insert_battle()` etc. are idempotent
+upserts (`ON CONFLICT`), so re-fetching the boundary item is still harmless — the compound cursor
+doesn't drop same-ms ties either, since `_id` breaks them.
 
-Fallout: every filler that computed its own ms-epoch cursor is broken for the calls that hit this
-(`TransactionFiller`'s window probes/buckets — unfiltered `transaction.getPaginatedTransactions` —
-and anything walking `battle.getBattles`). `Python/update_tx_window.py` (2026-08-18) is the
-from-scratch replacement for the transaction window: a dedicated cycle step, not a filler, that only
-ever echoes back `nextCursor` — see its module docstring for the design. Pending a full audit,
-**every filler is disabled by default** (`fillers.build_filler_pool`'s `WARERA_FILLERS` master
-switch, default OFF; `WARERA_FILLERS=1` re-enables them individually via the existing gates below).
-`UserTxFiller`/`PriorityUserTxFiller` (userId-filtered calls) were NOT observed failing in spot
-checks, but haven't been systematically re-verified against the new format — treat them as
-unverified, not confirmed-safe, until someone checks before flipping the switch back on.
+**Two rules, in order:**
+
+1. **If a previous page exists, echo its exact `nextCursor`.** It excludes the items already
+   seen precisely and survives the next format change. All the sequential walks do this
+   (`update_battles.py`'s walk-down/tail chains, `update_live.py` / `insert_ranking_sample.py`'s
+   ranking walks, `tx_walk.py`'s bands after their seed, `update_tx_window.py`'s backfill).
+2. **Only where the walk genuinely jumps to an arbitrary point**, synthesise one with
+   **`utils.make_cursor(ms, oid)`** — the single place cursor construction exists, so the next
+   format change is a one-line fix. Translation from the old code, verified live against a known
+   boundary item: `str(ms + 1)` (inclusive of `ms`) → `make_cursor(ms, MAX_OID)`;
+   `str(ms)` (exclusive) → `make_cursor(ms, MIN_OID)`. The server validates nothing — no
+   signature, no TTL, and the ObjectID need not exist — which is what makes the N-way parallel
+   band/bucket walks possible. Sites: `update_battles.py`'s batched index windows,
+   `tx_walk.make_bands`' seeds, and `fillers.py`'s four send sites (itemMarket page, user-tx
+   bucket page, SWEEP, FLOORCHECK).
+
+The fillers keep their `cursor_ms` **integer positions** in state — the cascade, stall detection
+and bucket bookkeeping are arithmetic on them, and only the wire encoding changed. So there was
+no state-file migration and no walk restarted. `grep -rn 'cursor.*str(' Python` should stay empty
+(bar docstrings).
+
+`WARERA_FILLERS=0` is the pool-wide kill switch if this ever happens again.
 
 ### Star schema
 

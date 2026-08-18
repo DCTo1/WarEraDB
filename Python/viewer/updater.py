@@ -25,11 +25,13 @@ The transaction window IS a dedicated step (2026-08-18, update_tx_window.py)
 update_live.py / update_weekly_ranking.py (update_transactions.TransactionFiller),
 but WarEra switched transaction.getPaginatedTransactions' cursor from a plain
 ms-epoch to an opaque server-issued token, so the filler's self-computed
-cursors now get HTTP 500 on every call. update_tx_window.py only ever echoes
-back the `nextCursor` the API gives it, so it is unaffected — see its module
-docstring. The old filler (and every other filler: user-lite, itemMarket,
-user tx walk, user tx refresh) is disabled by default while this settles
-(fillers.build_filler_pool's WARERA_FILLERS master switch, default OFF).
+cursors got HTTP 500 on every call. That filler was retired rather than
+repaired: update_tx_window.py owns the window now, seeding its parallel
+catch-up bands with utils.make_cursor and echoing the server's `nextCursor`
+thereafter — see its module docstring. The remaining fillers (user-lite,
+itemMarket, user tx walk, user tx refresh) build v2 cursors the same way;
+they stay behind fillers.build_filler_pool's WARERA_FILLERS master switch
+while that is rolled out one filler at a time.
 
 The FIRST run of a boot also does a one-shot completeness check (_boot_check,
 also skipped when --ranking 0 disables the ranking pass): battles ended in
@@ -236,8 +238,9 @@ def _run_updater() -> None:
                            str(settings.user_lite_limit)], False))
         if settings.transactions_enabled:
             # The 72 h transaction window tracker (2026-08-18) — replaces the
-            # old TransactionFiller (see the module docstring): a dedicated
-            # step, not a filler, so it is unaffected by WARERA_FILLERS.
+            # retired TransactionFiller (see the module docstring): a
+            # dedicated step, not a filler, so it is unaffected by
+            # WARERA_FILLERS.
             steps.append(("rc9", "tx window: update_tx_window.py",
                           [sys.executable, TX_WINDOW_SCRIPT, "--db", db], False))
         if settings.transactions_enabled and settings.priority_tx_requests:
