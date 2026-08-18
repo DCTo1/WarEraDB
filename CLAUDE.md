@@ -103,11 +103,23 @@ data is reachable only via per-entity filters: `userId` / `itemCode`). It is own
   range is covered**, and callers must treat "I stopped early" as "not covered".
 - `update_tx_window.py` — per cycle: a **catch-up** `walk_range(newest_ms, now)` (band count
   scales with the gap: 1 band for a 15 s-fresh watermark, 50 for a multi-hour outage, bounded
-  by `--max-waves`, default 6) plus the cold-start **backfill**, a resumable sequential walk
-  that fills the 72h window once on a fresh DB. The watermark advances **only when every band
-  retires**; unfinished bands are parked in `state["pending"]` and resumed next cycle, so any
-  length of downtime self-heals. `pending` non-empty for more than a couple of cycles is the
-  "not keeping up" signal and is shown on `/stats`.
+  by `--max-waves`, default 6) plus the cold-start **backfill**, the same `walk_range` over
+  `[edge, watermark]` with its bands parked under a *distinct* key (`backfill_pending`) and
+  resumed a slice at a time until every one retires, once, forever (`backfill_done`). The
+  watermark advances **only when every band retires**; unfinished bands are parked in
+  `state["pending"]` and resumed next cycle, so any length of downtime self-heals. `pending`
+  non-empty for more than a couple of cycles is the "not keeping up" signal and is shown on
+  `/stats`.
+  The backfill's slice is budgeted by `--backfill-calls` (pages per wave, default 4) **and**
+  `--backfill-seconds` (default 10) because a page costs more the deeper it is (measured
+  2026-08-18: 0.24 s at the edge, 1.02 s at 6 h, 2.30 s at 24 h) and **the API serialises our
+  calls whatever the request shape** — 50 deep pages take ~70 s in one 50-call request and in
+  twelve parallel ones alike, so parallelism buys nothing down there and only the wave size
+  keeps a cycle a cycle. Proving a full 72 h window costs ~22 K pages, i.e. hours of API time:
+  on a DB already known to be covered say so instead, with
+  `update_tx_window.py --mark-backfill-done` (refuses while any minute in the window is empty).
+  Done on `tsdb` 2026-08-18 — 0 empty minutes of 4,315, and the one thin minute the audit
+  flagged was re-walked and confirmed to be a real traffic lull.
 - `Python/recover_tx_gap.py` — the manual escape hatch over the same primitive: an explicit
   `--from/--to`, a resumable state file, and `--verify` (per-minute + thin-minute coverage of a
   range). Run it after any suspected loss; it is idempotent and safe alongside the live cycle.

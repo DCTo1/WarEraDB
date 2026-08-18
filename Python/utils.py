@@ -94,6 +94,25 @@ def make_cursor(ms: int, oid: str = MAX_OID) -> str:
     return "v2." + base64.urlsafe_b64encode(raw).decode().rstrip("=")
 
 
+def full_minute_range(from_ms: int, to_ms: int) -> tuple[int, int]:
+    """The whole minutes inside [from_ms, to_ms], as (first_ms, last_ms).
+
+    Per-minute coverage checks compare a minute's stored count against the
+    traffic rate, so a minute the range only half covers is guaranteed to
+    look thin — and the LAST bucket of a range that ends on a minute
+    boundary contains a single instant and reads as empty. That produced a
+    phantom "MISSING" run at the end of every recover_tx_gap.py --verify,
+    which made its exit code 3 (incomplete) on ranges that were complete.
+
+    Returns (0, -1) when the range does not contain a whole minute.
+    """
+    first = -(-from_ms // 60_000) * 60_000        # ceil to the next minute
+    last = (to_ms // 60_000) * 60_000 - 60_000    # last minute that fully fits
+    if last < first:
+        return 0, -1
+    return first, last
+
+
 def parse_until_ms(value: str) -> int:
     """--until CLI values: ISO datetime string or raw Unix ms."""
     if value.isdigit():

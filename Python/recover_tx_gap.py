@@ -37,12 +37,13 @@ import argparse
 import os
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from api import make_session
 from db import query
 from tx_walk import make_bands, walk_range
-from utils import MAX_BATCH, STATE_DIR, parse_until_ms, read_json, write_json
+from utils import (MAX_BATCH, STATE_DIR, full_minute_range, parse_until_ms,
+                   read_json, write_json)
 
 STATE_FILE = os.path.join(STATE_DIR, "tx_recovery_state.json")
 WINDOW_HOURS = 72
@@ -67,16 +68,27 @@ def _save(from_ms: int, to_ms: int, bands: list[dict]) -> None:
 
 
 def verify(db: str, from_ms: int, to_ms: int) -> int:
-    """Per-minute coverage of the target range. No API calls."""
+    """Per-minute coverage of the target range. No API calls.
+
+    Only WHOLE minutes are judged (utils.full_minute_range): a minute the
+    range half covers holds half a minute of traffic and would be reported
+    as thin — or, for the closing bucket of a range that ends on a minute
+    boundary, as missing — on a range that is in fact complete.
+    """
+    first_ms, last_ms = full_minute_range(from_ms, to_ms)
+    if last_ms < first_ms:
+        print(f"range {_iso(from_ms)} -> {_iso(to_ms)} UTC contains no whole minute")
+        return 0
     rows = query(
-        "WITH mins AS (SELECT generate_series(date_trunc('minute', to_timestamp(%d)),\n"
-        "                     date_trunc('minute', to_timestamp(%d)), interval '1 minute') AS m),\n"
+        "WITH mins AS (SELECT generate_series(to_timestamp(%d), to_timestamp(%d),\n"
+        "                     interval '1 minute') AS m),\n"
         "     cnt AS (SELECT date_trunc('minute', created_at) AS m, count(*)::int AS n\n"
         "             FROM transactions\n"
-        "             WHERE created_at >= to_timestamp(%d) AND created_at <= to_timestamp(%d)\n"
+        "             WHERE created_at >= to_timestamp(%d) AND created_at < to_timestamp(%d)\n"
         "             GROUP BY 1)\n"
         "SELECT mins.m, coalesce(cnt.n, 0) FROM mins LEFT JOIN cnt USING (m) ORDER BY 1;"
-        % (from_ms // 1000, to_ms // 1000, from_ms // 1000, to_ms // 1000), db)
+        % (first_ms // 1000, last_ms // 1000, first_ms // 1000,
+           (last_ms + 60_000) // 1000), db)
     runs, start, total = [], None, 0
     for m, n in rows:
         if n == 0:
@@ -84,8 +96,8 @@ def verify(db: str, from_ms: int, to_ms: int) -> int:
         elif start is not None:
             runs.append((start, m))
             start = None
-    if start is not None:
-        runs.append((start, rows[-1][0]))
+    if start is not None:      # run reaches the end: closed one minute past it
+        runs.append((start, rows[-1][0] + timedelta(minutes=1)))
     print(f"range {_iso(from_ms)} -> {_iso(to_ms)} UTC")
     print(f"  {sum(n for _, n in rows):,} transaction(s) stored over "
           f"{len(rows)} minute(s)")
@@ -104,12 +116,12 @@ def verify(db: str, from_ms: int, to_ms: int) -> int:
     thin = query(
         "WITH c AS (SELECT date_trunc('minute', created_at) AS m, count(*)::int AS n\n"
         "           FROM transactions\n"
-        "           WHERE created_at >= to_timestamp(%d) AND created_at <= to_timestamp(%d)\n"
+        "           WHERE created_at >= to_timestamp(%d) AND created_at < to_timestamp(%d)\n"
         "           GROUP BY 1),\n"
         "     w AS (SELECT m, n, avg(n) OVER (ORDER BY m ROWS BETWEEN 20 PRECEDING\n"
         "                                     AND 20 FOLLOWING) AS av FROM c)\n"
         "SELECT m, n, round(av)::int FROM w WHERE n < av * 0.35 ORDER BY m;"
-        % (from_ms // 1000, to_ms // 1000), db)
+        % (first_ms // 1000, (last_ms + 60_000) // 1000), db)
     if thin:
         print(f"  {len(thin)} thin minute(s) (<35%% of the local average) — a "
               f"dropped page looks like this, not like an empty minute:")

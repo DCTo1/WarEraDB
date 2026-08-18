@@ -124,6 +124,7 @@ def advance(band: dict, res: dict) -> list[dict]:
 
 def walk_range(session, db: str, from_ms: int, to_ms: int, *,
                bands: list[dict] | None = None, max_waves: int = 0,
+               max_calls: int = MAX_BATCH, deadline: float = 0.0,
                on_wave: Callable[[dict], None] | None = None,
                verbose: bool = False) -> tuple[int, list[dict]]:
     """Fill [from_ms, to_ms] via N parallel synthetic-cursor bands.
@@ -134,9 +135,21 @@ def walk_range(session, db: str, from_ms: int, to_ms: int, *,
 
     *bands* resumes a previous, unfinished walk (pass what a previous call
     returned, optionally with fresh bands appended for a newer range); the
-    default builds them from the range. *max_waves* 0 walks until every band
-    retires. *on_wave* is called after each wave COMMITS with
-    {wave, pages, failed, stored, remaining, top_id, top_ms, bands}.
+    default builds them from the range. Bands are served in list order, so
+    the caller decides what a short budget spends itself on. *max_waves* 0
+    walks until every band retires. *on_wave* is called after each wave
+    COMMITS with {wave, pages, failed, stored, remaining, top_id, top_ms,
+    bands}.
+
+    *max_calls* caps the pages per wave below MAX_BATCH, and *deadline* (an
+    absolute time.time()) stops the walk between waves. Both exist for the
+    deep backfill: a page's latency grows with its depth in the window
+    (measured 2026-08-18: 0.24 s at the edge, 1.0 s at 6 h, 2.3 s at 24 h)
+    and the API serialises our calls whatever the request shape, so a full
+    50-page wave down there costs ~70 s — far past a 15 s cycle. Sizing the
+    wave small and re-checking the clock between waves keeps a cycle a cycle
+    at every depth. The deadline is NOT checked mid-wave: a wave in flight
+    always finishes, so no page is fetched and then dropped.
 
     Statements are flushed on a background thread while the next wave is in
     flight (the same pipelining as update_filler_boost.py); a failed flush
@@ -169,8 +182,10 @@ def walk_range(session, db: str, from_ms: int, to_ms: int, *,
     while True:
         if err:
             break
-        live = [b for b in bands if not b["done"]][:MAX_BATCH]
+        live = [b for b in bands if not b["done"]][:max(1, min(max_calls, MAX_BATCH))]
         if not live or (max_waves and waves >= max_waves):
+            break
+        if deadline and time.time() >= deadline:
             break
         calls = [(ENDPOINT, {"limit": PAGE_LIMIT,
                              "cursor": b["cursor"] or make_cursor(b["top_ms"])})
