@@ -20,6 +20,7 @@ Usage
     # → call insert_transaction(transformed) on the DB side
 """
 
+import base64
 import json
 import os
 import zlib
@@ -62,6 +63,35 @@ def to_unix_ms(iso_str: str) -> int:
     else:
         dt = datetime.strptime(clean, "%Y-%m-%dT%H:%M:%S")
     return int(dt.replace(tzinfo=timezone.utc).timestamp() * 1000)
+
+
+# WarEra v2 keyset cursor (2026-08-17). `cursor` used to be a plain ms epoch
+# any caller could compute; it is now an opaque, versioned token encoding a
+# compound (createdAt, _id) upper bound. Passing the old ms-epoch form gets
+# HTTP 500 on every endpoint and every filter — see extra/CURSOR_MIGRATION_PLAN.md.
+MAX_OID = "f" * 24   # upper bound INCLUSIVE of the timestamp's own millisecond
+MIN_OID = "0" * 24   # upper bound EXCLUSIVE of it
+
+
+def make_cursor(ms: int, oid: str = MAX_OID) -> str:
+    """Build a v2 cursor: results satisfy (createdAt, _id) < (ms, oid).
+
+    Translation from the pre-2026-08-17 code, verified live against the
+    boundary item at 2026-08-18T08:59:49.727Z:
+        cursor = str(ms + 1)  (inclusive of ms) -> make_cursor(ms, MAX_OID)
+        cursor = str(ms)      (exclusive of ms) -> make_cursor(ms, MIN_OID)
+
+    ONLY for walks that start at an arbitrary point (buckets, probes, index
+    windows). When a previous page exists, echo back its `nextCursor` instead:
+    the server's token is (last item's createdAt, last item's _id), which
+    resumes exactly — no boundary re-fetch, no same-ms tie dropped — and it
+    survives a future format change, which a self-built cursor does not.
+    """
+    iso = datetime.fromtimestamp(ms / 1000, tz=timezone.utc).strftime(
+        "%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+    raw = json.dumps([{"t": "date", "v": iso}, {"t": "str", "v": oid}],
+                     separators=(",", ":")).encode()
+    return "v2." + base64.urlsafe_b64encode(raw).decode().rstrip("=")
 
 
 def parse_until_ms(value: str) -> int:
