@@ -3,3 +3,4 @@ __pycache__/
 extra/
 Python/__pycache__
 state/
+.claude/
