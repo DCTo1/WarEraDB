@@ -227,9 +227,10 @@ def _backfill(s, db: str, state: dict, edge_ms: int, now_ms: int,
     the hour; the top can wait.
     """
     if state.get("backfill_done"):
-        if state.get("backfill_pending"):
+        stats = state.setdefault("stats", {})
+        if state.get("backfill_pending") or stats.get("backfill_pending"):
             state["backfill_pending"] = []    # left over from --mark-backfill-done
-            state.setdefault("stats", {})["backfill_pending"] = 0
+            stats["backfill_pending"] = 0
             _save_state(state)
         return {"waves": 0, "pages": 0, "stored": 0, "bands": 0,
                 "pending": 0, "done": True}
