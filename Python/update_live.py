@@ -14,9 +14,10 @@ state/live_state.json); the battle list, reconciliation and battle-doc
 refresh run on every invocation (i.e. every 15s from the website).
 
 Per run:
-  1. battle.getBattles {isActive: true} — ALL active battles in one request
-     (the cursor is an UPPER bound on createdAt; a far-future cursor returns
-     the whole active set; verified 2026-08-03).
+  1. battle.getBattles {isActive: true} — ALL active battles in one request,
+     with NO cursor (the endpoint returns the whole active set in one page;
+     verified 2026-08-18 after the v2 cursor change made the old far-future
+     cursor a 500).
   2. Reconciliation: DB battles with ended_at IS NULL that are missing from
      the API's active list get their status checked via battle.getById. When
      isActive=false the battle is marked ended (ended_at = COALESCE(endedAt,
@@ -92,7 +93,6 @@ from fillers import FillerPool, build_filler_pool
 STATE_FILE = os.path.join(STATE_DIR, "live_state.json")
 
 FLUSH = 20000
-FUTURE_CURSOR = "2099-01-01T00:00:00Z"
 RANKING_INTERVAL = 300  # seconds between per-entity ranking syncs (default)
 WORKERS = 16            # concurrent batched requests during the ranking walk
 BODY_CAP = 20           # calls per batched request in the walk (<= MAX_BATCH;
@@ -105,8 +105,15 @@ DATA_TYPES = ("damage", "points")
 
 
 def fetch_live_battles(s: requests.Session, pool: FillerPool | None = None) -> list[dict]:
-    """ALL active battles in one request (the filler pool tops up the slack)."""
-    calls = [("battle.getBattles", {"isActive": True, "limit": 100, "cursor": FUTURE_CURSOR})]
+    """ALL active battles in one request (the filler pool tops up the slack).
+
+    No cursor: this call used to pass a far-future ISO string as an upper
+    bound, which HTTP 500s since WarEra made `cursor` an opaque v2 token
+    (2026-08-17). Verified 2026-08-18 — cursor-less returns the identical
+    items with nextCursor: null, so the bound bought nothing here; the
+    endpoint already returns every active battle in one page.
+    """
+    calls = [("battle.getBattles", {"isActive": True, "limit": 100})]
     slots, req = pool.top_up(calls) if pool is not None else ([], [])
     out = mixed_fetch(s, calls)
     if "error" in out[0]:

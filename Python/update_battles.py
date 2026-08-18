@@ -40,9 +40,14 @@ State
 
 Notes
 -----
-    - Pagination follows the verified API rules: cursor is an UPPER bound
-      (createdAt < cursor), so page with str(last_item_ms + 1) and dedupe by
-      _id (ON CONFLICT in the DB makes re-includes harmless).
+    - Pagination follows the verified API rules: `cursor` is an UPPER bound,
+      but since 2026-08-17 it is an OPAQUE (createdAt, _id) token, not a
+      millisecond epoch — a self-built ms string now gets HTTP 500 on every
+      call (extra/CURSOR_MIGRATION_PLAN.md). Sequential walks therefore echo
+      back the server's own `nextCursor`, which resumes exactly; only the
+      batched index windows, which have no previous page to echo, synthesise
+      a cursor (utils.make_cursor). Dedupe by _id either way (ON CONFLICT in
+      the DB makes re-includes harmless).
     - tRPC request batching: N single calls (each with its own payload) go in
       ONE POST to <trpc>/battle.getBattles,battle.getBattles,...?batch=1; the
       response is a list aligned with the request order. The SERVER caps
@@ -57,13 +62,14 @@ Notes
       the createdAt of every 100th battle, OLDEST-first. Positions are stable
       as new battles arrive, so the index only needs appending, never a
       rebuild. One batched request fetches up to MAX_BATCH windows = up to
-      5,000 battles; windows chain by the +1 ms rule; battles newer than the
-      index are covered by the cursor-less page (+catch-up walk if >100).
+      5,000 battles; each window's cursor is make_cursor(hi + 1, MIN_OID),
+      i.e. exactly `createdAt <= hi`; battles newer than the index are
+      covered by the cursor-less page (+catch-up walk if >100).
     - The active-battle refresh runs on a cadence: --active-interval minutes
       (default 30). It is DB-driven (one battle.getById per active battle,
       also batched). (2026-08-03: the API's isActive pagination IS usable —
-      battle.getBattles {isActive: true, cursor: <far-future>} returns ALL
-      active battles in one request; update_live.py uses it for reconciliation,
+      battle.getBattles {isActive: true} returns ALL active battles in one
+      cursor-less request; update_live.py uses it for reconciliation,
       this script keeps the getById cadence for rounds.)
     - insert_battle()/insert_round() upsert: new rows are inserted, and
       re-fetched active battles/live rounds have their mutable stats
@@ -101,7 +107,9 @@ from fillers import FillerPool, build_filler_pool
 from utils import (
     BASE_DIR,
     MAX_BATCH,
+    MIN_OID,
     STATE_DIR,
+    make_cursor,
     parse_until_ms,
     read_json,
     to_unix_ms,
@@ -158,11 +166,13 @@ def mixed_batch(session: requests.Session, calls: list[tuple[str, dict]],
 # ── Battle fetching (API) ───────────────────────────────────────────────
 
 def fetch_battles_sequential(session: requests.Session, since_ms: int, until_ms: int) -> list[dict]:
-    """Single-request walk (cursor = last_ms + 1), fallback when no index exists.
+    """Single-request walk (echoing the server's nextCursor), fallback when no
+    index exists.
 
-    Breaks when a page adds no new battles: the cursor re-includes the
-    boundary battle, so at the API's oldest battle pages become 1-item
-    repeats that never advance.
+    Ends on an empty page, a missing nextCursor, or a page that adds no new
+    battles — the last case now only means "this page fell outside
+    (since_ms, until_ms]", since an echoed cursor excludes the boundary
+    battle exactly instead of re-including it forever.
     """
     out: dict[str, dict] = {}
     cursor: str | None = None
@@ -172,7 +182,8 @@ def fetch_battles_sequential(session: requests.Session, since_ms: int, until_ms:
         if cursor is not None:
             payload["cursor"] = cursor
         endpoint_log.log("battle.getBattles")
-        items = fetch_data(session, "battle.getBattles", payload)["items"]
+        res = fetch_data(session, "battle.getBattles", payload)
+        items = res["items"]
         pages += 1
         if not items:
             break
@@ -186,7 +197,9 @@ def fetch_battles_sequential(session: requests.Session, since_ms: int, until_ms:
             break
         if pages % 10 == 0:
             print(f"  battles: {pages} pages, {len(out)} collected so far", flush=True)
-        cursor = str(to_unix_ms(items[-1]["createdAt"]) + 1)
+        cursor = res.get("nextCursor")
+        if not cursor:
+            break
         time.sleep(0.3)  # be polite; the API intermittently blackholes burst traffic
     print(f"  battles: {pages} pages, {len(out)} collected", flush=True)
     return list(out.values())
@@ -215,7 +228,8 @@ def fetch_battles(session: requests.Session, since_ms: int, until_ms: int, index
     if until_ms > newest_entry:
         res = mixed_batch(session, [("battle.getBattles",
                                      {"limit": 100, "direction": "forward"})], pool)[0]
-        items = res["result"]["data"]["items"]
+        page = res["result"]["data"]
+        items = page["items"]
         for it in items:
             ms = to_unix_ms(it["createdAt"])
             if since_ms < ms <= until_ms:
@@ -224,11 +238,12 @@ def fetch_battles(session: requests.Session, since_ms: int, until_ms: int, index
             # more than INDEX_STEP battles are newer than the index — walk down
             # until the newest index entry is reached (rare: index is stale)
             print("  ⚠ > INDEX_STEP battles newer than the index — walking down", file=sys.stderr, flush=True)
-            cursor = str(to_unix_ms(items[-1]["createdAt"]) + 1)
-            while True:
+            cursor = page.get("nextCursor")
+            while cursor:
                 endpoint_log.log("battle.getBattles")
-                items = fetch_data(session, "battle.getBattles",
-                                   {"limit": 100, "direction": "forward", "cursor": cursor})["items"]
+                res = fetch_data(session, "battle.getBattles",
+                                 {"limit": 100, "direction": "forward", "cursor": cursor})
+                items = res["items"]
                 if not items:
                     break
                 new = 0
@@ -239,7 +254,7 @@ def fetch_battles(session: requests.Session, since_ms: int, until_ms: int, index
                         new += 1
                 if new == 0:
                     break
-                cursor = str(to_unix_ms(items[-1]["createdAt"]) + 1)
+                cursor = res.get("nextCursor")
                 if to_unix_ms(items[-1]["createdAt"]) <= newest_entry:
                     break
                 time.sleep(0.3)
@@ -253,7 +268,11 @@ def fetch_battles(session: requests.Session, since_ms: int, until_ms: int, index
             continue  # window fully below the cutoff
         if lo >= until_ms:
             break  # entries are oldest-first: older windows stay below
-        payloads.append({"limit": 100, "direction": "forward", "cursor": str(hi + 1)})
+        # No previous page to echo: these go out together in one batched
+        # request, so the cursor has to be synthesised. make_cursor(hi + 1,
+        # MIN_OID) is exactly the old str(hi + 1), i.e. `createdAt <= hi`.
+        payloads.append({"limit": 100, "direction": "forward",
+                         "cursor": make_cursor(hi + 1, MIN_OID)})
 
     pages = 0
     page_calls = [("battle.getBattles", p) for p in payloads]
@@ -275,14 +294,16 @@ def fetch_battles(session: requests.Session, since_ms: int, until_ms: int, index
         time.sleep(0.3)
 
     # Tail walk: battles older than index[0] (the index source may lag the
-    # API). Breaks on an empty page or a page of only already-seen battles
-    # (at the API's oldest battle the cursor re-includes it forever).
-    cursor = str(index_ms[0] + 1)
+    # API). Seeded with a synthetic cursor (no previous page), then echoing
+    # nextCursor. Ends on an empty page, a missing nextCursor, or a page of
+    # only already-seen battles.
+    cursor = make_cursor(index_ms[0] + 1, MIN_OID)
     tail_pages = 0
-    while True:
+    while cursor:
         endpoint_log.log("battle.getBattles")
-        items = fetch_data(session, "battle.getBattles",
-                           {"limit": 100, "direction": "forward", "cursor": cursor})["items"]
+        res = fetch_data(session, "battle.getBattles",
+                         {"limit": 100, "direction": "forward", "cursor": cursor})
+        items = res["items"]
         tail_pages += 1
         if not items:
             break
@@ -294,7 +315,7 @@ def fetch_battles(session: requests.Session, since_ms: int, until_ms: int, index
                 new += 1
         if new == 0:
             break
-        cursor = str(to_unix_ms(items[-1]["createdAt"]) + 1)
+        cursor = res.get("nextCursor")
         time.sleep(0.3)
     if tail_pages > 1:
         print(f"  battles: tail walk finished ({tail_pages} pages, {len(out)} collected)", flush=True)
