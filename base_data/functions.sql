@@ -138,13 +138,20 @@ BEGIN
     END IF;
     SELECT id INTO v_id FROM items WHERE item_uuid = objectid_to_uuid(p_item_uuid);
     IF v_id IS NOT NULL THEN
-        -- existing item: only refresh last_acquisition_at (no sequence burn)
+        -- existing item: only refresh last_acquisition_at (no sequence burn).
+        -- The qual matters as much as the assignment (2026-08-18): the old
+        -- GREATEST() form rewrote the tuple even when the stored stamp was
+        -- already correct, and that row lock is held until the caller's flush
+        -- commits thousands of statements later. Every re-walked historical
+        -- transaction hit it, so two concurrent filler flushes touching the
+        -- same items in different orders deadlocked (~1-2/min with the
+        -- fillers on, 24% of filler-boost flushes lost). Skipping the write
+        -- when nothing changes takes no lock at all; the outcome is identical.
         IF p_last_acquisition_at IS NOT NULL THEN
-            UPDATE items SET last_acquisition_at = CASE
-                WHEN items.last_acquisition_at IS NULL THEN p_last_acquisition_at
-                ELSE GREATEST(items.last_acquisition_at, p_last_acquisition_at)
-            END
-            WHERE id = v_id;
+            UPDATE items SET last_acquisition_at = p_last_acquisition_at
+            WHERE id = v_id
+              AND (items.last_acquisition_at IS NULL
+                   OR items.last_acquisition_at < p_last_acquisition_at);
         END IF;
         RETURN v_id;
     END IF;
