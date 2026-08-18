@@ -264,6 +264,16 @@ beyond segmentby/orderby metadata — keep queries time-bounded or entity-scan v
 DML on compressed chunks decompresses whatever it touches, so cleanup DELETEs always carry a
 `created_at > now() - interval '7 days'` guard to avoid an accidental full-table decompress.
 
+The upsert functions in `base_data/functions.sql` must not write a row whose value is already
+correct. A flush is ONE transaction of 10-14K statements, so every row lock it takes is held for
+its whole 1.5-3 s; `get_item_id`'s old `GREATEST()` form rewrote `items.last_acquisition_at` on
+every re-walked historical transaction even when the stored stamp was already newer, and two
+concurrent flushes touching the same items in a different order deadlocked on it (102 occurrences
+in 128 active minutes → 0 after the write was guarded with a qual — a no-op write now takes no
+lock at all). Do not "simplify" that qual back into an unconditional `GREATEST()`. Deadlocks that
+remain are a different class (two flushes racing to insert the same genuinely new row);
+`db.exec_batch`/`exec_many` replay a 40P01 victim up to three times rather than lose the flush.
+
 Full column-level schema, views, and example queries are documented in `README.md` — read that
 before writing new SQL against tables you haven't touched before.
 

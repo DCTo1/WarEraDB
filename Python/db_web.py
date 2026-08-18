@@ -55,11 +55,12 @@ Python/update_users_lite.py fetches user.getUserLite for up to
 disables the user pass), and Python/update_weekly_ranking.py stores hourly
 official weekly-ranking snapshots (--weekly 1, self-throttled to xx:01; 0
 disables). The transactions table stays current with the API's rolling
-72 h window through the transaction fillers: the mixed batches of the first
-three scripts carry transaction.getPaginatedTransactions probes + pending
-window-backfill pages + itemMarket item-code walks + XP-ranked user walks
-in their slack slots, via the priority-ordered filler pool
-(Python/fillers.py; --transactions 0 disables it). Users on the
+72 h window through Python/update_tx_window.py, a cycle step of its own
+since 2026-08-18 (parallel band walk, watermark held until every band
+retires). History OLDER than that window comes from the filler pool: the
+mixed batches of the first three scripts carry itemMarket item-code walks +
+XP-ranked user walks in their slack slots (Python/fillers.py).
+--transactions 0 disables both. Users on the
 /tx-priority list are the exception: they are excluded from the slack
 fillers and walked by Python/update_priority_tx.py, which buys up to
 --priority-tx (default 2) dedicated 50-call requests per cycle for them
@@ -131,10 +132,10 @@ def main() -> int:
                         "weeklyCountryDamages/muWeeklyDamages, self-throttled to "
                         "xx:01; default 1, 0 disables)")
     p.add_argument("--transactions", type=int, default=int(config.settings.transactions_enabled),
-                   help="transaction fillers (window probes + 72 h backfill + "
-                        "itemMarket item-code walks + XP-ranked user walks "
-                        "riding the pipeline's mixed batches' slack; "
-                        "default 1, 0 disables)")
+                   help="the 72 h window step (update_tx_window.py) plus the "
+                        "transaction-history fillers (itemMarket item-code "
+                        "walks + XP-ranked user walks riding the pipeline's "
+                        "mixed batches' slack); default 1, 0 disables both)")
     p.add_argument("--priority-tx", type=int,
                    default=config.settings.priority_tx_requests,
                    help="dedicated 50-call requests per cycle for the "

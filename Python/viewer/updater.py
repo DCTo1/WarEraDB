@@ -29,9 +29,10 @@ cursors got HTTP 500 on every call. That filler was retired rather than
 repaired: update_tx_window.py owns the window now, seeding its parallel
 catch-up bands with utils.make_cursor and echoing the server's `nextCursor`
 thereafter — see its module docstring. The remaining fillers (user-lite,
-itemMarket, user tx walk, user tx refresh) build v2 cursors the same way;
-they stay behind fillers.build_filler_pool's WARERA_FILLERS master switch
-while that is rolled out one filler at a time.
+itemMarket, user tx walk, user tx refresh) build v2 cursors the same way
+through utils.make_cursor and have been back ON by default since
+2026-08-17; fillers.build_filler_pool's WARERA_FILLERS master switch is
+kept as the one-move kill switch for the next time the API changes shape.
 
 The FIRST run of a boot also does a one-shot completeness check (_boot_check,
 also skipped when --ranking 0 disables the ranking pass): battles ended in
