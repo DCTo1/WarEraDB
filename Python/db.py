@@ -13,6 +13,7 @@ API
     scalar(sql)                      # first column of the first row
     exec_many(stmts, pre="") -> int  # run each statement in ONE transaction
     exec_batch(stmts, pre="")        # same, but statements sent in bulk
+                                     # (both replay a 40P01 deadlock victim)
     exec_sql(sql)                    # run one single statement
     flush_endpoint_log()             # flush queued endpoint usages
 
@@ -26,7 +27,10 @@ live in base_data/functions.sql.
 """
 
 import os
+import random
 import re
+import sys
+import time
 from functools import wraps
 
 from sqlalchemy import create_engine
@@ -79,6 +83,59 @@ def _flush_endpoint_log(conn) -> None:
         conn.exec_driver_sql(stmt)
 
 
+# Two concurrent flushes routinely race to INSERT … ON CONFLICT the same
+# genuinely NEW row (the cycle steps run as parallel subprocesses and their
+# filler shards overlap by design at the edges), and each ends up waiting on
+# the other's uncommitted unique-index tuple. Postgres breaks the cycle by
+# killing one with SQLSTATE 40P01 and rolling its whole transaction back —
+# NOTHING was committed — so the victim can simply be replayed: every
+# statement these two helpers send is an idempotent upsert, and none of the
+# upsert functions accumulate (no `SET x = x + …` in base_data/functions.sql,
+# checked 2026-08-18).
+#
+# Measured before this: 8 deadlocks/hour on tsdb, all of this class, costing
+# the filler boost ~1 flush in 28 cycles. A lost flush is not lost DATA — the
+# callers skip save_state when the flush raises, so the pages are re-walked —
+# but it is a wasted 50-call request. Retrying is strictly cheaper.
+#
+# NOT applied to exec_sql: single-statement callers (the cleanup DELETEs) are
+# not part of this pattern, and a blind replay there is a bigger promise than
+# this comment can make.
+DEADLOCK_SQLSTATE = "40P01"
+DEADLOCK_ATTEMPTS = 3           # total tries, i.e. 2 retries
+DEADLOCK_BACKOFF = 0.25         # seconds, scaled by attempt and jittered
+
+_deadlock_retries = 0           # process-local counter, for the log line
+
+
+def _is_deadlock(exc: BaseException) -> bool:
+    """SQLAlchemy wraps the driver error; psycopg3 carries `.sqlstate`."""
+    return getattr(getattr(exc, "orig", None), "sqlstate", None) == DEADLOCK_SQLSTATE
+
+
+def _with_deadlock_retry(work, attempts: int = DEADLOCK_ATTEMPTS):
+    """Run `work()`, replaying it if Postgres picks it as a deadlock victim.
+
+    The jittered backoff matters: two victims that retry in lock-step would
+    just deadlock again. Anything that is not a deadlock — and the last
+    attempt — propagates unchanged, so the caller's contract is untouched:
+    a flush that ultimately fails still raises, and the caller still skips
+    its save_state.
+    """
+    global _deadlock_retries
+    for attempt in range(1, attempts + 1):
+        try:
+            return work()
+        except SQLAlchemyError as exc:
+            if attempt >= attempts or not _is_deadlock(exc):
+                raise
+            _deadlock_retries += 1
+            print(f"  deadlock (40P01) — retrying flush, attempt {attempt + 1}"
+                  f"/{attempts}", file=sys.stderr, flush=True)
+            time.sleep(DEADLOCK_BACKOFF * attempt * (0.5 + random.random()))
+    raise RuntimeError("unreachable")   # pragma: no cover
+
+
 @_as_db_error
 def query(sql: str, db: str | None = None, params: tuple | None = None) -> list[tuple]:
     """Run one SELECT, return the rows as tuples.
@@ -116,15 +173,23 @@ def exec_many(stmts: list[str], db: str | None = None, pre: str = "") -> int:
     `SET LOCAL ...` (scoped to the transaction, cannot leak to other pooled
     connections). Each statement is sent individually because psycopg only
     returns the LAST result set of a multi-statement string.
+
+    Deadlock victims (SQLSTATE 40P01) are replayed; see _with_deadlock_retry.
     """
-    total = 0
-    with engine(db).begin() as conn:
-        _flush_endpoint_log(conn)
-        if pre:
-            conn.exec_driver_sql(pre)
-        for stmt in stmts:
-            total += conn.exec_driver_sql(stmt).rowcount
-    return total
+    log_stmts = endpoint_log.drain_statements()
+
+    def once() -> int:
+        total = 0
+        with engine(db).begin() as conn:
+            for stmt in log_stmts:      # drained ONCE, replayed with the batch:
+                conn.exec_driver_sql(stmt)   # a rollback would otherwise eat them
+            if pre:
+                conn.exec_driver_sql(pre)
+            for stmt in stmts:
+                total += conn.exec_driver_sql(stmt).rowcount
+        return total
+
+    return _with_deadlock_retry(once)
 
 
 @_as_db_error
@@ -146,18 +211,29 @@ def exec_batch(stmts: list[str], db: str | None = None, pre: str = "",
     caller how many rows the batch really inserted vs. how many statements
     it sent — see update_filler_boost.ROWS_SQL. Transaction-local, so no
     before/after snapshot and no interference from the other cycle steps
-    writing concurrently.
+    writing concurrently — and, being transaction-local, it still reports the
+    right number after a deadlock retry replays the batch.
+
+    Deadlock victims (SQLSTATE 40P01) are replayed up to DEADLOCK_ATTEMPTS
+    times; see _with_deadlock_retry. A batch that fails every attempt still
+    raises, so callers keep skipping save_state on a failed flush.
     """
-    with engine(db).begin() as conn:
-        _flush_endpoint_log(conn)
-        if pre:
-            conn.exec_driver_sql(pre)
-        for i in range(0, len(stmts), chunk):
-            conn.exec_driver_sql(";\n".join(stmts[i:i + chunk]) + ";")
-        if post:
-            row = conn.exec_driver_sql(post).fetchone()
-            return int(row[0]) if row and row[0] is not None else 0
-    return None
+    log_stmts = endpoint_log.drain_statements()
+
+    def once() -> int | None:
+        with engine(db).begin() as conn:
+            for stmt in log_stmts:      # drained ONCE, replayed with the batch:
+                conn.exec_driver_sql(stmt)   # a rollback would otherwise eat them
+            if pre:
+                conn.exec_driver_sql(pre)
+            for i in range(0, len(stmts), chunk):
+                conn.exec_driver_sql(";\n".join(stmts[i:i + chunk]) + ";")
+            if post:
+                row = conn.exec_driver_sql(post).fetchone()
+                return int(row[0]) if row and row[0] is not None else 0
+        return None
+
+    return _with_deadlock_retry(once)
 
 
 @_as_db_error
