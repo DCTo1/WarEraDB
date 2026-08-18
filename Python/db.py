@@ -105,7 +105,7 @@ DEADLOCK_SQLSTATE = "40P01"
 DEADLOCK_ATTEMPTS = 3           # total tries, i.e. 2 retries
 DEADLOCK_BACKOFF = 0.25         # seconds, scaled by attempt and jittered
 
-_deadlock_retries = 0           # process-local counter, for the log line
+_deadlock_retries = 0           # process-local count, for tests and post-mortems
 
 
 def _is_deadlock(exc: BaseException) -> bool:
