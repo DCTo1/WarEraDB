@@ -109,7 +109,7 @@ USER_TX_POOL_SIZE = 100
 # from the XP ranking once this many have been consumed, so the walk drains
 # quietly when the last of them finishes. Raise/lower this manually to change
 # how far down the XP ranking the walk goes.
-USER_TX_TOTAL_LIMIT = 10000
+USER_TX_TOTAL_LIMIT = 20000
 
 # Safety cap on the /tx-priority walk's in-flight pool (PriorityUserTxFiller).
 # The list is operator-curated and normally a handful of users, so this only
@@ -135,6 +135,17 @@ USER_TX_REFRESH_OVERLAP_MS = 3_600_000
 # full history can be walked in as little as one batch when slack allows,
 # instead of the old one-page-per-user-per-cycle single chain).
 USER_TX_BUCKET_COUNT = 50
+
+# How many of a user's buckets are OFFERED to start with, and how fast that
+# window grows (2026-08-17, see UserTxFiller's "staged arming" docstring).
+# The bucket COUNT is sized from account age, which says nothing about how
+# much history a user actually has: below ~5,000 transactions the 50 bands
+# cost more calls than a single cursor chain would, and the API bill was
+# measured at 170.6 calls per user against an ideal of ~43 for the rank-10k
+# cohort. Arming a few bands and widening only when a page comes back FULL
+# lets density prove itself instead of being assumed.
+USER_TX_ARM_START = 4
+USER_TX_ARM_GROWTH = 2
 
 # Hard floor for every transaction walk: the first transaction in existence
 # (measured 2026-08-16, min(transactions.created_at) = 2025-05-01 19:02:21.982Z
@@ -520,6 +531,30 @@ class UserTxFiller:
          A newer id → mint one small catch-up bucket for (old walk_top_ms,
          new walk_top_ms] and loop (bounded: real-time traffic for one user
          is low, this converges in one or two extra rounds).
+    Three things keep that fan-out from costing more than it saves
+    (2026-08-17, `WARERA_USER_TX_STAGED=0` restores the previous behaviour;
+    the walk is unchanged for entries that predate the flag, which carry no
+    armed_n and stay fully armed):
+      * STAGED ARMING — only the ARM_START newest not-done buckets are
+        offered; a collect round in which any of the user's pages came back
+        FULL doubles that window (4 -> 8 -> ... -> 50, so a whale still
+        reaches full parallelism within ~4 cycles). _user_bucket_count sizes
+        the bands from account AGE, which says nothing about how much history
+        exists: a 3-transaction veteran was getting 50 bands and paying 92
+        calls for them. Buckets mid-SWEEP are always offered regardless of
+        the window — they are a repair in progress and must finish.
+      * CASCADE-CLOSE — a page is a complete contiguous run of history in
+        [oldest_ms + 1, cursor_sent) (verified against the live API, see
+        extra/probe_page_contiguity.py; the +1 is the same tie guard the
+        cursor arithmetic uses — a page that ends inside a same-ms block was
+        measured returning 10 of the 92 rows at that instant). So a page that
+        overshoots its own band bottom has ALREADY covered the bands below
+        it, and _cascade retires them instead of letting each re-request the
+        same rows. Measured before this: the median bucket's last page ended
+        74 % of a band below its bottom and 37 % of buckets more than a full
+        band below.
+      * FALSE-STALL GUARD — see the SWEEP branch in collect().
+
     In-band 404s (deleted accounts) drop the user at any phase and stamp it
     done too — the API will never serve its history. Any other error leaves
     that one unit of work (the bootstrap probe / a specific bucket / the
@@ -565,6 +600,12 @@ class UserTxFiller:
     # a shard filter there would just hide work from the single owner.
     SHARDED = True
 
+    # How many buckets a freshly bootstrapped user starts with armed (see the
+    # class docstring). PriorityUserTxFiller raises it to the full fan-out:
+    # that walk BUYS its requests to get a listed user now, so latency beats
+    # call efficiency there (the cascade and the stall guard still apply).
+    ARM_START = USER_TX_ARM_START
+
     # Whether the FLOORCHECK probe runs (see the class docstring).
     # UserTxRefreshFiller turns it OFF: its floor is a completion watermark,
     # not the start of history, so "there is something below it" is the
@@ -582,6 +623,7 @@ class UserTxFiller:
         self._touched: set[str] = set()    # users THIS run advanced
         self._stats0 = dict(self.state.get("stats", {}))   # for the delta below
         self._dirty = False
+        self._staged = os.environ.get("WARERA_USER_TX_STAGED", "1") != "0"
         self._skip = self._excluded()
 
     def _excluded(self) -> set[str]:
@@ -668,6 +710,19 @@ class UserTxFiller:
                               {"userId": h, "limit": PAGE_LIMIT, "direction": "forward"}))
                 continue
             pending = [i for i, b in enumerate(e.get("buckets", [])) if not b.get("done")]
+            armed = e.get("armed_n")
+            if armed is not None and len(pending) > armed:
+                # Newest bands first — the cascade retires the older ones from
+                # above, so arming from the top is what makes it fire. Ordered
+                # by top_ms, not by list position: FLOORCHECK appends its
+                # below-the-floor bucket last, and that one is the OLDEST.
+                # A bucket mid-SWEEP is always kept: it is a repair in
+                # progress and would otherwise starve outside the window.
+                keep = set(sorted(pending, key=lambda i: e["buckets"][i]["top_ms"],
+                                  reverse=True)[:armed])
+                keep |= {i for i in pending
+                         if e["buckets"][i].get("stall_ms") is not None}
+                pending = [i for i in pending if i in keep]
             if pending:
                 for idx in pending:
                     if len(calls) >= MAX_BATCH:
@@ -727,15 +782,87 @@ class UserTxFiller:
     def _finish(self, h: str, e: dict) -> None:
         """Mark a user fully done (finished walk OR 404): flag, not pop —
         see the class docstring on why removal doesn't survive the merge."""
+        stats = self.state.setdefault("stats", {})
+        stats["users_done"] = stats.get("users_done", 0) + 1
         e["done"] = True
         e["buckets"] = []
         e.pop("walk_top_id", None)
         e.pop("walk_top_ms", None)
         self._marks.append(h)
 
+    def _cascade(self, e: dict, cursor_sent: int, its: list[dict],
+                 stats: dict) -> None:
+        """Retire the bands a page has already covered.
+
+        A page answers "the newest `limit` rows with createdAt < cursor_sent",
+        so everything in [oldest_ms + 1, cursor_sent) came back with it and is
+        queued for storage — the `+1` because rows sharing the oldest
+        millisecond may have been truncated by the limit (measured: 10 of 92
+        at one instant). Any band whose top falls inside that interval is
+        therefore already walked down to oldest_ms + 1, and any band that ends
+        above it is finished outright. Without this each band re-requests what
+        its neighbour above already pulled: the median bucket's last page
+        overshot its own bottom by 74 % of a band.
+
+        A page that came back SHORT (fewer than PAGE_LIMIT rows, an empty one
+        included) says more: the API had nothing else to give below
+        cursor_sent, and nothing was truncated, so EVERY band under that
+        cursor is finished — not just the part down to oldest_ms. Verified on
+        the live API (extra/probe_page_contiguity.py, and 7 live stall points
+        re-asked one ms lower: 0 rows every time). It is the same premise the
+        walk has always used for an empty page ("empty page = bottom of this
+        band"), applied to the bands below as well: without it a user with a
+        single transaction still paid one probe for each of the ~49 bands
+        underneath it.
+
+        Buckets mid-SWEEP are left alone — their cursor means something else
+        while the item-code sweep runs, and closing one here would drop the
+        rest of the tie. Only ever called for UNFILTERED pages: a short page
+        under an itemCode filter proves exhaustion for that code alone."""
+        if not self._staged:
+            return
+        exhausted = len(its) < PAGE_LIMIT
+        cov_lo = to_unix_ms(its[-1]["createdAt"]) + 1 if its else cursor_sent
+        for b in e.get("buckets", []):
+            if b.get("done") or b.get("stall_ms") is not None:
+                continue
+            top = b["top_ms"]
+            if top >= cursor_sent:
+                continue          # not below the cursor we asked with
+            if top < cov_lo and not exhausted:
+                continue          # below what this page reached
+            cur = b.get("cursor_ms") or top + 1
+            if exhausted and top < cov_lo:
+                b["done"] = True  # nothing exists down there at all
+                stats["cascade_closed"] = stats.get("cascade_closed", 0) + 1
+            elif cov_lo < cur:
+                b["cursor_ms"] = cov_lo
+                if exhausted or cov_lo - 1 <= b["bottom_ms"]:
+                    b["done"] = True
+                    stats["cascade_closed"] = stats.get("cascade_closed", 0) + 1
+
+    def _arm(self, h: str, e: dict, grown: set[str]) -> None:
+        """Widen a user's armed window after a FULL page proved the density.
+        Once per collect round per user — several of a user's bands land in
+        the same batch, and doubling per page would jump straight back to the
+        fan-out this is here to avoid."""
+        if not self._staged or h in grown:
+            return
+        grown.add(h)
+        cur = e.get("armed_n")
+        if cur is None:
+            return                # pre-flag entry: fully armed already
+        n = min(len(e.get("buckets") or []),
+                max(self.ARM_START, cur * USER_TX_ARM_GROWTH))
+        if n != cur:
+            e["armed_n"] = n
+            stats = self.state.setdefault("stats", {})
+            stats["arm_rounds"] = stats.get("arm_rounds", 0) + 1
+
     def collect(self, results: list, slots: list[int], tokens: list[tuple]) -> None:
         users = self.state.setdefault("users", {})
         stats = self.state.setdefault("stats", {})
+        grown: set[str] = set()   # users whose armed window grew THIS round
         for pos, (h, kind, idx) in zip(slots, tokens):
             if pos >= len(results):
                 continue
@@ -756,6 +883,7 @@ class UserTxFiller:
             if its:
                 self._items.extend(its)
                 stats["items"] = stats.get("items", 0) + len(its)
+                stats["walk_items"] = stats.get("walk_items", 0) + len(its)
             if kind == "bootstrap":
                 if its:
                     e["walk_top_id"] = its[0]["_id"]
@@ -766,6 +894,13 @@ class UserTxFiller:
                                                   _user_bucket_count(span))
                                     if span > 0 else [])
                     e["bootstrapped"] = True
+                    if self._staged:
+                        e["armed_n"] = min(len(e["buckets"]), self.ARM_START)
+                        # The bootstrap page itself already covers the top of
+                        # history — for anyone with fewer than PAGE_LIMIT
+                        # transactions in total it covers ALL of it, and this
+                        # retires every band on the spot.
+                        self._cascade(e, e["walk_top_ms"] + 1, its, stats)
                 else:
                     self._finish(h, e)  # no transactions at all
             elif kind == "bucket":
@@ -775,7 +910,22 @@ class UserTxFiller:
                     if its:
                         sent = b.get("cursor_ms")
                         new_cursor = to_unix_ms(its[-1]["createdAt"]) + 1
-                        if sent is not None and new_cursor == sent:
+                        if (sent is not None and new_cursor == sent
+                                and self._staged and len(its) < PAGE_LIMIT):
+                            # FALSE stall (2026-08-17). The fixed point below
+                            # is only a TIE when the page came back FULL: a
+                            # short page means the API had nothing more to
+                            # give below `sent`, i.e. the boundary item simply
+                            # IS the oldest row there is, so this band is
+                            # finished rather than stuck. Verified on the live
+                            # API — re-asking one ms lower returned 0 items
+                            # for 7 of 8 live stalls (the 8th was a genuine
+                            # 100-row tie). Before the guard 26 of 100 active
+                            # users sat mid-SWEEP at once, ~36 wasted calls
+                            # each, ~39 % of a light user's entire walk.
+                            b["done"] = True
+                            stats["false_stalls"] = stats.get("false_stalls", 0) + 1
+                        elif sent is not None and new_cursor == sent:
                             # No progress: the API's cursor is a strict `<`
                             # upper bound, so `cursor = oldest_ms + 1` always
                             # re-includes the boundary item — a page whose
@@ -798,8 +948,17 @@ class UserTxFiller:
                             b["cursor_ms"] = new_cursor
                             if b["cursor_ms"] - 1 <= b["bottom_ms"]:
                                 b["done"] = True
+                        self._cascade(
+                            e, sent if sent is not None else b["top_ms"] + 1,
+                            its, stats)
+                        if len(its) >= PAGE_LIMIT:
+                            self._arm(h, e, grown)   # this band is dense
                     else:
                         b["done"] = True  # empty page = bottom of this band
+                        # ... and, per _cascade, proof that the bands below
+                        # this cursor are empty too.
+                        empty_at = b.get("cursor_ms") or b["top_ms"] + 1
+                        self._cascade(e, empty_at, its, stats)
             elif kind == "sweep":
                 bucket_idx, code = idx
                 buckets = e.get("buckets", [])
@@ -837,6 +996,7 @@ class UserTxFiller:
                          "bottom_ms": TX_EPOCH_MS if floor > TX_EPOCH_MS else 0,
                          "cursor_ms": None, "done": False})
                     stats["below_floor"] = stats.get("below_floor", 0) + 1
+                    self._cascade(e, floor, its, stats)
             elif kind == "recheck":
                 if its:
                     top_id, top_ms = its[0]["_id"], to_unix_ms(its[0]["createdAt"])
@@ -855,6 +1015,12 @@ class UserTxFiller:
             self._dirty = True
         if self._dirty:
             stats["pages"] = stats.get("pages", 0) + len(slots)
+            # walk_pages/walk_items/users_done all start at zero on 2026-08-17,
+            # so /stats can show calls-per-user and items-per-call for the walk
+            # AS IT RUNS NOW. pages/items are lifetime totals that still carry
+            # every page the pre-arming walk spent, and a ratio built on them
+            # would describe history rather than today.
+            stats["walk_pages"] = stats.get("walk_pages", 0) + len(slots)
 
     def stmts(self) -> list[str]:
         out = _store_stmts(self._items)
@@ -1007,6 +1173,10 @@ class PriorityUserTxFiller(UserTxFiller):
     SHARDED = False
 
     STATE_PATH = PRIORITY_TX_STATE
+    # Dedicated (bought) requests, so latency beats call efficiency: a listed
+    # user is walked at the full fan-out from the first batch. The cascade and
+    # the false-stall guard still apply — they cost nothing and save pages.
+    ARM_START = USER_TX_BUCKET_COUNT
     PRUNE_EXCLUDED = True
 
     def _excluded(self) -> set[str]:
@@ -1191,12 +1361,27 @@ def build_filler_pool(db: str) -> FillerPool:
     its own dedicated requests (Python/update_priority_tx.py), and this pool
     fills whatever slots that step's list can't — see the module docstring.
 
-    Env gates (all default ON): WARERA_USER_TX_REFRESH=0 disables #6;
-    WARERA_TX_FILLER=0 disables the three
-    transaction fillers (the viewer's --transactions 0 sets this for every
-    spawned script); WARERA_ITEM_MARKET_FILLER=0 / WARERA_USER_TX_FILLER=0
+    MASTER SWITCH (2026-08-18, default OFF): WARERA_FILLERS=1 re-enables the
+    whole pool; everything below stays wired up for when that happens. WarEra
+    changed transaction.getPaginatedTransactions' (and battle.getBattles')
+    cursor from a plain ms-epoch we could compute ourselves to an opaque
+    server-issued token — TransactionFiller (#2/#3) computes its own cursor
+    everywhere and now gets HTTP 500 on every call, so it is disabled outright
+    (see Python/update_tx_window.py, its simple replacement for the 72 h
+    window, wired into the viewer's cycle independently of this pool).
+    #1/#4/#5/#6 use a userId/itemCode filter and were NOT observed failing —
+    they are bundled into the same switch anyway to keep the pipeline simple
+    while the transaction pagination change is being sorted out; flip
+    WARERA_FILLERS=1 to bring them back individually via the gates below.
+
+    Env gates below this master switch (all default ON once WARERA_FILLERS=1):
+    WARERA_USER_TX_REFRESH=0 disables #6; WARERA_TX_FILLER=0 disables the
+    three transaction fillers (the viewer's --transactions 0 sets this for
+    every spawned script); WARERA_ITEM_MARKET_FILLER=0 / WARERA_USER_TX_FILLER=0
     disable individual ones.
     """
+    if os.environ.get("WARERA_FILLERS", "0") == "0":
+        return FillerPool([])
     tx = os.environ.get("WARERA_TX_FILLER", "1") != "0"
     fillers: list = [Filler(db)]
     if tx:

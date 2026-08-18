@@ -102,7 +102,12 @@ total), and `Python/fillers.py`'s `FillerPool` fills that slack in strict priori
    Each user's walk starts at their account's ObjectID second (`fillers._user_floor_ms`,
    clamped to the first transaction in existence) — never at a global floor, and never from
    `account_created_at`, which the API stopped serving. One FLOORCHECK probe per user proves
-   there is nothing below that bottom.
+   there is nothing below that bottom. The 50-way bucket fan-out is sized from account AGE,
+   so since 2026-08-17 it is **staged**: only the `armed_n` newest buckets are offered (4,
+   doubling on any full page), every page **cascade-closes** the bands it already covered
+   (a short page proves exhaustion below its cursor), and the same-ms SWEEP only fires on a
+   FULL page. 170.6 → 80.4 calls/user in production; `WARERA_USER_TX_STAGED=0` reverts.
+   See `extra/USER_TX_BUCKET_SIZING_PLAN.md`.
 6. **user refresh walk** (`UserTxRefreshFiller`, 2026-08-16) — re-walks the gap between an
    already-scraped user's `transactions_scraped_at` stamp and now, then moves the stamp, for
    users whose `last_active_at` outran it by a day. Without it a finished user was frozen
@@ -156,17 +161,35 @@ Writing the whole in-memory snapshot (what `write_json_merged` did until 2026-08
 every unit another shard advanced while we ran — measured as two good cycles followed by 0% new
 rows. `TransactionFiller` keys its buckets by `(top_ms, bottom_ms)` for the same reason: the
 done-filtering reindexes the list, so positions mean different things in different processes. Env gates: `WARERA_TX_FILLER=0` (all three transaction fillers), `WARERA_ITEM_MARKET_FILLER=0`,
-`WARERA_USER_TX_FILLER=0`, `WARERA_PRIORITY_TX_FILLER=0` (the dedicated /tx-priority step),
+`WARERA_USER_TX_FILLER=0`, `WARERA_USER_TX_STAGED=0` (undo the staged arming/cascade),
+`WARERA_PRIORITY_TX_FILLER=0` (the dedicated /tx-priority step),
 `WARERA_FILLER_BOOST=0` (the extra empty requests), `WARERA_FILLER_SHARDS=1` (undo the shard split).
 
-### Cursor pagination (API quirk — load-bearing, don't "fix" this)
+### Cursor pagination (API quirk — WarEra changed the format 2026-08-18, mid-migration)
 
 The `cursor` param is an **upper bound** (`createdAt < cursor`), not a lower bound, and pages are
-newest-first regardless of the `direction` param. Always resume with
-`cursor = str(last_item_ms + 1)` — subtracting or using the opaque `nextCursor` silently drops
-same-millisecond items (measured: 130 txns lost per 100 page boundaries with a naive cursor).
-`insert_transaction()`/`insert_battle()` etc. are idempotent upserts (`ON CONFLICT`), so
-re-fetching the boundary item is harmless.
+newest-first regardless of the `direction` param — that part still holds. What changed: cursor
+used to be a plain millisecond epoch we could compute ourselves (`str(last_item_ms + 1)`); WarEra
+switched it to an **opaque, versioned token** the server hands back as `nextCursor` (looks like
+`v2.<base64 of [{"t":"date","v":ISO_TS},{"t":"str","v":OBJECT_ID}]>` — a compound
+`(createdAt, _id)` cursor). Passing a self-computed ms-epoch string now gets **HTTP 500** from the
+server — verified live 2026-08-17/18 against `battle.getBattles` and (unfiltered)
+`transaction.getPaginatedTransactions`, consistently, across `direction`/`limit` variations, not a
+transient blip. **Always pass back the exact `nextCursor` string the previous page returned; never
+compute your own.** `insert_transaction()`/`insert_battle()` etc. are idempotent upserts
+(`ON CONFLICT`), so re-fetching the boundary item is still harmless — the compound cursor doesn't
+drop same-ms ties either, since `_id` breaks them.
+
+Fallout: every filler that computed its own ms-epoch cursor is broken for the calls that hit this
+(`TransactionFiller`'s window probes/buckets — unfiltered `transaction.getPaginatedTransactions` —
+and anything walking `battle.getBattles`). `Python/update_tx_window.py` (2026-08-18) is the
+from-scratch replacement for the transaction window: a dedicated cycle step, not a filler, that only
+ever echoes back `nextCursor` — see its module docstring for the design. Pending a full audit,
+**every filler is disabled by default** (`fillers.build_filler_pool`'s `WARERA_FILLERS` master
+switch, default OFF; `WARERA_FILLERS=1` re-enables them individually via the existing gates below).
+`UserTxFiller`/`PriorityUserTxFiller` (userId-filtered calls) were NOT observed failing in spot
+checks, but haven't been systematically re-verified against the new format — treat them as
+unverified, not confirmed-safe, until someone checks before flipping the switch back on.
 
 ### Star schema
 
