@@ -57,10 +57,31 @@ of `tsdb` (apply `base_data/` there first). `WARERA_DB_URL` may contain a `{db}`
 old code otherwise. Pipeline scripts (`update_*.py`) do **not** need a restart; the viewer spawns
 them fresh every cycle.
 
+**Check who owns the process first** — `systemctl status warera-viewer.service` and
+`ss -lptn 'sport = :8765'`.
+
+The viewer normally runs under systemd (`/etc/systemd/system/warera-viewer.service`, enabled,
+`ExecStart=… Python/db_web.py --db tsdb --port 8765`), which is also what brings the scraper back
+after a reboot. Then the restart is one command, and it needs sudo:
+
+```bash
+sudo systemctl restart warera-viewer.service
+curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:8765/    # MUST print 200
+journalctl -u warera-viewer.service -n 30 --no-pager                # if it doesn't
+```
+
+**Do not `pkill` a systemd-managed viewer.** `Restart=on-failure` does not fire on a clean
+SIGTERM, so the unit just goes `inactive (dead)` and whatever you start by hand owns the port
+until the next boot — when systemd starts its own and the two race. (Done exactly that on
+2026-08-18.)
+
+Only when the unit is `disabled`/absent is the manual form correct:
+
 ```bash
 pkill -f "Python/db_web.py"; sleep 2
 WARERA_DB_URL='postgresql+psycopg://postgres:postgres@localhost:5432/{db}' \
-  setsid .venv/bin/python Python/db_web.py > /tmp/warera_viewer.log 2>&1 < /dev/null & disown
+  setsid .venv/bin/python Python/db_web.py --db tsdb --port 8765 \
+  > /tmp/warera_viewer.log 2>&1 < /dev/null & disown
 sleep 5
 curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:8765/    # MUST print 200
 ```
