@@ -4,7 +4,8 @@ Every UPDATE_INTERVAL seconds (default 15) a scheduler thread runs
 Python/update_battles.py --force-active, then Python/update_live.py, then
 Python/insert_ranking_sample.py --latest N (skipped when N == 0), then
 Python/update_weekly_ranking.py (hourly self-throttled snapshot fetch),
-then Python/update_users_lite.py, then Python/update_priority_tx.py
+then Python/update_users_lite.py, then Python/update_tx_window.py (the 72 h
+transaction window tracker), then Python/update_priority_tx.py
 (dedicated requests for the /tx-priority list), then — only while the
 /stats page's filler-boost switch is on — Python/update_filler_boost.py
 (N empty 50-call requests bought for the fillers), then Python/rollup_endpoint_usage.py
@@ -19,11 +20,16 @@ log (/update-status/stream), so neither polls any more. Every UPDATE_STATE
 mutation goes through _bump()/_log(), which wakes the streams; the poll
 routes stay as the fallback for clients whose stream never connects.
 
-The transaction window is NOT a dedicated step: update_battles /
-update_live / update_weekly_ranking carry transaction.getPaginatedTransactions
-calls (probes + pending window-bucket pages) in the slack of their mixed
-batches via update_transactions.TransactionFiller — disabled for every
-spawned script when --transactions 0 (WARERA_TX_FILLER=0 in their env).
+The transaction window IS a dedicated step (2026-08-18, update_tx_window.py)
+— it used to ride as FILLER in the mixed batches of update_battles.py /
+update_live.py / update_weekly_ranking.py (update_transactions.TransactionFiller),
+but WarEra switched transaction.getPaginatedTransactions' cursor from a plain
+ms-epoch to an opaque server-issued token, so the filler's self-computed
+cursors now get HTTP 500 on every call. update_tx_window.py only ever echoes
+back the `nextCursor` the API gives it, so it is unaffected — see its module
+docstring. The old filler (and every other filler: user-lite, itemMarket,
+user tx walk, user tx refresh) is disabled by default while this settles
+(fillers.build_filler_pool's WARERA_FILLERS master switch, default OFF).
 
 The FIRST run of a boot also does a one-shot completeness check (_boot_check,
 also skipped when --ranking 0 disables the ranking pass): battles ended in
@@ -52,7 +58,7 @@ import threading
 import time
 from typing import Iterator
 
-from .config import (FILLER_BOOST_SCRIPT, LIVE_SCRIPT, MAX_UPDATE_LINES, PRIORITY_TX_SCRIPT, RANKING_SCRIPT, ROLLUP_SCRIPT, UPDATE_INTERVAL, UPDATE_SCRIPT, USER_LITE_SCRIPT, WEEKLY_SCRIPT, settings)
+from .config import (FILLER_BOOST_SCRIPT, LIVE_SCRIPT, MAX_UPDATE_LINES, PRIORITY_TX_SCRIPT, RANKING_SCRIPT, ROLLUP_SCRIPT, TX_WINDOW_SCRIPT, UPDATE_INTERVAL, UPDATE_SCRIPT, USER_LITE_SCRIPT, WEEKLY_SCRIPT, settings)
 from .queries import query_dicts
 from .ui import esc, layout
 
@@ -228,6 +234,12 @@ def _run_updater() -> None:
                           f"user lite: update_users_lite.py --limit {settings.user_lite_limit}",
                           [sys.executable, USER_LITE_SCRIPT, "--limit",
                            str(settings.user_lite_limit)], False))
+        if settings.transactions_enabled:
+            # The 72 h transaction window tracker (2026-08-18) — replaces the
+            # old TransactionFiller (see the module docstring): a dedicated
+            # step, not a filler, so it is unaffected by WARERA_FILLERS.
+            steps.append(("rc9", "tx window: update_tx_window.py",
+                          [sys.executable, TX_WINDOW_SCRIPT, "--db", db], False))
         if settings.transactions_enabled and settings.priority_tx_requests:
             # The ONLY step that buys API requests for transaction history
             # instead of riding slack: up to N dedicated 50-call requests for
@@ -281,7 +293,7 @@ def _run_updater() -> None:
                 _log(f"  launch failed: {exc}")
         if not rcs:
             with UPDATE_LOCK:
-                UPDATE_STATE["rc"] = _first_nonzero(rc0, 0, 0, 0, 0, 0, 0, 0, 0)
+                UPDATE_STATE["rc"] = _first_nonzero(rc0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
                 _bump()
 
         def _record(key: str) -> None:
@@ -289,7 +301,8 @@ def _run_updater() -> None:
                 UPDATE_STATE["rc"] = _first_nonzero(
                     rc0, rcs.get("rc", 0), rcs.get("rc3", 0),
                     rcs.get("rc2", 0), rcs.get("rc5", 0), rcs.get("rc4", 0),
-                    rcs.get("rc7", 0), rcs.get("rc8", 0), rcs.get("rc6", 0))
+                    rcs.get("rc7", 0), rcs.get("rc8", 0), rcs.get("rc6", 0),
+                    rcs.get("rc9", 0))
                 _bump()
 
         def _tee_one(key: str, proc: subprocess.Popen) -> None:

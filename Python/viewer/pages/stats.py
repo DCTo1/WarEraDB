@@ -121,6 +121,23 @@ def _ut_active(ut: dict) -> int:
     return sum(1 for e in ut.get("users", {}).values() if not e.get("done"))
 
 
+def _ut_rate(st: dict) -> str:
+    """Calls-per-user and items-per-call for the user walk as it runs NOW.
+
+    Built on walk_pages/walk_items/users_done, which start at zero with the
+    2026-08-17 bucket-arming change (fillers.UserTxFiller) — the lifetime
+    pages/items counters still carry every page the pre-arming walk spent, so
+    a ratio taken from them would describe history rather than the current
+    walk. Empty until the first user finishes under the new counters."""
+    done = st.get("users_done", 0)
+    pages = st.get("walk_pages", 0)
+    if not done or not pages:
+        return ""
+    return (f" — <b>{pages / done:.0f}</b> calls/user, "
+            f"<b>{st.get('walk_items', 0) / pages:.0f}</b> items/call "
+            f"over {done:,} finished")
+
+
 def _filler_table(f: dict, tx: dict, im: dict, ut: dict, ul: dict) -> str:
     """Per-filler progress rows from the state files + DB-derived numbers.
 
@@ -153,8 +170,11 @@ def _filler_table(f: dict, tx: dict, im: dict, ut: dict, ul: dict) -> str:
          f"{imstats.get('pages', 0):,} pages · {imstats.get('items', 0):,} items · "
          f"{imstats.get('failed_calls', 0)} failed"),
         ("user walks", f"{_ut_active(ut)} in flight, {ut_done:,} scraped",
-         "refills from the XP ranking until USER_TX_TOTAL_LIMIT users walked",
+         "refills from the XP ranking until USER_TX_TOTAL_LIMIT users walked"
+         + _ut_rate(utstats),
          f"{utstats.get('pages', 0):,} pages · {utstats.get('items', 0):,} items · "
+         f"{utstats.get('cascade_closed', 0):,} bands cascaded · "
+         f"{utstats.get('false_stalls', 0):,} false stalls skipped · "
          f"{utstats.get('failed_calls', 0)} failed"),
         ("user-lite", f"{f['lite_queue']:,} in queue",
          f"last activity check {'on' if ul.get('last_active_check') else 'never'}",

@@ -30,6 +30,7 @@ USER_LITE_SCRIPT = os.path.join(REPO, "Python", "update_users_lite.py")
 ROLLUP_SCRIPT = os.path.join(REPO, "Python", "rollup_endpoint_usage.py")
 PRIORITY_TX_SCRIPT = os.path.join(REPO, "Python", "update_priority_tx.py")
 FILLER_BOOST_SCRIPT = os.path.join(REPO, "Python", "update_filler_boost.py")
+TX_WINDOW_SCRIPT = os.path.join(REPO, "Python", "update_tx_window.py")
 
 HEX_RE = re.compile(r"^[0-9a-f]{24}$")
 BATTLE_TYPES = ("war", "resistance", "tournament", "revolution")
