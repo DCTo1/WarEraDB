@@ -244,6 +244,12 @@ def _backfill(s, db: str, state: dict, edge_ms: int, now_ms: int,
         state["backfill_top_ms"] = top_ms
         state.pop("backfill_cursor", None)     # retired sequential-walk key
         bands = list(reversed(tx_walk.make_bands(edge_ms, top_ms, BACKFILL_BANDS)))
+        # Park them BEFORE walking. An API failure on the very first wave
+        # would otherwise leave backfill_top_ms set with no parked bands, and
+        # the next cycle would read that empty list as "every band retired"
+        # and declare a walk that never happened finished.
+        state["backfill_pending"] = bands
+        _save_state(state)
     else:
         bands = _trim_bands(state.get("backfill_pending") or [], edge_ms)
 
