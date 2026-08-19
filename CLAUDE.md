@@ -280,7 +280,10 @@ Hypertables (TimescaleDB, chunked + natively compressed): `transactions` (1-day 
 `side, entity_type` — side 1=attacker/2=defender/**3=merged, exceptions only** i.e. only rows where
 the official value differs from the derivable side sum), `weekly_ranking_snapshots` (7-day chunks
 on `week_start`). `user_battle_stats` is a maintained rollup (not scanned per-query) so the /user
-page avoids scanning compressed hypertables per entity. Compressed chunks carry **no indexes**
+page avoids scanning compressed hypertables per entity. The `transactions` query indexes
+(`base_data/create_indexes.sql`, re-enabled by migration_20) live only on the recent
+**uncompressed** chunks — TimescaleDB drops per-chunk indexes when a chunk compresses, so
+compressed chunks carry **no indexes**
 beyond segmentby/orderby metadata — keep queries time-bounded or entity-scan via chunk pruning;
 DML on compressed chunks decompresses whatever it touches, so cleanup DELETEs always carry a
 `created_at > now() - interval '7 days'` guard to avoid an accidental full-table decompress.
@@ -302,12 +305,13 @@ before writing new SQL against tables you haven't touched before.
 
 `db_web.py` is a thin entry point into the package: `config.py`, `updater.py` (the auto-update
 scheduler — spawns `update_battles.py` / `update_live.py` / `insert_ranking_sample.py` /
-`update_weekly_ranking.py` / `update_users_lite.py` / `update_priority_tx.py` /
+`update_weekly_ranking.py` / `update_users_lite.py` / `update_tx_window.py` /
+`update_priority_tx.py` / `rollup_endpoint_usage.py` (self-throttled to ~daily) /
 `update_filler_boost.py` (only while the /stats boost switch is on) as parallel
 subprocesses every 15s, staggered
 by `LAUNCH_STAGGER` (0.2s) to stay under API rate limits), `queries.py`, `search.py`, `ui.py`
 (pjax navigation, dark/light theme, SSE clients), `server.py`, and `pages/` (battles, users, transactions,
-weekly, tracker, snipes, stats, tx-priority, SQL console). Reads go through `db.py` the same way the pipeline scripts
+weekly, tracker, snipes, stats, usage, tx-priority, SQL console). Reads go through `db.py` the same way the pipeline scripts
 write. The only write paths into the DB are the automatic updater cycle and the `/tx-priority`
 page's three list statements (`viewer/queries.exec_write` — parameterized and idempotent; read
 its docstring before using it anywhere else). `/stats` also mutates the *process's* config (never

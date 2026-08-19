@@ -6,48 +6,39 @@ all transaction types from the WarEra API, normalizes them into a compact
 star-schema (MongoDB ObjectIDs → integer IDs), and stores them in PostgreSQL with
 TimescaleDB hypertables.
 
-> Transactions: the API serves only the rolling **72 h window** of transaction
-> history unfiltered (verified 2026-08-07 — the edge is exactly now − 72.00 h
-> and moves with the clock; older rows are reachable only via per-entity
-> filters like `userId`/`itemCode`, whose full-history backfill runs through
-> the fillers below). The window is kept current by a **filler** riding the web
-> viewer's mixed batches (no dedicated step since 2026-08-07): on every
-> cycle the slack slots of update_battles / update_live / update_weekly_ranking
-> carry `transaction.getPaginatedTransactions` calls from a priority-ordered
-> **filler pool** (`Python/fillers.py`, see `extra/docs/FILLERS.md`):
-> 1. `user.getUserLite` (user-lite backfill + active refresh),
-> 2. `transaction.getPaginatedTransactions` **window work** — a
->    time-bucketed walk that fills the window back to the edge (~1.5M rows on
->    the first fill) plus 4 live probes (no-cursor + now−5s/−10s/−15s) every
->    `PROBE_EVERY` seconds that tile the newest ~26 s and detect gaps,
-> 3. an **itemMarket walk per item code** (`itemCode` filter bypasses the
->    72 h window — full history per equipment code, `ITEM_MARKET_CODES`),
-> 4. a **user walk** (`userId` filter bypasses the window too — full lifetime
->    history per user, picked by XP ranking; at most `USER_TX_TOTAL_LIMIT`
->    users walked in total — `USER_TX_POOL_SIZE` in parallel — each stamped
->    `users.transactions_scraped_at` once an empty page confirms their
->    scrape finished).
-> The window pools stop naturally when the work is drained (`done=True` in
-> `state/transactions_state.json` → no more calls until a probe finds
-> something new); the code/user walks ride the same slack, so they never
-> start additional requests. The full 72 h window is stored continuously from
-> the moment the scraper runs; anything older than 72 h at that point is
-> reachable only through the per-entity walks (code and user pools).
+> Transactions: unfiltered, the API serves only the rolling **72 h window** of
+> transaction history (verified 2026-08-07 — the edge is exactly now − 72.00 h
+> and moves with the clock). Older rows are reachable only via per-entity
+> filters (`userId` / `itemCode`), which bypass the window entirely. So the
+> pipeline has two halves:
+> 1. **The window** — `Python/update_tx_window.py`, a dedicated step of the web
+>    viewer's 15 s cycle since 2026-08-18. It walks `(watermark, now]` as N
+>    parallel bands (`Python/tx_walk.walk_range`) and advances the watermark
+>    ONLY once every band retires, so an outage of any length self-heals.
+> 2. **Full history** — walks that ride the *slack* of the other steps' batched
+>    requests (never extra requests) through a priority-ordered **filler pool**
+>    (`Python/fillers.py`, see `extra/docs/FILLERS.md`): `user.getUserLite`
+>    backfill/refresh, an **itemMarket walk per item code**, a **per-user walk**
+>    by XP rank (each user stamped `users.transactions_scraped_at` when done),
+>    and a **refresh walk** re-covering the gap after that stamp.
+>
+> The window is stored continuously from the moment the scraper runs; anything
+> older than 72 h at that point arrives through the per-entity walks.
 
 **What's in the DB today** *(rough counts — they grow with every incremental update run)*
 
 | Data | Rows |
 |---|---|
 | Battles (war / resistance / tournament / revolution) | ~16K |
-| Rounds | ~33K |
+| Rounds | ~34K |
 | Bounty sides (attacker/defender bounty pools) | ~10K |
 | Countries (current-state snapshot) | 180 |
-| Battle ranking entries (damage/points/money + loot, per side; merged = exceptions only) | ~10M |
-| Round ranking entries | ~12.7M |
-| Loot items (upserted from ranking loot) | ~1.4M |
-| Inventory ids (users, countries, MUs — global ObjectID → int map) | ~100K |
-| Users (API lifetime stats + username/level/MU detail) | ~100K |
-| Transactions (rolling 72 h window, kept live by the mixed-batch filler + full history per item code / per user via the bypass filters) | ~1.5M + growing |
+| Battle ranking entries (damage/points/money + loot, per side; merged = exceptions only) | ~10.7M |
+| Round ranking entries | ~13.6M |
+| Items (upserted from ranking loot and transactions) | ~28M |
+| Inventory ids (users, countries, MUs — global ObjectID → int map) | ~126K |
+| Users (API lifetime stats + username/level/MU detail) | ~124K |
+| Transactions (the live 72 h window + the full history walked per item code / per user through the bypass filters) | ~97M + growing |
 
 ## Easy setup (for everyone)
 
@@ -111,8 +102,9 @@ docker run -d --name timescaledb \
 Apply the SQL files in order (any psql client works — `psql -h localhost -U postgres -d tsdb`):
 
 ```bash
-# create_indexes.sql holds OPTIONAL query indexes, all commented out by
-# default — uncomment the ones you need before this loop (or skip the file).
+# create_indexes.sql holds the query indexes: the `transactions` ones are
+# enabled (the viewer's /transactions and /user pages need them), the rest
+# are commented out — uncomment what your own queries need.
 for f in create_tables functions item_codes create_indexes create_views; do
   docker exec -i timescaledb psql -U postgres -d tsdb -v ON_ERROR_STOP=1 \
     -f - < base_data/$f.sql
@@ -237,40 +229,40 @@ WARERA_DB_URL='postgresql+psycopg://postgres:postgres@localhost:5432/{db}' \
 ### Web viewer (optional)
 
 Local read-only web viewer + auto-updater (battles/rounds/countries, live
-battle sync, rankings, users, bounties, **transactions** — every 15 s; the
-cycle steps run as parallel subprocesses launched 0.2 s apart
+battle sync, rankings, users, bounties, **transactions**). Every 15 s the
+cycle launches its steps as parallel subprocesses 0.2 s apart
 (`LAUNCH_STAGGER` in `Python/viewer/updater.py` — raise it if the API ever
-answers 429) — the API serves every batched request in ~0.6-1.7 s
-regardless of size, so parallel launches cut the cycle's wall time from
-~6-8 s to ~5 s; the cycle
-also runs update_users_lite.py: backfills user.getUserLite basic info
-for up to 100 unchecked users per run, wealth/damage rankings first, then
-re-checks users active within 4 days only — users.last_active_at, ≤50 per
-cycle, ≥48 h apart, real lastConnectionAt stored on fetch, activity check
-every 2 h; the transaction work rides the mixed batches' slack via the
-priority-ordered filler pool (`Python/fillers.py` — window probes/buckets +
-per-item-code itemMarket walks + XP-ranked per-user walks, see
-`extra/docs/FILLERS.md`) — `--transactions 0` disables. The one exception
-is the `/tx-priority` list: those users are excluded from the slack fillers
-and walked by `Python/update_priority_tx.py`, a cycle step that buys up to
-`--priority-tx` (default 2) dedicated 50-call requests per cycle for them —
-leftover slots go back to the ordinary fillers, and nothing is requested
-when the list has no pending user), and the ordinary fillers can be sped up
-the same way on demand — `/stats`'s "Cycle config" panel switches
-`Python/update_filler_boost.py` on and sets how many EMPTY 50-call requests
-it buys per cycle for them (`--filler-boost N`, off by default, capped at 20
-≈ +80 requests/min, sent in parallel with their statements flushed by a
-background writer while the next request is in flight, persisted in
-`state/viewer_settings.json` and applied on the next cycle without a
-restart). The cycle's filler-carrying steps take DISJOINT shards of the
-pools (`WARERA_FILLER_SHARD`, handed out by the updater) — before that they
-all fetched the same pages, and the boost's flush was inserting 7-33% new
-rows against 82-104% after. `/stats` shows the
-filler health at the top (window buckets, itemMarket codes, user walks,
-history rows) plus exact request counts — every `api.mixed_fetch` POST logs
-one `request_id` (`endpoints_used.request_id`, migration_22), so a 50-call
-batch counts as ONE request; pre-2026-08-08 rows fall back to
-same-timestamp groups):
+answers 429): `update_battles.py`, `update_live.py`,
+`insert_ranking_sample.py` (`--ranking 0` disables), `update_weekly_ranking.py`
+(`--weekly 0`), `update_users_lite.py` (`--user-lite 0`), `update_tx_window.py`
+(`--transactions 0`), `update_priority_tx.py` (`--priority-tx 0`) and the
+endpoint-usage rollup. The API serves every batched request in ~0.6-1.7 s
+regardless of size, so parallel launches cut the cycle's wall time from the
+sum of the steps (~6-8 s) to the longest one (~5 s).
+
+The full-history transaction walks ride the *slack* of those steps' batched
+requests via the priority-ordered filler pool (`Python/fillers.py`, see
+`extra/docs/FILLERS.md`), so they never add requests. Two steps deliberately
+buy requests instead:
+
+- **`update_priority_tx.py`** — up to `--priority-tx` (default 2) dedicated
+  50-call requests per cycle for the `/tx-priority` list (those users are
+  excluded from the XP-ranked slack filler); leftover slots go back to the
+  ordinary fillers, and nothing is requested when the list has no pending user.
+- **`update_filler_boost.py`** — N EMPTY 50-call requests purely to drain the
+  ordinary fillers faster. Off by default; switched on and sized from
+  `/stats`'s "Cycle config" panel (`--filler-boost N`, capped at 20 ≈ +80
+  requests/min, persisted in `state/viewer_settings.json`, applied on the next
+  cycle without a restart).
+
+The filler-carrying steps take DISJOINT shards of the pools
+(`WARERA_FILLER_SHARD`, handed out by the updater) — before that they all
+fetched the same pages, and the boost's flush was inserting 7-33% new rows
+against 82-104% after. `/stats` shows filler health at the top (itemMarket
+codes, user walks, history rows, window freshness) plus exact request counts —
+every `api.mixed_fetch` POST logs one `request_id`
+(`endpoints_used.request_id`, migration_22), so a 50-call batch counts as ONE
+request; pre-2026-08-08 rows fall back to same-timestamp groups.
 
 ```bash
 # WARERA_DB_URL must be set in the viewer's environment: the auto-updater
@@ -367,6 +359,11 @@ Naming convention: `*_id` columns are INT FKs into `inventory_ids`; bare UUID
 columns (regions, tournament teams) are raw API ObjectIDs — those entities
 never trade, so they get no `inventory_ids` row.
 
+⚠ `users.id` is **not** the id transactions/rankings refer to: those are
+`inventory_ids.id`. Resolve a user through `inventory_ids` (join on
+`users.user_id = inventory_ids.external_id`) before filtering
+`transactions.buyer_id` / `seller_id` or `*_ranking_entries.entity_id`.
+
 ## Views (for easy querying)
 
 | View | What it gives you |
@@ -422,5 +419,5 @@ ORDER BY r.rank LIMIT 20;
 | `docker-compose.yml` | Manual alternative to the GUI's container setup (`docker compose up -d` — same image/port/volume) |
 | `base_data/` | Schema DDL (`create_tables.sql`), PL/pgSQL functions (`functions.sql`), indexes, views |
 | `Python/` | Battle tooling: shared modules (`api.py` WarEra API client, `db.py` SQLAlchemy DB access + SQL helpers, `utils.py` time/state/constants + `prepare_transaction()`, `endpoint_log.py`, `fillers.py` — the priority-ordered filler pool + the itemMarket/user-history fillers) + the CLI scripts (`update_battles.py`, `update_live.py`, `update_countries.py`, `insert_ranking_sample.py`, `update_users.py`, `update_users_lite.py`, `update_weekly_ranking.py`, `update_tx_window.py` (the 72 h transaction-window tracker) + `tx_walk.py` (its parallel band-walk primitive) + `recover_tx_gap.py` (manual range recovery) + `update_transactions.py` (the retired scraper's coverage report), `seed_endpoints.py`) + the web viewer (`db_web.py` entry point and the `viewer/` package with its pages, incl. the `/tracker` damage tracker, the `/weekly` rankings and the `/transactions` browser — full stored history via preset/custom ranges, keyset pagination and a day-jump strip, defaulting to the last 24 h) |
-| `state/` | Runtime state files (gitignored, regenerable — `backups.py load` resets them): scraper cursors / throttle stamps / audit trails (`battles_state.json`, `live_state.json`, `transactions_state.json`, `item_market_state.json`, `user_tx_state.json`, `users_lite_state.json`, `weekly_ranking_state.json`, `weekly_reconcile_state.json`, `ranking_sample_state.json`, `ranking_sample_rate.json`) |
+| `state/` | Runtime state files (gitignored, regenerable — `backups.py load` resets them): scraper cursors / throttle stamps / audit trails (`battles_state.json`, `live_state.json`, `tx_window_state.json`, `item_market_state.json`, `user_tx_state.json`, `user_tx_refresh_state.json`, `priority_tx_state.json`, `users_lite_state.json`, `weekly_ranking_state.json`, `weekly_reconcile_state.json`, `ranking_sample_state.json`, `ranking_sample_rate.json`) + `viewer_settings.json` (the /stats "Cycle config" panel) |
 | `data/battle_timestamps.json` | Battle timestamp index for batched pagination (oldest-first, append-only) |
