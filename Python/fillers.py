@@ -106,7 +106,7 @@ USER_TX_POOL_SIZE = 100
 # from the XP ranking once this many have been consumed, so the walk drains
 # quietly when the last of them finishes. Raise/lower this manually to change
 # how far down the XP ranking the walk goes.
-USER_TX_TOTAL_LIMIT = 50000
+USER_TX_TOTAL_LIMIT = 200000
 
 # Safety cap on the /tx-priority walk's in-flight pool (PriorityUserTxFiller).
 # The list is operator-curated and normally a handful of users, so this only
