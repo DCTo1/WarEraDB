@@ -77,6 +77,12 @@ SELECT
  (SELECT count(*) FROM users WHERE transactions_scraped_at IS NOT NULL) AS users_scraped,
  (SELECT count(*) FROM users WHERE lite_checked_at IS NULL) AS lite_queue,
  (SELECT count(*) FROM item_codes) AS item_codes_total,
+ (SELECT count(*) FROM tx_entities) AS entities_total,
+ (SELECT count(*) FROM tx_entities
+   WHERE transactions_scraped_at IS NOT NULL) AS entities_scraped,
+ (SELECT count(*) FROM tx_item_type_walks) AS combos_total,
+ (SELECT count(*) FROM tx_item_type_walks
+   WHERE transactions_scraped_at IS NOT NULL) AS combos_scraped,
  (SELECT count(*) FROM transactions
    WHERE created_at < now() - interval '72 hours') AS txn_history,
  (SELECT min(created_at) FROM transactions) AS txn_oldest,
@@ -121,6 +127,34 @@ def _ut_active(ut: dict) -> int:
     return sum(1 for e in ut.get("users", {}).values() if not e.get("done"))
 
 
+def _et_active(et: dict) -> int:
+    """Country/MU/party chains still walking — finished entities linger in
+    entity_tx_state.json with done=True (fillers.EntityTxFiller marks rather
+    than removes, same merge rule as the user walk), so len() would
+    overcount. The authoritative done count is the DB's tx_entities stamp."""
+    return sum(1 for e in et.get("entities", {}).values() if not e.get("done"))
+
+
+def _it_progress(it: dict) -> tuple[int, int, float]:
+    """(combos still walking, combos in state, % of their history covered).
+
+    The per-combo watermark climbs from floor_ms to top_ms, so the fraction is
+    exact rather than a page count — and it is read from the state file, which
+    the DB's tx_item_type_walks mirrors one slice behind (the stamp lands with
+    the rows, the state file is written right after)."""
+    combos = it.get("combos", {})
+    active = sum(1 for e in combos.values() if not e.get("done"))
+    pcts = []
+    for e in combos.values():
+        floor, top = e.get("floor_ms"), e.get("top_ms")
+        if e.get("done"):
+            pcts.append(1.0)
+        elif floor and top and top > floor:
+            pcts.append(min(1.0, max(0.0, (e.get("covered_to_ms", floor) - floor)
+                                     / (top - floor))))
+    return active, len(combos), 100 * sum(pcts) / len(pcts) if pcts else 0.0
+
+
 def _ut_rate(st: dict) -> str:
     """Calls-per-user and items-per-call for the user walk as it runs NOW.
 
@@ -138,7 +172,8 @@ def _ut_rate(st: dict) -> str:
             f"over {done:,} finished")
 
 
-def _filler_table(f: dict, tx: dict, im: dict, ut: dict, ul: dict) -> str:
+def _filler_table(f: dict, tx: dict, im: dict, et: dict, it: dict, ut: dict,
+                  ul: dict) -> str:
     """Per-filler progress rows from the state files + DB-derived numbers.
 
     The state dicts are parsed once by page_stats() and passed in — re-reading
@@ -147,9 +182,14 @@ def _filler_table(f: dict, tx: dict, im: dict, ut: dict, ul: dict) -> str:
     """
     tstats = tx.get("stats", {})
     imstats = im.get("stats", {})
+    etstats = et.get("stats", {})
+    itstats = it.get("stats", {})
     utstats = ut.get("stats", {})
     imcodes = im.get("codes", {})
     im_done = sum(1 for c in imcodes.values() if c.get("done"))
+    it_active, _it_total, it_pct = _it_progress(it)
+    it_bands = sum(1 for e in it.get("combos", {}).values()
+                   for b in (e.get("buckets") or []) if not b.get("done"))
     ut_done = f["users_scraped"]
 
     pending = tx.get("pending") or []
@@ -169,12 +209,27 @@ def _filler_table(f: dict, tx: dict, im: dict, ut: dict, ul: dict) -> str:
          f"{len(imcodes)}/{f['item_codes_total']} codes started",
          f"{imstats.get('pages', 0):,} pages · {imstats.get('items', 0):,} items · "
          f"{imstats.get('failed_calls', 0)} failed"),
+        ("country/MU/party",
+         f"{f['entities_scraped']:,}/{f['entities_total']:,} entities done",
+         f"{_et_active(et)} chain(s) in flight — countryId/muId/partyId walks, "
+         "finite set, refills from tx_entities",
+         f"{etstats.get('pages', 0):,} pages · {etstats.get('items', 0):,} items · "
+         f"{etstats.get('failed_calls', 0)} failed"),
+        ("item-type tx",
+         f"{f['combos_scraped']}/{f['combos_total'] or len(it.get('combos', {}))} "
+         f"streams done, {it_pct:.1f}% of history walked",
+         f"{it_active} (type, itemCode) stream(s) walking, {it_bands} band(s) open "
+         "— itemCode+transactionType, finite set, drains for good",
+         f"{itstats.get('pages', 0):,} pages · {itstats.get('items', 0):,} items · "
+         f"{itstats.get('slices', 0):,} slices · "
+         f"{itstats.get('failed_calls', 0)} failed"),
         ("user walks", f"{_ut_active(ut)} in flight, {ut_done:,} scraped",
          "refills from the XP ranking until USER_TX_TOTAL_LIMIT users walked"
          + _ut_rate(utstats),
          f"{utstats.get('pages', 0):,} pages · {utstats.get('items', 0):,} items · "
          f"{utstats.get('cascade_closed', 0):,} bands cascaded · "
          f"{utstats.get('false_stalls', 0):,} false stalls skipped · "
+         f"{utstats.get('ties', 0):,} same-ms ties walked · "
          f"{utstats.get('failed_calls', 0)} failed"),
         ("user-lite", f"{f['lite_queue']:,} in queue",
          f"last activity check {'on' if ul.get('last_active_check') else 'never'}",
@@ -348,6 +403,8 @@ def page_stats(q: dict) -> str:
     # (that was the pre-2026-08-18 bug), but the edge is falling behind.
     tx = _read_state("tx_window_state.json", {})
     im = _read_state("item_market_state.json", {})
+    et = _read_state("entity_tx_state.json", {})
+    it = _read_state("item_type_tx_state.json", {})
     ut = _read_state("user_tx_state.json", {})
     ul = _read_state("users_lite_state.json", {})
     imcodes = im.get("codes", {})
@@ -416,13 +473,15 @@ def page_stats(q: dict) -> str:
         <div class="cards">
           {_card(f"{len(pending)}", window_lbl)}
           {_card(f"{im_done}/{f['item_codes_total']}", "itemMarket codes scraped")}
+          {_card(f"{f['entities_scraped']:,}/{f['entities_total']:,}", "country/MU/party histories")}
+          {_card(f"{_it_progress(it)[2]:.0f}%", "item-type history walked")}
           {_card(f"{f['users_scraped']:,}", "user histories scraped")}
           {_card(f"{_ut_active(ut)}", "user walks in flight")}
           {_card(f"{f['txn_history']:,}", "full-history rows (>72 h)")}
           {_card(oldest_lbl, "oldest stored transaction")}
           {_card(f"{f['lite_queue']:,}", "user-lite backfill queue")}
         </div>
-        {_filler_table(f, tx, im, ut, ul)}
+        {_filler_table(f, tx, im, et, it, ut, ul)}
         <h2>Top endpoints (all time)</h2>
         {top_html or '<p class="muted">No calls logged yet.</p>'}
         <h2>Last 24 hours</h2>
