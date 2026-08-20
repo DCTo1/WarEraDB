@@ -183,65 +183,58 @@ def _user_floor_ms(hexid: str) -> int:
     return max(_oid_ms(hexid), TX_EPOCH_MS)
 
 
-def _step_walk(entry: dict, its: list[dict], no_cursor: bool) -> str:
-    """Advance one page of a full-history walk (ItemMarketFiller — UserTxFiller
-    uses its own bucketed state machine, see the UserTxFiller class docstring).
+def _step_chain(entry: dict, its: list[dict], next_cursor: str | None,
+                no_cursor: bool) -> str:
+    """Advance one page of a nextCursor chain (EntityTxFiller, ItemMarketFiller).
 
-    Cursor chains walk DOWN from the newest page. The top of each pass is
-    remembered (walk_top_id / walk_top_ms) so the pass's LAST no-cursor page
-    can prove nothing new arrived while the pass ran — transactions created
-    mid-walk sit above the pass's top, a downward walk never re-visits them,
-    and without this re-check the user/code would be stamped done with those
-    rows missing forever (the 72 h window covers them only while it runs).
-    New items found at the re-check start a bounded catch-up pass that walks
-    only the band (old_top, new_top] (stop line = the previous pass's top).
+    Both chains ran on ARITHMETIC cursors until 2026-08-20 (`_step_walk`,
+    `cursor_ms = oldest_ms + 1`, encoded with make_cursor(..., MIN_OID)) and
+    detected the bottom of history by CURSOR EQUALITY — a page whose oldest
+    item sat at sent-1 meant nothing older existed. That premise is false for
+    a millisecond holding more than PAGE_LIMIT rows: every page is then full
+    of the same tie, the cursor can never step past it, and the walk reads the
+    fixed point as "oldest reached" — re-probes the top, matches walk_top_id
+    and stamps the code DONE, silently dropping everything below the tie.
+    Measured offline against 100/250/1000-row blocks: 201/351/1101 rows lost
+    per block. It is the same family as the SWEEP bug UserTxFiller's TIEWALK
+    replaced; here there is nothing to repair with, so the walk was moved onto
+    the token instead. Do not reintroduce a computed cursor for these chains.
 
-    The bottom of the history is detected by CURSOR EQUALITY, not by an
-    empty page: the API's cursor is a strict `<` upper bound (full-ms
-    precision), so `cursor = oldest_ms + 1` always re-includes the boundary
-    item — a page that returns only that item never comes back empty, and
-    the pre-2026-08-09 code looped forever re-fetching it (every code/user
-    stuck at first_tx_ms + 1). A page whose oldest item is at sent_cursor-1
-    proves nothing older exists → oldest reached.
+    Because the server's v2 token is a compound (createdAt, _id) bound,
+    echoing it resumes exactly — the boundary item is not re-fetched, so "the
+    page made no progress" is not a state that can occur, and a same-ms tie of
+    any size paginates like any other page.
 
-    `cursor_ms` is an integer POSITION, not the wire value: since
-    2026-08-17 the API takes an opaque v2 token, which the send sites build
-    from this number with utils.make_cursor(cursor_ms, MIN_OID) — exactly
-    the old `cursor = str(cursor_ms)`. The arithmetic below (equality tests,
-    band bookkeeping) is unchanged and deliberately NOT converted to echoing
-    nextCursor: these walks jump to arbitrary points rather than following
-    one chain (extra/BUGFIX_PLAN.md section 3.1).
+    The bottom of the history is a SHORT page or an absent nextCursor: the
+    API had nothing more to give below the cursor we sent (the premise
+    tx_walk.advance retires a band on). The chain then resets its cursor so
+    the next offer is a no-cursor probe, which is what proves the pass saw
+    everything: a downward walk never revisits rows created above its own
+    top, and for a stamped-done entity nothing would ever look again.
 
     Returns:
-      "done"    — the no-cursor page's newest item is the pass's own top:
-                  the walk covered everything → caller marks finished;
-      "continue" — keep walking (entry's cursor_ms advanced);
-      "recheck" — the cursor was reset to None: the next offer re-fetches
-                  the top of the history (band covered / oldest reached).
+      "done"     — the probe's newest item is the pass's own top: the walk
+                   covered everything → the caller stamps the entity/code;
+      "continue" — keep walking (entry["cursor"] advanced);
+      "recheck"  — the cursor was reset to None: the next offer re-probes the
+                   top of the history (bottom reached / catch-up covered).
     """
     if no_cursor:
         top_id = its[0]["_id"]
-        top_ms = to_unix_ms(its[0]["createdAt"])
         if entry.get("walk_top_id") == top_id:
             return "done"
-        # pass start — fresh walk, or catch-up after new items appeared
-        entry["catch_to_ms"] = entry.get("walk_top_ms")  # None → full pass
+        # pass start — fresh walk, or catch-up after new rows appeared
+        entry["catch_to_ms"] = entry.get("walk_top_ms")   # None → full pass
         entry["walk_top_id"] = top_id
-        entry["walk_top_ms"] = top_ms
-        entry["cursor_ms"] = to_unix_ms(its[-1]["createdAt"]) + 1
-        return "continue"
-    sent = entry.get("cursor_ms")
-    entry["cursor_ms"] = to_unix_ms(its[-1]["createdAt"]) + 1
-    if sent is not None and entry["cursor_ms"] == sent:
-        # no progress: the page's oldest item sits exactly at sent-1, i.e.
-        # the API returned only the boundary duplicate — nothing older
-        # exists → oldest reached → re-check the top
-        entry["cursor_ms"] = None
+        entry["walk_top_ms"] = to_unix_ms(its[0]["createdAt"])
+    if len(its) < PAGE_LIMIT or not next_cursor:
+        entry["cursor"] = None     # end of this entity's/code's history
         return "recheck"
-    if (entry.get("catch_to_ms") is not None
-            and to_unix_ms(its[-1]["createdAt"]) <= entry["catch_to_ms"]):
-        entry["cursor_ms"] = None  # the catch-up band is covered → re-check
+    catch_to_ms = entry.get("catch_to_ms")
+    if catch_to_ms is not None and to_unix_ms(its[-1]["createdAt"]) <= catch_to_ms:
+        entry["cursor"] = None     # the catch-up band is covered
         return "recheck"
+    entry["cursor"] = next_cursor
     return "continue"
 
 
@@ -333,12 +326,21 @@ class ItemMarketFiller:
     confirms the walk covered everything (its oldest row reached AND no new
     rows appeared while the walk ran). Payload per page:
         {"transactionType": "itemMarket", "itemCode": <code>, limit: 100,
-         direction: "forward", cursor: make_cursor(<last item ms + 1>, MIN_OID)}
-    (no-cursor first page = the newest of the code's history; the cursor is
-    a v2 token built from the stored cursor_ms position — see _step_walk). Items flow
+         direction: "forward", cursor: <the previous page's nextCursor>}
+    (no-cursor first page = the newest of the code's history). Items flow
     through the same idempotent insert_transaction upsert as the window.
 
-    State: state/item_market_state.json — {codes: {<code>: {cursor_ms,
+    The chain ECHOES the server's token (_step_chain) and does not compute
+    one. Until 2026-08-20 it kept an arithmetic `cursor_ms` position and
+    stopped on cursor equality, which mistakes a millisecond holding more
+    than PAGE_LIMIT rows for the bottom of history and stamps the code done
+    on top of the hole — see _step_chain for the measurement. An entry still
+    carrying a `cursor_ms` has its whole pass (walk_top_id/walk_top_ms/
+    catch_to_ms) dropped on first contact and re-walks from the top; keeping
+    the pass would stamp the code done on the first probe. All 36 codes were
+    already `done` when this landed, so no walk was actually interrupted.
+
+    State: state/item_market_state.json — {codes: {<code>: {cursor,
     walk_top_id, walk_top_ms, catch_to_ms, done}}, stats: {}}. Re-walking a
     code whose state was lost is idempotent (ON CONFLICT + _id dedupe).
     """
@@ -394,10 +396,10 @@ class ItemMarketFiller:
                 taken.add(code)
                 p = {"transactionType": "itemMarket", "itemCode": code,
                      "limit": PAGE_LIMIT, "direction": "forward"}
-                cursor = entry.get("cursor_ms")
-                no_cursor = cursor is None
+                cursor = entry.get("cursor")
+                no_cursor = not cursor
                 if cursor:
-                    p["cursor"] = make_cursor(cursor, MIN_OID)
+                    p["cursor"] = cursor
                 slots.append(len(calls))
                 tokens.append((code, no_cursor))
                 calls.append((self.ENDPOINT, p))
@@ -416,23 +418,40 @@ class ItemMarketFiller:
             if "error" in res:
                 stats["failed_calls"] = stats.get("failed_calls", 0) + 1
                 continue  # retried by the next run — the code keeps its cursor
-            its = (res["result"]["data"].get("items")) or []
+            data = res["result"]["data"]
+            its = data.get("items") or []
             entry = state.setdefault(code, {})
             self._touched.add(code)   # save_state writes back only these
+            if "cursor_ms" in entry:
+                # Legacy arithmetic-walk entry (pre-2026-08-20). Dropping its
+                # position is not enough: walk_top_id describes a pass that
+                # STOPPED at that position, so the first no-cursor probe would
+                # match it and _step_chain would stamp the code done on top of
+                # whatever the interrupted pass never reached (measured: 100 of
+                # 650 rows stored, code done, one call). Drop the whole pass and
+                # start a fresh one — idempotent (ON CONFLICT + _id dedupe).
+                # Keyed on the KEY, not its value: `cursor_ms: None` was the old
+                # walk's "oldest reached, re-probe the top" state, and a bottom
+                # that walk found is exactly what is no longer trustworthy.
+                entry.pop("cursor_ms", None)
+                entry.pop("walk_top_id", None)
+                entry.pop("walk_top_ms", None)
+                entry.pop("catch_to_ms", None)
             if its:
                 self._items.extend(its)
                 stats["items"] = stats.get("items", 0) + len(its)
-                if _step_walk(entry, its, no_cursor) == "done":
+                if _step_chain(entry, its, data.get("nextCursor"),
+                               no_cursor) == "done":
                     entry["done"] = True
-                    entry.pop("cursor_ms", None)
+                    entry.pop("cursor", None)
             elif no_cursor:
                 # a code with no market history at all → done on the spot
                 entry["done"] = True
-                entry.pop("cursor_ms", None)
+                entry.pop("cursor", None)
             else:
                 # the code's oldest row reached → re-check the top for rows
                 # created while the walk ran
-                entry["cursor_ms"] = None
+                entry["cursor"] = None
             self._dirty = True
         if self._dirty:
             stats["pages"] = stats.get("pages", 0) + len(slots)
