@@ -27,9 +27,16 @@ for f in create_tables functions item_codes create_indexes create_views; do
   docker exec -i <container> psql -U postgres -d tsdb -v ON_ERROR_STOP=1 -f - < base_data/$f.sql
 done
 
-# Type checking (no automated test suite — extra/test_roundtrip.py and extra/bench_queries.py
-# are standalone manual scripts, not pytest)
+# Type checking
 .venv/bin/pyright Python/ extra/
+
+# The one automated test: an offline proof that no transaction walk loses a
+# same-millisecond block bigger than a page. No DB, no API key, no network —
+# run it after touching fillers.py or tx_walk.py. Exit 0 = every walk clean.
+.venv/bin/python tests/test_tie_walks.py
+
+# (extra/test_roundtrip.py and extra/bench_queries.py are standalone manual
+# scripts against a live DB, not pytest.)
 
 # Run a single pipeline script (all read WARERA_DB_URL / WARERA_API_KEY env vars)
 .venv/bin/python Python/update_battles.py
@@ -159,18 +166,69 @@ Every mixed API batch made by `update_battles.py` / `update_live.py` /
 `Python/fillers.py`'s `FillerPool` fills that slack in strict priority order:
 
 1. `user.getUserLite` (backfill unchecked users, then refresh active ones)
-2. **itemMarket walk** per equipment code (`itemCode` filter bypasses the window — full history)
-3. **user walk** by XP rank (`userId` filter bypasses the window — full lifetime history).
+2. **itemMarket walk** per equipment code (`itemCode` filter bypasses the window — full history).
+   Its chain ECHOES the server's `nextCursor` (`_step_chain`, shared with filler 3). It kept an
+   arithmetic `cursor_ms` and stopped on cursor equality until 2026-08-20, which reads a
+   millisecond holding more than 100 rows as the bottom of history and stamps the code done on
+   top of the hole — measured offline at 201/351/1101 rows lost for a 100/250/1000-row block.
+   Never hit in production (max rows at one `(itemCode, ms)`: **2**, all time; all 36 codes were
+   already `done`), but a `state/` reset would have re-armed it. A legacy `cursor_ms` entry drops
+   its whole pass on first contact and re-walks.
+3. **country / MU / party walk** (`EntityTxFiller`, 2026-08-19) — the full history of every
+   discovered non-user entity, through the `countryId` / `muId` / `partyId` filters (each
+   bypasses the window like `itemCode`/`userId` do). One `nextCursor` **chain per entity**,
+   not the user walk's bucket fan-out: with ~2,150 entities in the registry there is always
+   more ready work than slack, so parallelism per entity would buy nothing, and echoing the
+   server's own token means no boundary re-fetch and no same-ms stall (so no SWEEP). The
+   candidate pool is `tx_entities` (migration_26, countries first, then MUs, then parties),
+   whose rows the filler DISCOVERS itself on a 15-min throttle from `countries` /
+   `users.mu_id` / battle-ranking MUs / `parties` / recent `transactions.secondary_*_id`.
+   Completion is stamped in `tx_entities.transactions_scraped_at` so a `state/` reset does
+   not re-walk finished entities. Placed AHEAD of the user walks because the set is finite
+   and drains for good; `WARERA_ENTITY_TX_FILLER=0` disables it.
+4. **(type, itemCode) walk** (`ItemTypeTxFiller`, 2026-08-20) — the full history of the
+   item-bearing transaction types, through the `itemCode` filter, which bypasses the window
+   and **ANDs** with `transactionType`. It matches the row's OUTER `itemCode` only (the input
+   / the case — `dismantleItem`+`sniper` returns 0 rows), so `ITEM_TYPE_TX_TYPES`'
+   `openCase` / `craftItem` / `dismantleItem` have exactly **four streams** between them:
+   `openCase`/`case1`, `openCase`/`case2`, `craftItem`/`scraps`, `dismantleItem`/`scraps`
+   (discovered from the last week of `transactions`, so a future `case3` joins on its own).
+   Each stream walks one SLICE of history at a time, split into `ITEM_TYPE_TX_BUCKETS` (20)
+   `tx_walk` bands, and the slices climb from the stream's floor upward — coverage is 100 %
+   inside 60 days and 71-93 % past 120 d, so oldest-first yields new rows immediately.
+   **Bands are sized in ROWS, not clock time** (`ITEM_TYPE_TX_TARGET_ROWS` = 5,000 ≈ 50 pages):
+   5,000 rows is 38 min of `dismantleItem` in 2026-08, 6.2 h of it in 2026-01 and 13 days of
+   `openCase`/`case2` down there, so `_slice_top` asks our own stored rows where the
+   slice's 100,000th row sits rather than extrapolating a density (which was wrong by 3x —
+   these streams grew ~10x across the period a slice can span). The watermark only moves when EVERY band of a slice
+   retires, and it is stored in `tx_item_type_walks` (migration_27) so a `state/` reset
+   resumes instead of re-walking ~451 K pages. `top_ms` is a ceiling captured at bootstrap —
+   rows created above it are the 72 h window step's. AHEAD of the user walks for filler 3's
+   reason: finite, and it drains for good. `WARERA_ITEM_TYPE_TX_FILLER=0` disables it.
+   Measured 2026-08-20: filtered pages cost ~0.27 s at EVERY depth (vs 2.30 s for an
+   unfiltered page 24 h deep) and 50 of them come back in 1.29 s, so all 45 M rows of the
+   three types are ~3.2 h of pure API time; in production it ran at ~800 pages/min with
+   100.0 items/page and ~6 % of the rows genuinely new.
+5. **user walk** by XP rank (`userId` filter bypasses the window — full lifetime history).
    Each user's walk starts at their account's ObjectID second (`fillers._user_floor_ms`,
    clamped to the first transaction in existence) — never at a global floor, and never from
    `account_created_at`, which the API stopped serving. One FLOORCHECK probe per user proves
    there is nothing below that bottom. The 50-way bucket fan-out is sized from account AGE,
    so since 2026-08-17 it is **staged**: only the `armed_n` newest buckets are offered (4,
    doubling on any full page), every page **cascade-closes** the bands it already covered
-   (a short page proves exhaustion below its cursor), and the same-ms SWEEP only fires on a
+   (a short page proves exhaustion below its cursor), and the same-ms repair only fires on a
    FULL page. 170.6 → 80.4 calls/user in production; `WARERA_USER_TX_STAGED=0` reverts.
    See `extra/USER_TX_BUCKET_SIZING_PLAN.md`.
-4. **user refresh walk** (`UserTxRefreshFiller`, 2026-08-16) — re-walks the gap between an
+   That same-ms repair is the **TIEWALK** (`_advance_tie`, 2026-08-20): a band stuck on a
+   millisecond holding more rows than a page echoes the server's own `nextCursor` until it
+   reaches below the tie. It replaced a SWEEP that asked for the stuck ms under each of the
+   36 `ITEM_MARKET_CODES` and then skipped past it — every real tie is a bulk dismantle
+   (`dismantleItem`/`scraps`, not an equipment code), so the sweep matched nothing and the
+   skip dropped every row past the first page: **4,048 (user, ms) clusters stored at exactly
+   100** vs ~95 at each neighbouring size, ~250 K rows lost, 2025-12-28 → 2026-05-19. It
+   cannot recur (the game caps at 20 rows per user-ms since 2026-06) and filler 4 repairs
+   the history as it climbs.
+6. **user refresh walk** (`UserTxRefreshFiller`, 2026-08-16) — re-walks the gap between an
    already-scraped user's `transactions_scraped_at` stamp and now, then moves the stamp, for
    users whose `last_active_at` outran it by a day. Without it a finished user was frozen
    forever and depended entirely on the 72h window step having swept up their activity.
@@ -183,7 +241,7 @@ changed under every filler at once; default ON again since the four send sites r
 
 Fillers never start additional requests — they only ride slots that would otherwise go unused.
 The one deliberate exception is the **priority list** (`tx_priority_users`, migration_24, managed
-from the viewer's `/tx-priority` page): those users are excluded from filler 3's pool entirely and
+from the viewer's `/tx-priority` page): those users are excluded from filler 5's pool entirely and
 walked by `Python/update_priority_tx.py`, a cycle step that BUYS up to 2 dedicated 50-call requests
 per cycle for them (`--priority-tx N` on `db_web.py`, `WARERA_PRIORITY_TX_FILLER=0`) and hands the
 slots the list can't fill to the ordinary fillers — zero requests when the list has nothing pending.
@@ -208,10 +266,13 @@ standalone filler runs skip the lock, so don't fire one while a viewer cycle is 
 (`update_tx_window.py` and `recover_tx_gap.py` carry no filler state and are safe to run
 alongside — their writes are idempotent upserts.)
 
-Note the practical consequence of the refresh walk being LAST: while the XP conveyor still has users to
-walk (`USER_TX_TOTAL_LIMIT` not yet consumed) it takes essentially every slack slot, so the
-refresh walk only really starts once that conveyor drains. That ordering is deliberate — a first
-pass over a user nobody has ever walked beats a top-up of one who has.
+Note the practical consequence of that strict ordering: a filler takes essentially every slack
+slot it can use before the ones below it see any. While the XP conveyor still has users to walk
+(`USER_TX_TOTAL_LIMIT` not yet consumed) the refresh walk barely starts — deliberate, a first
+pass over a user nobody has ever walked beats a top-up of one who has. The same now applies one
+level up: while the (type, itemCode) walk has open bands it takes the slack the user walks would
+have had (measured 2026-08-20 on a boost request: 39 of 41 filler calls), for the ~33 h it takes
+to drain. `WARERA_ITEM_TYPE_TX_FILLER=0` gives the slack straight back.
 
 **Filler shards (2026-08-15, load-bearing).** All five filler-carrying steps build their pools from
 the SAME state files, each filler's in-flight dedupe is per-process, and the files are read once at
@@ -229,7 +290,8 @@ Writing the whole in-memory snapshot (what `write_json_merged` did until 2026-08
 every unit another shard advanced while we ran — measured as two good cycles followed by 0% new
 rows. Env gates: `WARERA_FILLERS=0` (the whole pool, plus the /tx-priority step),
 `WARERA_TX_FILLER=0` (every transaction-history filler), `WARERA_ITEM_MARKET_FILLER=0`,
-`WARERA_USER_TX_FILLER=0`, `WARERA_USER_TX_STAGED=0` (undo the staged arming/cascade),
+`WARERA_ENTITY_TX_FILLER=0` (the country/MU/party walk),
+`WARERA_ITEM_TYPE_TX_FILLER=0` (the (type, itemCode) walk), `WARERA_USER_TX_FILLER=0`, `WARERA_USER_TX_STAGED=0` (undo the staged arming/cascade),
 `WARERA_PRIORITY_TX_FILLER=0` (the dedicated /tx-priority step),
 `WARERA_FILLER_BOOST=0` (the extra empty requests), `WARERA_FILLER_SHARDS=1` (undo the shard split).
 
@@ -261,8 +323,12 @@ doesn't drop same-ms ties either, since `_id` breaks them.
    `str(ms)` (exclusive) → `make_cursor(ms, MIN_OID)`. The server validates nothing — no
    signature, no TTL, and the ObjectID need not exist — which is what makes the N-way parallel
    band/bucket walks possible. Sites: `update_battles.py`'s batched index windows,
-   `tx_walk.make_bands`' seeds, and `fillers.py`'s four send sites (itemMarket page, user-tx
-   bucket page, SWEEP, FLOORCHECK).
+   `tx_walk.make_bands`' seeds, and `fillers.py`'s four send sites (the (type,itemCode) band seed
+   and its FLOORCHECK, the user-tx bucket page, the user FLOORCHECK). The itemMarket page was a
+   fifth until 2026-08-20 — see filler 2. Every OTHER walk echoes `nextCursor`, and that is what
+   makes them safe against a millisecond holding more rows than a page: verified offline against
+   blocks of 100/250/1000 rows at the top, middle and floor of a history, for the user walk
+   (TIEWALK), the `tx_walk` bands, the entity chain and the itemMarket chain alike.
 
 The fillers keep their `cursor_ms` **integer positions** in state — the cascade, stall detection
 and bucket bookkeeping are arithmetic on them, and only the wire encoding changed. So there was
