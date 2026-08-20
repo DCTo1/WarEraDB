@@ -27,7 +27,11 @@ The fillers:
      + active-user refresh;
   2. ItemMarketFiller — full itemMarket history per equipment item code
      (the API's itemCode filter bypasses the rolling 72 h window);
-   3. UserTxFiller — full transaction history per user, picked by XP ranking
+   3. EntityTxFiller — full transaction history per COUNTRY / MILITARY UNIT /
+      donation PARTY (the countryId / muId / partyId filters bypass the window
+      as well); the entity set is finite and drains, so it sits ahead of the
+      user walks. Completion is stamped in tx_entities (migration_26);
+   4. UserTxFiller — full transaction history per user, picked by XP ranking
       (the API's userId filter bypasses the window too); users are marked in
       the DB once their scrape is confirmed finished and replaced by the
       next-in-line (a conveyor capped at USER_TX_TOTAL_LIMIT total users,
@@ -44,9 +48,11 @@ UserTxFiller entirely (its _excluded set and its candidate query).
 """
 
 import os
+import re
+import time
 
-from db import query
-from tx_walk import build_stmts
+from db import exec_sql, query
+from tx_walk import advance, build_stmts
 from update_users_lite import Filler
 from utils import (MAX_BATCH, MIN_OID, PAGE_LIMIT, STATE_DIR, filler_shard,
                    make_cursor, read_json, shard_owns, to_unix_ms, write_json)
@@ -55,6 +61,7 @@ ITEM_MARKET_STATE = os.path.join(STATE_DIR, "item_market_state.json")
 USER_TX_STATE = os.path.join(STATE_DIR, "user_tx_state.json")
 PRIORITY_TX_STATE = os.path.join(STATE_DIR, "priority_tx_state.json")
 USER_TX_REFRESH_STATE = os.path.join(STATE_DIR, "user_tx_refresh_state.json")
+ENTITY_TX_STATE = os.path.join(STATE_DIR, "entity_tx_state.json")
 
 # Lock file serializing the filler state writes of the viewer's PARALLEL
 # cycle steps (viewer/updater.py launches them staggered since 2026-08-08;
@@ -107,6 +114,15 @@ USER_TX_POOL_SIZE = 100
 # quietly when the last of them finishes. Raise/lower this manually to change
 # how far down the XP ranking the walk goes.
 USER_TX_TOTAL_LIMIT = 200000
+
+# EntityTxFiller: how many countries/MUs/parties are walked at once, and how
+# often the discovery INSERT re-scans the DB for entities that have appeared
+# since. The pool is a queue, not a cap on the total — the set is finite
+# (~2,150 entities on 2026-08-19) and drains for good. 100 chains is already
+# far more ready work than one batch's slack, so raising it only changes
+# which entities finish first, never the throughput.
+ENTITY_TX_POOL_SIZE = 100
+ENTITY_TX_DISCOVER_INTERVAL_S = 900
 
 # Safety cap on the /tx-priority walk's in-flight pool (PriorityUserTxFiller).
 # The list is operator-curated and normally a handful of users, so this only
@@ -486,6 +502,304 @@ class ItemMarketFiller:
             if delta:
                 st[k] = st.get(k, 0) + delta
         write_json(ITEM_MARKET_STATE, disk)
+
+
+class EntityTxFiller:
+    """Rides the slack to scrape the FULL transaction history of every
+    discovered COUNTRY, MILITARY UNIT and donation PARTY (2026-08-19).
+
+    The API's `countryId` / `muId` / `partyId` filters bypass the rolling
+    72 h window exactly like `userId` does (extra/docs/TRANSACTIONS_ENDPOINT.md
+    §3, verified to ~60 d for muId/countryId and ~23 d for partyId at the time
+    — the limit was the data, not the filter). Those ids are how the
+    non-user side of a transaction is expressed: `sellerMuId`/`buyerMuId`,
+    `sellerCountryId`/`buyerCountryId` (both collapse into
+    transactions.secondary_seller_id / secondary_buyer_id, MU winning when a
+    row carries both — see insert_transaction) and donation `sellerPartyId`.
+    Walking them is the only way to reach the history of an entity whose
+    members were never picked by the XP-ranked user walk.
+
+    Pool = tx_entities rows with transactions_scraped_at IS NULL (migration_26),
+    ENTITY_TX_POOL_SIZE of them in flight, countries first, then MUs, then
+    parties (DISCOVER_SQL / _candidates). The set is FINITE — ~2,150 entities
+    as of 2026-08-19 — so unlike the user conveyor this filler drains and then
+    costs nothing until discovery finds a new MU or party.
+
+    ONE CURSOR CHAIN PER ENTITY, echoing `nextCursor` — deliberately NOT the
+    bucket fan-out UserTxFiller uses. Two reasons:
+      * the fan-out exists so a SINGLE user can occupy dozens of slots at
+        once; with ~2,150 entities and a 100-strong pool there is always more
+        ready work than there are slack slots, so the parallelism would buy
+        nothing and cost the same over-fetch it cost there (170 -> 80 calls
+        per user after the staged-arming fix);
+      * echoing the server's own token is rule 1 in CLAUDE.md's cursor
+        section: it resumes exactly, needs no boundary re-fetch, and — since
+        the v2 token carries `_id` as well as `createdAt` — it cannot be
+        defeated by a same-ms tie. That is what makes the TIEWALK sub-phase
+        (and the false-stall guard around it) unnecessary here.
+
+    Per-entity state machine (state/entity_tx_state.json, {entities: {hex:
+    {...}}, stats: {}, discovered_ms: int}):
+      1. WALK — a no-cursor page opens the pass and records its top
+         (walk_top_id / walk_top_ms); every later page echoes the previous
+         one's nextCursor. Empty first page → the entity never traded → done
+         on the spot.
+      2. BOTTOM — a SHORT page (fewer than PAGE_LIMIT items) or a missing
+         nextCursor is the end of that entity's history (same premise
+         tx_walk.advance retires a band on). The cursor resets to None, so
+         the next offer is a fresh no-cursor probe.
+      3. RECHECK — that probe's newest `_id` equal to the pass's own
+         walk_top_id proves nothing arrived while the pass ran → the entity
+         is done and gets stamped. A newer id starts a bounded catch-up pass
+         that stops at the previous pass's top (catch_to_ms), then rechecks
+         again; entity traffic is low (the busiest country moved ~340 rows a
+         day in 2026-08), so this converges in one round.
+
+    Completion is stamped in the DB (tx_entities.transactions_scraped_at), not
+    only in the state file: state/ is regenerable and backups.py load wipes
+    it, and re-walking every finished entity costs ~50-100 K pages.
+
+    Rows created AFTER an entity is stamped are covered by the unfiltered 72 h
+    window step (Python/update_tx_window.py), the same way they are for a
+    finished user — there is no refresh walk here yet (UserTxRefreshFiller's
+    equivalent); a re-walk is a matter of clearing the stamp.
+    """
+
+    ENDPOINT = "transaction.getPaginatedTransactions"
+
+    # entity_type -> the filter parameter that selects that entity's history.
+    PARAM = {2: "countryId", 3: "muId", 4: "partyId"}
+
+    MARK_SQL = ("UPDATE tx_entities SET transactions_scraped_at = NOW()\n"
+                "WHERE entity_id = (SELECT id FROM inventory_ids\n"
+                "                   WHERE external_id = objectid_to_uuid('{hex}'))\n"
+                "  AND transactions_scraped_at IS NULL")
+
+    # Registers every country / MU / party we can see in data we already hold.
+    # Sources (see base_data/create_tables.sql section 13): the countries table
+    # is the complete 180 from country.getAllCountries, so anything appearing
+    # as a transaction's secondary id and NOT in it is an MU — that last
+    # branch is what catches an MU with no members in `users` that never
+    # fought a battle (1 such id in a 2-day sample, 2026-08-19). DISTINCT ON
+    # collapses the id an entity appears under twice (a country is also a
+    # secondary id), lowest kind winning, so ON CONFLICT never has to resolve
+    # a duplicate inside the same command.
+    DISCOVER_SQL = """
+INSERT INTO tx_entities (entity_id, entity_type)
+SELECT DISTINCT ON (id) id, kind
+FROM (
+    SELECT country_id AS id, 2 AS kind FROM countries
+    UNION ALL
+    SELECT DISTINCT mu_id, 3 FROM users WHERE mu_id IS NOT NULL
+    UNION ALL
+    SELECT DISTINCT entity_id, 3 FROM battle_ranking_entries WHERE entity_type = 3
+    UNION ALL
+    SELECT party_id, 4 FROM parties
+    UNION ALL
+    SELECT DISTINCT s.id, 3 FROM (
+        SELECT secondary_seller_id AS id FROM transactions
+         WHERE created_at > now() - interval '3 days' AND secondary_seller_id IS NOT NULL
+        UNION ALL
+        SELECT secondary_buyer_id FROM transactions
+         WHERE created_at > now() - interval '3 days' AND secondary_buyer_id IS NOT NULL) s
+    WHERE NOT EXISTS (SELECT 1 FROM countries c WHERE c.country_id = s.id)
+) d
+ORDER BY id, kind
+ON CONFLICT (entity_id) DO NOTHING;"""
+
+    def __init__(self, db: str) -> None:
+        self.db = db
+        self.state = read_json(ENTITY_TX_STATE, {"entities": {}, "stats": {}})
+        self._items: list[dict] = []
+        self._marks: list[str] = []
+        self._offer = 0       # round-robin position into the active set
+        self._offered: set[str] = set()    # entities offered THIS run
+        self._shard_i, self._shard_n = filler_shard()
+        self._touched: set[str] = set()    # entities THIS run advanced
+        self._stats0 = dict(self.state.get("stats", {}))
+        self._dirty = False
+
+    def top_up(self, calls: list[tuple[str, dict]]) -> tuple[list[int], list[str]]:
+        """One page per active entity (round-robin), never two for the same
+        entity in one run — a chain's cursor only advances in collect, so a
+        second offer would re-fetch the page already in flight. Returns
+        (positions, the hexes in position order — the collect token).
+
+        Two passes, same rule as ItemMarketFiller: this process's shard
+        first, then anything left if the batch still has room (a slot with
+        nothing else to do is better spent on a duplicate than left empty)."""
+        slots: list[int] = []
+        tokens: list[str] = []
+        ents = self.state.setdefault("entities", {})
+        keys = [h for h, e in ents.items() if not e.get("done")]
+        n = len(keys)
+        if not n:
+            return slots, tokens
+        base = self._offer % n
+        order = keys[base:] + keys[:base]
+        last_k = -1
+        for shard_only in (True, False):
+            if len(calls) >= MAX_BATCH:
+                break
+            if shard_only and self._shard_n < 2:
+                continue          # sharding off: one unfiltered pass is enough
+            for k, h in enumerate(order):
+                if len(calls) >= MAX_BATCH:
+                    break
+                if h in self._offered:
+                    continue
+                if shard_only and not shard_owns(h, self._shard_i, self._shard_n):
+                    continue
+                e = ents[h]
+                param = self.PARAM.get(e.get("kind"))
+                if param is None:
+                    continue      # unknown entity_type: never guess a filter
+                last_k = k
+                self._offered.add(h)
+                p = {param: h, "limit": PAGE_LIMIT, "direction": "forward"}
+                if e.get("cursor"):
+                    p["cursor"] = e["cursor"]
+                slots.append(len(calls))
+                tokens.append(h)
+                calls.append((self.ENDPOINT, p))
+        if last_k >= 0:
+            # Advance PAST the entities this batch took (ItemMarketFiller's
+            # rule, not UserTxFiller's +1): with a pool far larger than the
+            # slack of one batch, a +1 rotation would walk the same handful
+            # of entities every cycle and leave the rest waiting a full pool
+            # length of cycles for their first page.
+            self._offer = (base + last_k + 1) % n
+        return slots, tokens
+
+    def collect(self, results: list, slots: list[int], tokens: list[str]) -> None:
+        ents = self.state.setdefault("entities", {})
+        stats = self.state.setdefault("stats", {})
+        for pos, h in zip(slots, tokens):
+            if pos >= len(results):
+                continue
+            res = results[pos]
+            e = ents.get(h)
+            if e is None:
+                continue
+            self._touched.add(h)   # save_state writes back only these
+            if "error" in res:
+                if (res["error"].get("data") or {}).get("httpStatus") == 404:
+                    self._finish(h, e)   # gone: the API will never serve it
+                    stats["dead"] = stats.get("dead", 0) + 1
+                else:
+                    stats["failed_calls"] = stats.get("failed_calls", 0) + 1
+                self._dirty = True
+                continue
+            data = res["result"]["data"]
+            its = data.get("items") or []
+            no_cursor = not e.get("cursor")
+            if its:
+                self._items.extend(its)
+                stats["items"] = stats.get("items", 0) + len(its)
+                if _step_chain(e, its, data.get("nextCursor"), no_cursor) == "done":
+                    self._finish(h, e)
+            elif no_cursor:
+                self._finish(h, e)   # the entity never traded at all
+            else:
+                e["cursor"] = None   # bottom reached → re-check the top
+            self._dirty = True
+        if self._dirty:
+            stats["pages"] = stats.get("pages", 0) + len(slots)
+
+    def _finish(self, h: str, e: dict) -> None:
+        """Mark an entity fully walked (or gone): flag, not pop — the same
+        merge rule as UserTxFiller, and the DB stamp travels with the rows
+        that produced it (see take_stmts)."""
+        stats = self.state.setdefault("stats", {})
+        stats["entities_done"] = stats.get("entities_done", 0) + 1
+        e["done"] = True
+        e.pop("cursor", None)
+        e.pop("walk_top_id", None)
+        e.pop("walk_top_ms", None)
+        e.pop("catch_to_ms", None)
+        self._marks.append(h)
+
+    def stmts(self) -> list[str]:
+        out = build_stmts(self._items)
+        out += [self.MARK_SQL.format(hex=h) for h in self._marks]
+        return out
+
+    def take_stmts(self) -> list[str]:
+        """stmts() + hand over the buffers (see FillerPool.take_stmts). The
+        completion stamps travel with the items they follow, so an entity is
+        never marked scraped before its rows are stored."""
+        out = self.stmts()
+        self._items = []
+        self._marks = []
+        return out
+
+    def save_state(self) -> None:
+        """Write this run's entities into a FRESH on-disk copy (the caller
+        holds the filler pool lock), then discover + refill. Only the entries
+        this run advanced are written back — with filler shards our untouched
+        copies are another step's fresh progress (see UserTxFiller.save_state
+        for the measurement that rule came from)."""
+        if self._dirty:
+            disk = read_json(ENTITY_TX_STATE, None) or {"entities": {}, "stats": {}}
+            ents = disk.setdefault("entities", {})
+            mine = self.state.get("entities", {})
+            for h in self._touched:
+                if h in mine:
+                    ents[h] = mine[h]
+            st = disk.setdefault("stats", {})
+            for k, v in self.state.get("stats", {}).items():
+                delta = v - self._stats0.get(k, 0)
+                if delta:
+                    st[k] = st.get(k, 0) + delta
+            write_json(ENTITY_TX_STATE, disk)
+        self._refill()
+
+    def _refill(self) -> None:
+        """Discover newly-visible entities (throttled), then bring the pool
+        back up to ENTITY_TX_POOL_SIZE — both decided against a FRESH on-disk
+        read taken here, under the lock, so the cycle's parallel steps can't
+        each add their own poolful off the same stale snapshot (the
+        pre-2026-08-13 overshoot UserTxFiller._refill documents)."""
+        disk: dict = read_json(ENTITY_TX_STATE, {"entities": {}, "stats": {}})
+        ents = disk.setdefault("entities", {})
+        changed = False
+        now_ms = int(time.time() * 1000)
+        if now_ms - disk.get("discovered_ms", 0) >= ENTITY_TX_DISCOVER_INTERVAL_S * 1000:
+            # Cheap (0.2 s measured 2026-08-19 — the secondary-id branch is
+            # time-bounded so it reads only uncompressed chunks), but it runs
+            # in every filler-carrying step of every cycle, hence the throttle.
+            exec_sql(self.DISCOVER_SQL, self.db)
+            disk["discovered_ms"] = now_ms
+            changed = True
+        active = sum(1 for e in ents.values() if not e.get("done"))
+        room = ENTITY_TX_POOL_SIZE - active
+        if room > 0:
+            # Over-fetch by len(ents) for the same reason UserTxFiller does:
+            # an entity in flight is not stamped yet, so it still matches the
+            # candidate WHERE and sits at the TOP of the ordering.
+            for h, kind in self._candidates(room + len(ents)):
+                if h in ents:
+                    continue
+                ents[h] = {"kind": kind, "cursor": None, "walk_top_id": None,
+                           "walk_top_ms": None, "catch_to_ms": None, "done": False}
+                changed = True
+                room -= 1
+                if room == 0:
+                    break
+        if changed:
+            write_json(ENTITY_TX_STATE, disk)
+
+    def _candidates(self, limit: int) -> list[tuple[str, int]]:
+        """(hex, entity_type) of entities still to walk — countries first
+        (fewest, richest histories), then MUs, then parties; oldest discovery
+        first inside each kind (idx_tx_entities_pending serves exactly this)."""
+        return [(r[0], int(r[1])) for r in query(
+            "SELECT lower(uuid_to_objectid(i.external_id)) AS hex, e.entity_type\n"
+            "FROM tx_entities e\n"
+            "JOIN inventory_ids i ON i.id = e.entity_id\n"
+            "WHERE e.transactions_scraped_at IS NULL\n"
+            "ORDER BY e.entity_type, e.first_seen_at\n"
+            f"LIMIT {limit};", self.db)]
 
 
 def _make_buckets(bottom_ms: int, top_ms: int, n: int) -> list[dict]:
@@ -1391,9 +1705,13 @@ def build_filler_pool(db: str) -> FillerPool:
       1. user-lite (user.getUserLite backfill + active refresh) — cheap,
          idempotent, per-user upserts;
       2. itemMarket item-code walks — full history per code;
-      3. user transaction walks — full history per user (XP-ranked, the
+      3. country / MU / party transaction walks — full history per entity
+         (EntityTxFiller, 2026-08-19), AHEAD of the user walks because the
+         entity set is finite (~2,150) and drains in days, while the XP
+         conveyor's 200,000 users would starve it indefinitely;
+      4. user transaction walks — full history per user (XP-ranked, the
          infinite slow one);
-      4. user transaction REFRESH — re-walk the gap between an already
+      5. user transaction REFRESH — re-walk the gap between an already
          scraped user's completion stamp and now (UserTxRefreshFiller,
          2026-08-16) — LAST, because a first pass over a user nobody has
          walked always beats a top-up of one who has.
@@ -1426,10 +1744,10 @@ def build_filler_pool(db: str) -> FillerPool:
     payload shapes, all 200, zero added failed_calls.
 
     Env gates below this master switch (all default ON):
-    WARERA_USER_TX_REFRESH=0 disables #4; WARERA_TX_FILLER=0 disables every
+    WARERA_USER_TX_REFRESH=0 disables #5; WARERA_TX_FILLER=0 disables every
     transaction-history filler (the viewer's --transactions 0 sets this for
     every spawned script); WARERA_ITEM_MARKET_FILLER=0 /
-    WARERA_USER_TX_FILLER=0 disable individual ones.
+    WARERA_ENTITY_TX_FILLER=0 / WARERA_USER_TX_FILLER=0 disable individual ones.
     """
     if os.environ.get("WARERA_FILLERS", "1") == "0":
         return FillerPool([])
@@ -1437,6 +1755,8 @@ def build_filler_pool(db: str) -> FillerPool:
     fillers: list = [Filler(db)]
     if tx and os.environ.get("WARERA_ITEM_MARKET_FILLER", "1") != "0":
         fillers.append(ItemMarketFiller())
+    if tx and os.environ.get("WARERA_ENTITY_TX_FILLER", "1") != "0":
+        fillers.append(EntityTxFiller(db))
     if tx and os.environ.get("WARERA_USER_TX_FILLER", "1") != "0":
         fillers.append(UserTxFiller(db))
         if os.environ.get("WARERA_USER_TX_REFRESH", "1") != "0":

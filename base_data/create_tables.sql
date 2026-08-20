@@ -624,3 +624,46 @@ CREATE TABLE tx_priority_users (
     added_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),          -- FIFO order of the walk
     note     TEXT NULL                                    -- free-form operator note
 );
+
+
+-- =============================================================================
+-- 13. Non-user transaction-scrape registry (migration_26, 2026-08-19)
+--
+-- Countries, military units and donation parties whose FULL transaction
+-- history is walked through the API's countryId / muId / partyId filters
+-- (each bypasses the rolling 72 h window exactly like userId does — see
+-- extra/docs/TRANSACTIONS_ENDPOINT.md §3). One row per discovered entity;
+-- fillers.EntityTxFiller stamps transactions_scraped_at when the walk is
+-- confirmed complete, which is what keeps a state/ reset from re-walking
+-- ~2,150 finished entities.
+--
+-- The rows are DISCOVERED from data we already hold — the filler's refill
+-- re-runs that insert on a throttle, so a new MU/party joins the walk on its
+-- own (see EntityTxFiller.DISCOVER_SQL):
+--   country (2) — countries.country_id (country.getAllCountries: all 180)
+--   mu      (3) — users.mu_id (getUserLite) ∪ battle_ranking_entries
+--                 entity_type = 3 ∪ recent transactions.secondary_*_id that
+--                 is not a country (the MU/country secondary columns are one
+--                 column with MU precedence, see insert_transaction)
+--   party   (4) — parties.party_id (donation.sellerPartyId)
+-- entity_type extends utils.ENTITY (1 = user, 2 = country, 3 = mu) with
+-- 4 = party; user histories are NOT tracked here (users.transactions_scraped_at
+-- owns those).
+-- =============================================================================
+
+CREATE TABLE tx_entities (
+    -- 8-byte aligned
+    first_seen_at           TIMESTAMPTZ NOT NULL DEFAULT NOW(),  -- discovery time
+    transactions_scraped_at TIMESTAMPTZ NULL,   -- NULL = still to walk
+
+    -- 4-byte aligned
+    entity_id   INT PRIMARY KEY REFERENCES inventory_ids(id),
+
+    -- 2-byte aligned
+    entity_type SMALLINT NOT NULL   -- 2 = country, 3 = mu, 4 = party
+);
+
+-- The filler's candidate query: unfinished entities, countries first, then
+-- MUs, then parties, oldest discovery first inside each kind.
+CREATE INDEX idx_tx_entities_pending ON tx_entities (entity_type, first_seen_at)
+    WHERE transactions_scraped_at IS NULL;
