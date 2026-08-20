@@ -1,7 +1,8 @@
 {
   "venvPath": ".",
   "venv": ".venv",
-  "include": ["Python", "extra"],
+  "include": ["Python", "tests", "extra"],
   "exclude": ["extra/deprecated"],
+  "extraPaths": ["Python"],
   "reportMissingImports": "warning"
 }
