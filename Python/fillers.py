@@ -1341,6 +1341,22 @@ def _make_buckets(bottom_ms: int, top_ms: int, n: int) -> list[dict]:
     return out
 
 
+def _drop_legacy_sweep(b: dict) -> None:
+    """Retire a bucket left mid-SWEEP by the pre-2026-08-20 code.
+
+    The SWEEP (walk the 36 equipment item codes at the stuck millisecond, then
+    skip past it) was replaced by the TIEWALK — see UserTxFiller's class
+    docstring for why it lost rows. A bucket carrying its state resumes as an
+    ordinary page at the tie, which re-detects the tie and enters the TIEWALK
+    with a real token; the only thing that must NOT survive is the sweep's
+    `skip past the whole ms` bookkeeping.
+    """
+    if b.pop("stall_codes", None) is not None or "stall_ms" in b:
+        stall_ms = b.pop("stall_ms", None)
+        if stall_ms is not None:
+            b["cursor_ms"] = stall_ms + 1
+
+
 def _user_bucket_count(span_ms: int) -> int:
     """Bucket parallelism for one user's history: roughly one bucket per day
     of account age, capped at USER_TX_BUCKET_COUNT — a brand-new account
@@ -1386,14 +1402,13 @@ class UserTxFiller:
          whose plain userId+cursor walk stalls (the computed next cursor
          equals the one just sent — more transactions share that exact ms
          than fit in one page, e.g. a bulk "dismantle all" logging 100
-         same-instant rows) enters a SWEEP sub-phase: userId+itemCode filters
-         combine (AND together, extra/docs/TRANSACTIONS_ENDPOINT.md §3), so
-         walking all 36 ITEM_MARKET_CODES at that exact ms splits the tie
-         and pulls everything at the boundary instead of giving up on it
-         (short of 50+ transactions of the SAME item code at the SAME
-         instant, an accepted narrow residual case). Once every code is
-         swept the bucket skips past the whole ms and resumes its normal
-         walk.
+         same-instant rows) enters the TIEWALK sub-phase (_advance_tie,
+         2026-08-20): it echoes the SERVER's nextCursor, a compound
+         (createdAt, _id) bound, until a page reaches below the tie or the
+         API runs out — the only thing that can step through a millisecond
+         no arithmetic cursor can leave. It replaced a SWEEP that asked for
+         the stuck ms under each of the 36 ITEM_MARKET_CODES and then
+         skipped past it; see _advance_tie for the rows that cost.
       3. FLOORCHECK — once every bucket reports done, ONE probe with
          cursor = the derived floor confirms there is nothing below it
          (see _oid_ms: the floor is the account document's own creation
@@ -1419,7 +1434,7 @@ class UserTxFiller:
         reaches full parallelism within ~4 cycles). _user_bucket_count sizes
         the bands from account AGE, which says nothing about how much history
         exists: a 3-transaction veteran was getting 50 bands and paying 92
-        calls for them. Buckets mid-SWEEP are always offered regardless of
+        calls for them. Buckets mid-TIEWALK are always offered regardless of
         the window — they are a repair in progress and must finish.
       * CASCADE-CLOSE — a page is a complete contiguous run of history in
         [oldest_ms + 1, cursor_sent) (verified against the live API, see
@@ -1431,7 +1446,7 @@ class UserTxFiller:
         same rows. Measured before this: the median bucket's last page ended
         74 % of a band below its bottom and 37 % of buckets more than a full
         band below.
-      * FALSE-STALL GUARD — see the SWEEP branch in collect().
+      * FALSE-STALL GUARD — see the TIEWALK branch in collect().
 
     In-band 404s (deleted accounts) drop the user at any phase and stamp it
     done too — the API will never serve its history. Any other error leaves
@@ -1520,13 +1535,12 @@ class UserTxFiller:
         """Fill slack with whatever's ready: a bootstrap probe for
         not-yet-bootstrapped users, one page per pending bucket for
         bootstrapped ones (or, for a stalled bucket, one page per remaining
-        item code in its SWEEP — see the class docstring), or a recheck
+        server's own token while mid-TIEWALK, see the class docstring), or a recheck
         probe once a user's buckets have all
         drained — round-robin over ACTIVE (not done) users so one heavy
         user's backlog can't starve the rest of the pool forever across
         cycles. Returns (positions, (hex, kind, payload) tokens) — payload
-        is a bucket index for "bucket", (bucket index, item code) for
-        "sweep", None otherwise."""
+        is a bucket index for "bucket", None otherwise."""
         slots: list[int] = []
         tokens: list[tuple] = []
         users = self.state.setdefault("users", {})
@@ -1570,7 +1584,7 @@ class UserTxFiller:
               tokens: list[tuple], users: dict, order: list[str],
               shard_only: bool) -> None:
         """One pass over the active users, appending every unit of work they
-        have ready (bootstrap probe / bucket page / same-ms sweep / recheck
+        have ready (bootstrap probe / bucket page / recheck
         probe) that this pass may take and ``_offered`` has not already
         handed out in this run."""
         for h in order:
@@ -1594,47 +1608,34 @@ class UserTxFiller:
                 # above, so arming from the top is what makes it fire. Ordered
                 # by top_ms, not by list position: FLOORCHECK appends its
                 # below-the-floor bucket last, and that one is the OLDEST.
-                # A bucket mid-SWEEP is always kept: it is a repair in
+                # A bucket mid-TIEWALK is always kept: it is a repair in
                 # progress and would otherwise starve outside the window.
                 keep = set(sorted(pending, key=lambda i: e["buckets"][i]["top_ms"],
                                   reverse=True)[:armed])
                 keep |= {i for i in pending
-                         if e["buckets"][i].get("stall_ms") is not None}
+                         if e["buckets"][i].get("tie_cursor")}
                 pending = [i for i in pending if i in keep]
             if pending:
                 for idx in pending:
                     if len(calls) >= MAX_BATCH:
                         break
                     b = e["buckets"][idx]
-                    stall_ms = b.get("stall_ms")
-                    if stall_ms is not None:
-                        # Stalled bucket: sweep the remaining item codes at
-                        # the boundary ms instead of the plain userId+cursor
-                        # request (see the class docstring's SWEEP phase).
-                        for code in list(b.get("stall_codes") or []):
-                            if len(calls) >= MAX_BATCH:
-                                break
-                            tok = (h, "sweep", (idx, code))
-                            if tok in self._offered or not self._mine(tok, shard_only):
-                                continue
-                            self._offered.add(tok)
-                            slots.append(len(calls))
-                            tokens.append(tok)
-                            calls.append((self.ENDPOINT,
-                                          {"userId": h, "itemCode": code, "limit": PAGE_LIMIT,
-                                           "direction": "forward",
-                                           "cursor": make_cursor(stall_ms + 1, MIN_OID)}))
-                        continue
+                    _drop_legacy_sweep(b)
                     tok = (h, "bucket", idx)
                     if tok in self._offered or not self._mine(tok, shard_only):
                         continue
                     self._offered.add(tok)
-                    cursor = b.get("cursor_ms") or b["top_ms"] + 1
                     slots.append(len(calls))
                     tokens.append(tok)
-                    calls.append((self.ENDPOINT,
-                                  {"userId": h, "limit": PAGE_LIMIT, "direction": "forward",
-                                   "cursor": make_cursor(cursor, MIN_OID)}))
+                    p = {"userId": h, "limit": PAGE_LIMIT, "direction": "forward"}
+                    # Mid-TIEWALK the band echoes the SERVER's own token, which
+                    # is the only thing that can step through a millisecond
+                    # holding more rows than a page (see collect's TIEWALK
+                    # branch); otherwise it sends its arithmetic position.
+                    p["cursor"] = (b.get("tie_cursor")
+                                   or make_cursor(b.get("cursor_ms") or b["top_ms"] + 1,
+                                                  MIN_OID))
+                    calls.append((self.ENDPOINT, p))
             elif self.FLOORCHECK and not e.get("floor_checked"):
                 # One probe BELOW the derived floor before the recheck can
                 # finish the user (class docstring, FLOORCHECK) — makes
@@ -1694,16 +1695,15 @@ class UserTxFiller:
         single transaction still paid one probe for each of the ~49 bands
         underneath it.
 
-        Buckets mid-SWEEP are left alone — their cursor means something else
-        while the item-code sweep runs, and closing one here would drop the
-        rest of the tie. Only ever called for UNFILTERED pages: a short page
-        under an itemCode filter proves exhaustion for that code alone."""
+        Buckets mid-TIEWALK are left alone — their position is the server's
+        token, not an arithmetic ms, and closing one here would drop the rest
+        of the tie."""
         if not self._staged:
             return
         exhausted = len(its) < PAGE_LIMIT
         cov_lo = to_unix_ms(its[-1]["createdAt"]) + 1 if its else cursor_sent
         for b in e.get("buckets", []):
-            if b.get("done") or b.get("stall_ms") is not None:
+            if b.get("done") or b.get("tie_cursor"):
                 continue
             top = b["top_ms"]
             if top >= cursor_sent:
@@ -1719,6 +1719,50 @@ class UserTxFiller:
                 if exhausted or cov_lo - 1 <= b["bottom_ms"]:
                     b["done"] = True
                     stats["cascade_closed"] = stats.get("cascade_closed", 0) + 1
+
+    def _advance_tie(self, b: dict, its: list[dict], next_cursor: str | None,
+                     stats: dict) -> None:
+        """One page of a TIEWALK — the band is stepping through a millisecond
+        that holds more rows than a page, using the server's own compound
+        (createdAt, _id) token (2026-08-20).
+
+        It replaces the SWEEP, which asked for the stuck millisecond under each
+        of the 36 ITEM_MARKET_CODES and then skipped past it. Every tie that
+        actually occurs in the data is a bulk dismantle — `dismantleItem` /
+        `scraps` — and `scraps` is not an equipment code, so the sweep matched
+        NOTHING and the skip dropped every row past the first page. Measured
+        2026-08-20: 4,048 (user, millisecond) clusters stored at exactly 100
+        rows against ~95 at each neighbouring size, all dismantleItem/scraps,
+        2025-12-28 to 2026-05-19; six of them re-asked through this token chain
+        returned 839 rows where we held 600, and a 14-cluster sample of the
+        untouched range held 1,400 against 2,277 — roughly 250 K rows.
+
+        Three ways out, and the band never leaves the tie without one:
+          * the page's oldest row is BELOW the tie: the millisecond is fully
+            walked and the ordinary arithmetic walk resumes from there;
+          * a SHORT page (or no token): the API had nothing more below the
+            token at all, which is the same premise _cascade retires bands on —
+            the band is finished;
+          * otherwise the token advances and the next page continues inside
+            the millisecond.
+        """
+        stats["tie_pages"] = stats.get("tie_pages", 0) + 1
+        oldest = to_unix_ms(its[-1]["createdAt"])
+        tie_ms = b.get("tie_ms")
+        if tie_ms is not None and oldest < tie_ms:
+            b.pop("tie_cursor", None)
+            b.pop("tie_ms", None)
+            b["cursor_ms"] = oldest + 1
+            if b["cursor_ms"] - 1 <= b["bottom_ms"]:
+                b["done"] = True
+        elif len(its) < PAGE_LIMIT or not next_cursor:
+            b.pop("tie_cursor", None)
+            b.pop("tie_ms", None)
+            if tie_ms is not None:
+                b["cursor_ms"] = tie_ms
+            b["done"] = True
+        else:
+            b["tie_cursor"] = next_cursor
 
     def _arm(self, h: str, e: dict, grown: set[str]) -> None:
         """Widen a user's armed window after a FULL page proved the density.
@@ -1758,7 +1802,8 @@ class UserTxFiller:
                     stats["failed_calls"] = stats.get("failed_calls", 0) + 1
                 self._dirty = True
                 continue
-            its = (res["result"]["data"].get("items")) or []
+            data = res["result"]["data"]
+            its = data.get("items") or []
             if its:
                 self._items.extend(its)
                 stats["items"] = stats.get("items", 0) + len(its)
@@ -1789,7 +1834,13 @@ class UserTxFiller:
                     if its:
                         sent = b.get("cursor_ms")
                         new_cursor = to_unix_ms(its[-1]["createdAt"]) + 1
-                        if (sent is not None and new_cursor == sent
+                        if b.get("tie_cursor"):
+                            # TIEWALK in progress — this page was fetched with
+                            # the server's token, so "the ms did not move" is
+                            # progress, not a stall.
+                            self._advance_tie(b, its, data.get("nextCursor"),
+                                              stats)
+                        elif (sent is not None and new_cursor == sent
                                 and self._staged and len(its) < PAGE_LIMIT):
                             # FALSE stall (2026-08-17). The fixed point below
                             # is only a TIE when the page came back FULL: a
@@ -1800,29 +1851,27 @@ class UserTxFiller:
                             # API — re-asking one ms lower returned 0 items
                             # for 7 of 8 live stalls (the 8th was a genuine
                             # 100-row tie). Before the guard 26 of 100 active
-                            # users sat mid-SWEEP at once, ~36 wasted calls
+                            # users sat mid-repair at once, ~36 wasted calls
                             # each, ~39 % of a light user's entire walk.
                             b["done"] = True
                             stats["false_stalls"] = stats.get("false_stalls", 0) + 1
                         elif sent is not None and new_cursor == sent:
-                            # No progress: the API's cursor is a strict `<`
-                            # upper bound, so `cursor = oldest_ms + 1` always
-                            # re-includes the boundary item — a page whose
-                            # oldest item sits exactly at sent-1 never comes
-                            # back empty (same fixed point _step_walk already
-                            # guards against). Also fires when a single ms
-                            # holds MORE items than PAGE_LIMIT (e.g. a bulk
-                            # dismantle-all logged as 100 same-instant rows):
-                            # every page is full of ties at that ms and the
-                            # plain userId cursor can never step past it.
-                            # Enter the SWEEP phase (class docstring) instead
-                            # of giving up: userId+itemCode combine (AND) per
-                            # extra/docs/TRANSACTIONS_ENDPOINT.md §3, so
-                            # walking the 36 item codes at this exact ms
-                            # splits the tie and (short of 50+ of the SAME
-                            # code at the SAME instant) captures all of it.
-                            b["stall_ms"] = sent - 1
-                            b["stall_codes"] = list(ITEM_MARKET_CODES)
+                            # No progress on a FULL page: the API's cursor is a
+                            # strict `<` upper bound, so `cursor = oldest_ms+1`
+                            # always re-includes the boundary item — and when a
+                            # single ms holds more rows than PAGE_LIMIT (a bulk
+                            # dismantle-all logs ~180 same-instant rows) every
+                            # page is full of that tie and no arithmetic cursor
+                            # can ever step past it.
+                            # Enter the TIEWALK: echo the server's own
+                            # nextCursor, a compound (createdAt, _id) bound, so
+                            # the walk advances by _id inside the millisecond.
+                            b["tie_ms"] = sent - 1
+                            b["tie_cursor"] = data.get("nextCursor")
+                            stats["ties"] = stats.get("ties", 0) + 1
+                            if not b["tie_cursor"]:
+                                # no token offered = nothing below this page
+                                b["done"] = True
                         else:
                             b["cursor_ms"] = new_cursor
                             if b["cursor_ms"] - 1 <= b["bottom_ms"]:
@@ -1838,29 +1887,6 @@ class UserTxFiller:
                         # this cursor are empty too.
                         empty_at = b.get("cursor_ms") or b["top_ms"] + 1
                         self._cascade(e, empty_at, its, stats)
-            elif kind == "sweep":
-                bucket_idx, code = idx
-                buckets = e.get("buckets", [])
-                if 0 <= bucket_idx < len(buckets):
-                    b = buckets[bucket_idx]
-                    codes = b.get("stall_codes")
-                    if codes and code in codes:
-                        codes.remove(code)
-                    if b.get("stall_ms") is not None and not codes:
-                        # Every item code swept at this boundary — anything
-                        # item-bearing at stall_ms is captured (idempotent
-                        # upserts already queued via `its` above), so it's
-                        # safe to skip past the whole ms and resume the
-                        # plain walk. Residual risk: a non-item-bearing type
-                        # (wage/donation/articleTip/applicationFee) ALSO
-                        # piling 50+ rows onto this exact instant would still
-                        # be missed — accepted as a much narrower edge case
-                        # than the one this sweep fixes.
-                        b["cursor_ms"] = b["stall_ms"]
-                        b.pop("stall_ms", None)
-                        b.pop("stall_codes", None)
-                        if b["cursor_ms"] - 1 <= b["bottom_ms"]:
-                            b["done"] = True
             elif kind == "floorcheck":
                 e["floor_checked"] = True
                 if its:
@@ -2036,7 +2062,7 @@ class PriorityUserTxFiller(UserTxFiller):
     DEDICATED 50-call requests per updater cycle, and only the slots the list
     cannot fill go to the ordinary fillers.
 
-    Everything else is inherited: bootstrap → buckets (+ the same-ms sweep) →
+    Everything else is inherited: bootstrap → buckets (+ the same-ms tiewalk) →
     recheck, the 404 drop, and the users.transactions_scraped_at stamp that
     marks a user fully scraped. A listed user that is already stamped is
     simply not a candidate (it shows as done on the page and costs nothing);
@@ -2256,7 +2282,7 @@ def build_filler_pool(db: str) -> FillerPool:
     again; set WARERA_FILLERS=0 to silence the whole pool in one move if the
     format changes under us a second time. Re-enabled 2026-08-18 after the
     staged rollout in extra/BUGFIX_PLAN.md 3.5: 350 filler calls through the
-    bucket / FLOORCHECK paths and a direct probe of the SWEEP and itemMarket
+    bucket / FLOORCHECK paths and a direct probe of the tie and itemMarket
     payload shapes, all 200, zero added failed_calls.
 
     Env gates below this master switch (all default ON):
