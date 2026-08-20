@@ -667,3 +667,44 @@ CREATE TABLE tx_entities (
 -- MUs, then parties, oldest discovery first inside each kind.
 CREATE INDEX idx_tx_entities_pending ON tx_entities (entity_type, first_seen_at)
     WHERE transactions_scraped_at IS NULL;
+
+-- =============================================================================
+-- 14. Item-type transaction walk registry (migration_27, 2026-08-20)
+-- =============================================================================
+-- One row per (transactionType, itemCode) stream whose FULL history is walked
+-- through the API's itemCode filter by fillers.ItemTypeTxFiller. The filter
+-- bypasses the rolling 72 h window and ANDs with transactionType, and it
+-- matches the OUTER itemCode only (the input / the case, i.e. exactly
+-- transactions.item_code_id — never the nested item.code, verified 2026-08-20),
+-- so the three item-bearing types of ITEM_TYPE_TX_TYPES have just four streams
+-- between them: openCase/case1, openCase/case2, craftItem/scraps,
+-- dismantleItem/scraps. The rows are DISCOVERED by the filler from the last
+-- week of `transactions`, so a code that appears later joins on its own.
+--
+-- covered_to_ms is a WATERMARK that climbs from the stream's floor (its oldest
+-- row, less a day, proven by a floorcheck probe) toward top_ms, and it moves
+-- only when every band of a slice has retired — "I stopped early" is never
+-- "the range is covered". It lives here rather than only in
+-- state/item_type_tx_state.json because state/ is regenerable by contract
+-- (backups.py load wipes it) while re-walking a stream from the floor costs
+-- ~451 K pages / ~33 h of filler slack.
+--
+-- top_ms is the walk's CEILING, captured when the stream is bootstrapped:
+-- rows created above it while the walk runs belong to the unfiltered 72 h
+-- window step (Python/update_tx_window.py), which demonstrably covers them
+-- (sampled 2026-08-20: 100 % of live rows inside 60 days already stored).
+-- Clearing transactions_scraped_at is how a finished stream is re-walked.
+
+CREATE TABLE tx_item_type_walks (
+    -- 8-byte aligned
+    covered_to_ms           BIGINT NOT NULL,     -- history proven walked from the floor up to here
+    top_ms                  BIGINT NOT NULL,     -- ceiling captured at bootstrap
+    first_seen_at           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    transactions_scraped_at TIMESTAMPTZ NULL,    -- NULL = still walking
+
+    -- 2-byte aligned
+    transaction_type_id     SMALLINT NOT NULL REFERENCES transaction_types(id),
+    item_code_id            SMALLINT NOT NULL REFERENCES item_codes(id),
+
+    PRIMARY KEY (transaction_type_id, item_code_id)
+);

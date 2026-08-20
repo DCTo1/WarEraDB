@@ -31,7 +31,13 @@ The fillers:
       donation PARTY (the countryId / muId / partyId filters bypass the window
       as well); the entity set is finite and drains, so it sits ahead of the
       user walks. Completion is stamped in tx_entities (migration_26);
-   4. UserTxFiller — full transaction history per user, picked by XP ranking
+   4. ItemTypeTxFiller — full history of every (transactionType, itemCode)
+      stream of the item-bearing types (openCase / craftItem / dismantleItem
+      to start with); the itemCode filter bypasses the window too, and it
+      ANDs with transactionType. Four streams, walked in parallel time bands
+      sized in ROWS. Ahead of the user walks for EntityTxFiller's reason: a
+      finite set that drains. Watermark in tx_item_type_walks (migration_27);
+   5. UserTxFiller — full transaction history per user, picked by XP ranking
       (the API's userId filter bypasses the window too); users are marked in
       the DB once their scrape is confirmed finished and replaced by the
       next-in-line (a conveyor capped at USER_TX_TOTAL_LIMIT total users,
@@ -52,12 +58,13 @@ import re
 import time
 
 from db import exec_sql, query
-from tx_walk import advance, build_stmts
+from tx_walk import advance, build_stmts, make_bands
 from update_users_lite import Filler
 from utils import (MAX_BATCH, MIN_OID, PAGE_LIMIT, STATE_DIR, filler_shard,
                    make_cursor, read_json, shard_owns, to_unix_ms, write_json)
 
 ITEM_MARKET_STATE = os.path.join(STATE_DIR, "item_market_state.json")
+ITEM_TYPE_TX_STATE = os.path.join(STATE_DIR, "item_type_tx_state.json")
 USER_TX_STATE = os.path.join(STATE_DIR, "user_tx_state.json")
 PRIORITY_TX_STATE = os.path.join(STATE_DIR, "priority_tx_state.json")
 USER_TX_REFRESH_STATE = os.path.join(STATE_DIR, "user_tx_refresh_state.json")
@@ -123,6 +130,34 @@ USER_TX_TOTAL_LIMIT = 200000
 # which entities finish first, never the throughput.
 ENTITY_TX_POOL_SIZE = 100
 ENTITY_TX_DISCOVER_INTERVAL_S = 900
+
+# ItemTypeTxFiller (2026-08-20): the item-bearing transaction types whose full
+# history is walked through the API's itemCode filter. The (type, code) pairs
+# themselves are DISCOVERED from recent data — these three types have only two
+# distinct outer codes between them (case1/case2 for openCase, scraps for
+# craftItem/dismantleItem, measured 2026-08-20), so the list of TYPES is the
+# knob: add "trading" / "battleLoot" here and their codes join on their own.
+ITEM_TYPE_TX_TYPES = ["openCase", "craftItem", "dismantleItem"]
+
+# How many buckets one combo's current slice splits into (its parallelism —
+# each bucket is a sequential cursor chain, so the COUNT is what lets a combo
+# occupy many slots of one batch), and how often discovery re-scans for new
+# (type, code) pairs. 20 x 4 combos = 80 ready units, comfortably more than
+# one batch's slack.
+ITEM_TYPE_TX_BUCKETS = 20
+ITEM_TYPE_TX_DISCOVER_INTERVAL_S = 900
+
+# Band size, in ROWS rather than in clock time: traffic per combo spans
+# 372/day (openCase/case2 in 2025-12) to 187,000/day (dismantleItem/scraps in
+# 2026-08), so a fixed span would be 4 pages of one and 1,874 of the other.
+# 5,000 rows = 50 pages is the sequential depth of one band; where that lands
+# in clock time is asked of our own stored rows per slice (_slice_top).
+# MIN_SPAN only guarantees a slice make_bands can split; DEFAULT_SPAN is for
+# the stretches where we hold no rows at all and so have no evidence either
+# way (an empty band costs a single page).
+ITEM_TYPE_TX_TARGET_ROWS = 5000
+ITEM_TYPE_TX_MIN_SPAN_MS = 15 * 60_000
+ITEM_TYPE_TX_DEFAULT_SPAN_MS = 6 * 3_600_000
 
 # Safety cap on the /tx-priority walk's in-flight pool (PriorityUserTxFiller).
 # The list is operator-curated and normally a handful of users, so this only
@@ -800,6 +835,483 @@ ON CONFLICT (entity_id) DO NOTHING;"""
             "WHERE e.transactions_scraped_at IS NULL\n"
             "ORDER BY e.entity_type, e.first_seen_at\n"
             f"LIMIT {limit};", self.db)]
+
+
+class ItemTypeTxFiller:
+    """Rides the slack to scrape the FULL history of the item-bearing
+    transaction types through the API's `itemCode` filter (2026-08-20).
+
+    `itemCode` bypasses the rolling 72 h window exactly like `userId` /
+    `countryId` do, and it ANDs with `transactionType` (one Mongo query —
+    extra/docs/TRANSACTIONS_ENDPOINT.md §3), so `(type, code)` selects one
+    complete stream of history. What it does NOT match is the item NESTED in
+    the row: `dismantleItem`+`sniper` returns 0 rows, because the filter reads
+    the OUTER `itemCode` — the input / the case, i.e. exactly what
+    transactions.item_code_id stores. So ITEM_TYPE_TX_TYPES' three types have
+    only FOUR streams between them (measured 2026-08-20): openCase/case1,
+    openCase/case2, craftItem/scraps, dismantleItem/scraps.
+
+    Why this is worth a filler of its own, when the user walks already fetch
+    these rows: they fetch them only for users somebody walked. Sampling 3,200
+    live rows across the four combos at eight depths, 96 % were already in
+    `tsdb` — but every miss was older than 60 days (71-93 % coverage at
+    120-230 d), which is a ~1.5 M-row hole in exactly the era the XP conveyor
+    has not reached and never will at 200,000 users.
+
+    Why it is affordable: a FILTERED page costs ~0.27 s at EVERY depth
+    (measured 0.5 d through 236 d), where an unfiltered window page costs
+    2.30 s at 24 h, and 50 filtered pages in one request come back in 1.29 s —
+    the API does not serialise these the way it serialises deep unfiltered
+    pages. All 45 M rows of the three types are ~451 K pages ≈ 3.2 h of pure
+    API time; at the transaction fillers' current share of the slack, ~33 h.
+
+    PARALLEL TIME BUCKETS, sized in ROWS. Each combo walks one SLICE of its
+    history at a time, split into ITEM_TYPE_TX_BUCKETS independent bands (the
+    same band shape tx_walk uses, and its `advance` drives them: seed with
+    make_cursor(top), then echo the server's own nextCursor, retire on
+    reaching the band's bottom / a short page / an absent cursor). A band is
+    a SEQUENTIAL chain, so its row target is its latency and the band COUNT is
+    the parallelism. Bands are sized to ITEM_TYPE_TX_TARGET_ROWS rows rather
+    than to a fixed span, by asking our own stored rows where that many of
+    them sit above the watermark (_slice_top): 5,000 rows is 38 min of
+    dismantleItem/scraps in 2026-08 and 6.2 h of it in 2026-01, and 13 DAYS of
+    openCase/case2 down there.
+
+    No TIEWALK sub-phase (UserTxFiller's same-ms repair) is needed here: a
+    filtered page of 100 rows carried 100 distinct milliseconds (max cluster
+    1), and the bands echo the compound v2 token anyway, which breaks ties by
+    `_id`.
+
+    Per-combo state machine (state/item_type_tx_state.json, {combos:
+    {"<type>|<code>": {...}}, stats: {}, discovered_ms: int}):
+      1. BOOTSTRAP — one no-cursor probe fixes `top_ms`, the walk's CEILING,
+         and stores its page. An empty probe means the combo has no history at
+         all → done on the spot.
+      2. FLOORCHECK — one probe strictly below `floor_ms` (the combo's oldest
+         row in our DB, less a day) proves there is nothing under the bottom
+         we derived. Non-empty → the derived floor was wrong: it drops to
+         TX_EPOCH_MS and the page is stored. One call per combo, the same
+         self-verifying trick UserTxFiller uses on _user_floor_ms.
+      3. SLICES, OLDEST FIRST — `covered_to_ms` climbs from `floor_ms` one
+         slice at a time (_carve, in the refill under the pool lock). Upward
+         because coverage is 100 % for the last 60 days and thin past 120 d,
+         so the walk yields new rows from its first cycle instead of after
+         30 hours of re-reading rows we hold. Inside a slice the bands walk
+         newest-first, because the cursor is an upper bound.
+      4. ADVANCE — the watermark moves ONLY when every band of the slice has
+         retired; a slice with bands still open keeps them in state and is
+         resumed next cycle ("I stopped early" is never "the range is
+         covered" — the rule tx_walk exists to enforce).
+      5. DONE — `covered_to_ms` reaching `top_ms` stamps
+         tx_item_type_walks.transactions_scraped_at. Rows created ABOVE the
+         ceiling while the walk ran are the 72 h window step's job, and it
+         demonstrably does it: 100 % of the sampled rows inside 60 days were
+         already stored. Clearing the stamp is how a combo is re-walked.
+
+    The watermark lives in the DB (tx_item_type_walks, migration_27), not only
+    in state/: state/ is regenerable by contract and backups.py load wipes it,
+    while re-walking from the floor costs ~33 h of slack. Both the watermark
+    upsert and the completion stamp are emitted from stmts(), so they travel
+    in the SAME transaction as the rows they describe and can never get ahead
+    of them.
+    """
+
+    ENDPOINT = "transaction.getPaginatedTransactions"
+
+    # Only names matching this ever reach the SQL literals below (codes are
+    # read back from our own tables, but a filler is not the place to trust
+    # that) — anything else is skipped at discovery.
+    NAME_RE = re.compile(r"^[A-Za-z0-9_]+$")
+
+    # The (type, code) pairs in play, from the last week of data only — a
+    # bounded, uncompressed-chunk scan (0.38 s measured), so a code that
+    # appears later (a case3) joins the walk on its own.
+    DISCOVER_SQL = """
+SELECT tt.type, ic.code
+FROM transactions t
+JOIN transaction_types tt ON tt.id = t.transaction_type_id
+JOIN item_codes ic ON ic.id = t.item_code_id
+WHERE t.created_at > now() - interval '7 days'
+  AND tt.type IN ({types})
+GROUP BY 1, 2;"""
+
+    # Watermark upsert. The DO UPDATE carries a qual so a re-sent watermark
+    # that is already stored writes NOTHING — the same rule get_item_id's
+    # last_acquisition_at guard came from (base_data/functions.sql): a no-op
+    # write still takes a row lock, and a flush holds its locks for its whole
+    # 1.5-3 s.
+    MARK_SQL = """
+INSERT INTO tx_item_type_walks (transaction_type_id, item_code_id, covered_to_ms, top_ms)
+SELECT tt.id, ic.id, {covered}, {top}
+FROM transaction_types tt, item_codes ic
+WHERE tt.type = '{type}' AND ic.code = '{code}'
+ON CONFLICT (transaction_type_id, item_code_id) DO UPDATE
+   SET covered_to_ms = GREATEST(tx_item_type_walks.covered_to_ms, EXCLUDED.covered_to_ms),
+       top_ms        = GREATEST(tx_item_type_walks.top_ms, EXCLUDED.top_ms)
+ WHERE tx_item_type_walks.covered_to_ms < EXCLUDED.covered_to_ms
+    OR tx_item_type_walks.top_ms < EXCLUDED.top_ms;"""
+
+    DONE_SQL = """
+UPDATE tx_item_type_walks SET transactions_scraped_at = NOW()
+WHERE transaction_type_id = (SELECT id FROM transaction_types WHERE type = '{type}')
+  AND item_code_id = (SELECT id FROM item_codes WHERE code = '{code}')
+  AND transactions_scraped_at IS NULL;"""
+
+    def __init__(self, db: str) -> None:
+        self.db = db
+        self.state = read_json(ITEM_TYPE_TX_STATE, {"combos": {}, "stats": {}})
+        self._items: list[dict] = []
+        self._marks: list[str] = []        # combos whose watermark advanced
+        self._done: list[str] = []         # combos finished THIS run
+        self._offer = 0       # round-robin position into the combo order
+        self._offered: set[tuple] = set()  # units offered THIS run
+        self._shard_i, self._shard_n = filler_shard()
+        self._touched: set[str] = set()    # combos THIS run advanced
+        self._stats0 = dict(self.state.get("stats", {}))
+        self._dirty = False
+
+    # ---------------- offering ----------------
+
+    def top_up(self, calls: list[tuple[str, dict]]) -> tuple[list[int], list[tuple]]:
+        """One page per ready unit — a bootstrap probe, a floorcheck probe, or
+        one band of the combo's current slice — INTERLEAVED across combos so a
+        single batch advances all four rather than draining one.
+
+        Two passes, the rule every filler here shares: this process's shard
+        first, then anything left if the batch still has room (a slot with
+        nothing else to do is better spent on a duplicate than left empty).
+        """
+        slots: list[int] = []
+        tokens: list[tuple] = []
+        combos = self.state.setdefault("combos", {})
+        keys = [k for k, e in combos.items() if not e.get("done")]
+        n = len(keys)
+        if not n:
+            return slots, tokens
+        base = self._offer % n
+        order = keys[base:] + keys[:base]
+        units = self._units(combos, order)
+        for shard_only in (True, False):
+            if len(calls) >= MAX_BATCH:
+                break
+            if shard_only and self._shard_n < 2:
+                continue          # sharding off: one unfiltered pass is enough
+            for tok in units:
+                if len(calls) >= MAX_BATCH:
+                    break
+                if tok in self._offered:
+                    continue      # a band's cursor only moves in collect
+                if shard_only and not shard_owns(tok, self._shard_i, self._shard_n):
+                    continue
+                self._offered.add(tok)
+                slots.append(len(calls))
+                tokens.append(tok)
+                calls.append((self.ENDPOINT, self._payload(combos, tok)))
+        self._offer = (base + 1) % n
+        return slots, tokens
+
+    def _units(self, combos: dict, order: list[str]) -> list[tuple]:
+        """The ready (combo key, kind, band index) units, one lane at a time
+        across combos: combo A's first band, combo B's first band, ... then
+        every combo's second band. A combo with no slice carved yet simply
+        contributes nothing this run — _carve runs in the refill, under the
+        pool lock, where the DB read it needs is safe to take."""
+        per: dict[str, list[tuple]] = {}
+        for k in order:
+            e = combos[k]
+            if e.get("top_ms") is None:
+                per[k] = [(k, "bootstrap", -1)]
+            elif not e.get("floor_checked"):
+                per[k] = [(k, "floor", -1)]
+            else:
+                per[k] = [(k, "band", i)
+                          for i, b in enumerate(e.get("buckets") or [])
+                          if not b.get("done")]
+        out: list[tuple] = []
+        for lane in range(max((len(v) for v in per.values()), default=0)):
+            for k in order:
+                if lane < len(per[k]):
+                    out.append(per[k][lane])
+        return out
+
+    def _payload(self, combos: dict, tok: tuple) -> dict:
+        key, kind, idx = tok
+        ttype, code = key.split("|")
+        p = {"transactionType": ttype, "itemCode": code,
+             "limit": PAGE_LIMIT, "direction": "forward"}
+        e = combos[key]
+        if kind == "floor":
+            # strictly BELOW the derived floor (MIN_OID = exclusive of the ms)
+            p["cursor"] = make_cursor(e["floor_ms"], MIN_OID)
+        elif kind == "band":
+            b = e["buckets"][idx]
+            # seed inclusive of the band's own top ms (MAX_OID), then echo
+            p["cursor"] = b["cursor"] or make_cursor(b["top_ms"])
+        return p                  # bootstrap: no cursor = the newest page
+
+    # ---------------- collecting ----------------
+
+    def collect(self, results: list, slots: list[int], tokens: list[tuple]) -> None:
+        combos = self.state.setdefault("combos", {})
+        stats = self.state.setdefault("stats", {})
+        for pos, (key, kind, idx) in zip(slots, tokens):
+            if pos >= len(results):
+                continue
+            res = results[pos]
+            e = combos.get(key)
+            if e is None:
+                continue
+            self._touched.add(key)   # save_state writes back only these
+            if "error" in res:
+                stats["failed_calls"] = stats.get("failed_calls", 0) + 1
+                self._dirty = True   # so the counter survives save_state
+                continue             # the unit keeps its cursor: retried later
+            data = res["result"]["data"]
+            its = data.get("items") or []
+            self._dirty = True
+            if kind == "bootstrap":
+                if not its:
+                    self._finish(key, e)   # no history at all for this stream
+                    continue
+                self._items.extend(its)
+                stats["items"] = stats.get("items", 0) + len(its)
+                e["top_ms"] = to_unix_ms(its[0]["createdAt"])
+            elif kind == "floor":
+                e["floor_checked"] = True
+                if its:
+                    # the derived floor was NOT the bottom — drop to the first
+                    # transaction that exists and let the slices climb from
+                    # there (the page itself is stored, not thrown away)
+                    self._items.extend(its)
+                    stats["items"] = stats.get("items", 0) + len(its)
+                    e["floor_ms"] = TX_EPOCH_MS
+                    e["covered_to_ms"] = TX_EPOCH_MS
+                    stats["floor_misses"] = stats.get("floor_misses", 0) + 1
+            else:
+                bands = e.get("buckets") or []
+                if idx >= len(bands):
+                    continue         # slice re-carved under us: nothing to do
+                kept = advance(bands[idx], data)
+                self._items.extend(kept)
+                stats["items"] = stats.get("items", 0) + len(kept)
+                if all(b.get("done") for b in bands):
+                    self._close_slice(key, e)
+        if self._dirty:
+            stats["pages"] = stats.get("pages", 0) + len(slots)
+
+    def _close_slice(self, key: str, e: dict) -> None:
+        """Every band of the slice retired → the range really is covered, so
+        the watermark may move (and only now). The next slice is carved by the
+        refill; a combo whose watermark reached the ceiling is finished."""
+        stats = self.state.setdefault("stats", {})
+        stats["slices"] = stats.get("slices", 0) + 1
+        e["covered_to_ms"] = e["slice_top_ms"]
+        e["buckets"] = []
+        self._mark(key)
+        if e["covered_to_ms"] >= e["top_ms"]:
+            self._finish(key, e)
+
+    def _finish(self, key: str, e: dict) -> None:
+        """Mark a combo fully walked: flag, not pop — write_json_merged's
+        per-key merge can add or overwrite a key across concurrent writers but
+        never delete one, so a pop() would resurrect on the next merge (the
+        rule UserTxFiller/EntityTxFiller document)."""
+        stats = self.state.setdefault("stats", {})
+        stats["combos_done"] = stats.get("combos_done", 0) + 1
+        e["done"] = True
+        e["buckets"] = []
+        # the stamp is an UPDATE, so the row has to exist first — a stream that
+        # turned out to have no history at all never closed a slice and so has
+        # never been written
+        self._mark(key)
+        self._done.append(key)
+
+    def _mark(self, key: str) -> None:
+        """Queue this combo's watermark upsert, once per run."""
+        if key not in self._marks:
+            self._marks.append(key)
+
+    # ---------------- statements & state ----------------
+
+    def stmts(self) -> list[str]:
+        out = build_stmts(self._items)
+        for key in self._marks:
+            ttype, code = key.split("|")
+            e = self.state.get("combos", {}).get(key) or {}
+            out.append(self.MARK_SQL.format(
+                type=ttype, code=code,
+                covered=int(e.get("covered_to_ms") or 0),
+                top=int(e.get("top_ms") or 0)))
+        for key in self._done:
+            ttype, code = key.split("|")
+            out.append(self.DONE_SQL.format(type=ttype, code=code))
+        return out
+
+    def take_stmts(self) -> list[str]:
+        """stmts() + hand over the buffers (see FillerPool.take_stmts). The
+        watermark and the completion stamp travel with the rows they follow,
+        so neither can ever describe data that was not stored."""
+        out = self.stmts()
+        self._items = []
+        self._marks = []
+        self._done = []
+        return out
+
+    def save_state(self) -> None:
+        """Write this run's combos into a FRESH on-disk copy (the caller holds
+        the filler pool lock), then discover + carve. Only the entries this run
+        advanced are written back — with filler shards our untouched copies are
+        another step's fresh progress (see UserTxFiller.save_state for the
+        measurement that rule came from)."""
+        if self._dirty:
+            disk = read_json(ITEM_TYPE_TX_STATE, None) or {"combos": {}, "stats": {}}
+            combos = disk.setdefault("combos", {})
+            mine = self.state.get("combos", {})
+            for k in self._touched:
+                if k in mine:
+                    combos[k] = mine[k]
+            st = disk.setdefault("stats", {})
+            for k, v in self.state.get("stats", {}).items():
+                delta = v - self._stats0.get(k, 0)
+                if delta:
+                    st[k] = st.get(k, 0) + delta
+            write_json(ITEM_TYPE_TX_STATE, disk)
+        self._refill()
+
+    def _refill(self) -> None:
+        """Discover combos (throttled) and carve the next slice for whichever
+        of them has none — both decided against a FRESH on-disk read taken
+        here, under the lock, so the cycle's parallel steps cannot each carve
+        their own slice from the same stale snapshot (the overshoot
+        UserTxFiller._refill documents)."""
+        disk: dict = read_json(ITEM_TYPE_TX_STATE, {"combos": {}, "stats": {}})
+        combos = disk.setdefault("combos", {})
+        changed = False
+        now_ms = int(time.time() * 1000)
+        if now_ms - disk.get("discovered_ms", 0) >= ITEM_TYPE_TX_DISCOVER_INTERVAL_S * 1000:
+            self._discover(combos)
+            disk["discovered_ms"] = now_ms
+            changed = True
+        for key, e in combos.items():
+            if e.get("done") or e.get("buckets") or e.get("top_ms") is None:
+                continue
+            if not e.get("floor_checked") or e["covered_to_ms"] >= e["top_ms"]:
+                continue
+            self._carve(key, e)
+            changed = True
+        if changed:
+            write_json(ITEM_TYPE_TX_STATE, disk)
+
+    def _discover(self, combos: dict) -> bool:
+        """Add state entries for (type, code) pairs seen in the last week.
+
+        A pair already stamped in tx_item_type_walks comes back as done (a
+        state reset must not re-walk it), and one with a stored watermark
+        resumes from it — that is the whole reason the watermark is in the DB.
+        """
+        types = ", ".join(f"'{t}'" for t in ITEM_TYPE_TX_TYPES
+                          if self.NAME_RE.match(t))
+        if not types:
+            return False
+        stored = {(r[0], r[1]): (int(r[2]), int(r[3]), r[4]) for r in query(
+            "SELECT tt.type, ic.code, w.covered_to_ms, w.top_ms,\n"
+            "       w.transactions_scraped_at\n"
+            "FROM tx_item_type_walks w\n"
+            "JOIN transaction_types tt ON tt.id = w.transaction_type_id\n"
+            "JOIN item_codes ic ON ic.id = w.item_code_id;", self.db)}
+        changed = False
+        for ttype, code in query(self.DISCOVER_SQL.format(types=types), self.db):
+            if not (self.NAME_RE.match(ttype) and self.NAME_RE.match(code)):
+                continue          # never build a SQL literal we did not vet
+            key = f"{ttype}|{code}"
+            if key in combos:
+                continue
+            covered, top, scraped = stored.get((ttype, code), (0, 0, None))
+            floor = covered or self._floor_ms(ttype, code)
+            combos[key] = {
+                "floor_ms": floor,
+                "covered_to_ms": floor,
+                # a resumed walk keeps its original ceiling: everything above
+                # it is the window step's, walked or not
+                "top_ms": top or None,
+                "floor_checked": bool(covered),
+                "slice_top_ms": 0, "buckets": [], "done": scraped is not None}
+            changed = True
+        return changed
+
+    def _floor_ms(self, ttype: str, code: str) -> int:
+        """Bottom of this combo's walk: the oldest row we hold for it, less a
+        day of margin, never below the first transaction in existence. Derived,
+        then PROVEN by the floorcheck probe — our own DB is evidence of what
+        exists, not of what does not."""
+        rows = query(
+            "SELECT created_at FROM transactions\n"
+            f"WHERE transaction_type_id = (SELECT id FROM transaction_types WHERE type = '{ttype}')\n"
+            f"  AND item_code_id = (SELECT id FROM item_codes WHERE code = '{code}')\n"
+            "ORDER BY created_at LIMIT 1;", self.db)
+        if not rows or rows[0][0] is None:
+            return TX_EPOCH_MS
+        return max(TX_EPOCH_MS, int(rows[0][0].timestamp() * 1000) - 86_400_000)
+
+    def _carve(self, key: str, e: dict) -> None:
+        """Split the next slice above the watermark into ITEM_TYPE_TX_BUCKETS
+        bands of ~ITEM_TYPE_TX_TARGET_ROWS rows each."""
+        ttype, code = key.split("|")
+        lo = int(e["covered_to_ms"])
+        top = self._slice_top(ttype, code, lo, int(e["top_ms"]))
+        bands = make_bands(lo, top, ITEM_TYPE_TX_BUCKETS)
+        if not bands:
+            return
+        e["buckets"] = bands
+        e["slice_top_ms"] = top
+
+    def _slice_top(self, ttype: str, code: str, lo: int, ceiling: int) -> int:
+        """Top of the next slice: the point above *lo* holding
+        BUCKETS x TARGET_ROWS rows of this combo.
+
+        Asked EXACTLY, as the timestamp of the (BUCKETS x TARGET_ROWS)-th row
+        we already hold above the watermark, rather than extrapolated from a
+        density probe: these streams grew ~10x between 2025-12 and 2026-08, so
+        a rate measured at a slice's bottom describes none of the rest of it
+        (the first version sized a 210-day openCase/case2 slice from the 30
+        days above its floor and put 3x the target in every band). The ordered
+        scan is chunk-pruned and stops at the offset — 0.01-0.37 s measured
+        across all four streams, once per slice per combo.
+
+        Our own rows are evidence of what EXISTS, never of what does not, so
+        the two thin cases fall back rather than trust the silence: fewer than
+        the target above `lo` means the rest of history is one final slice,
+        and NO rows there at all means we have no evidence, so the stretch is
+        walked in cheap default-sized steps (an empty band costs one page).
+        """
+        want = ITEM_TYPE_TX_TARGET_ROWS * ITEM_TYPE_TX_BUCKETS
+        rows = query(
+            "SELECT created_at FROM transactions\n"
+            + self._where(ttype, code, lo, ceiling)
+            + f"\nORDER BY created_at OFFSET {want} LIMIT 1;", self.db)
+        if not (rows and rows[0][0]):
+            probe = query("SELECT 1 FROM transactions\n"
+                          + self._where(ttype, code, lo, ceiling)
+                          + "\nLIMIT 1;", self.db)
+            if probe:
+                return ceiling     # the remainder holds less than one slice
+            return min(ceiling,
+                       lo + ITEM_TYPE_TX_DEFAULT_SPAN_MS * ITEM_TYPE_TX_BUCKETS)
+        top = int(rows[0][0].timestamp() * 1000)
+        # never carve a slice so thin that make_bands cannot split it — a
+        # burst of `want` rows inside one second would otherwise stall the walk
+        return min(ceiling, max(lo + ITEM_TYPE_TX_MIN_SPAN_MS * ITEM_TYPE_TX_BUCKETS,
+                                top))
+
+    @staticmethod
+    def _where(ttype: str, code: str, lo: int, hi: int) -> str:
+        """The [lo, hi) window of one (type, code) stream. Both names are
+        vetted by NAME_RE at discovery, so they are safe as SQL literals."""
+        return (
+            f"WHERE transaction_type_id = (SELECT id FROM transaction_types WHERE type = '{ttype}')\n"
+            f"  AND item_code_id = (SELECT id FROM item_codes WHERE code = '{code}')\n"
+            f"  AND created_at >= to_timestamp({lo / 1000.0})\n"
+            f"  AND created_at <  to_timestamp({hi / 1000.0})")
 
 
 def _make_buckets(bottom_ms: int, top_ms: int, n: int) -> list[dict]:
@@ -1709,9 +2221,13 @@ def build_filler_pool(db: str) -> FillerPool:
          (EntityTxFiller, 2026-08-19), AHEAD of the user walks because the
          entity set is finite (~2,150) and drains in days, while the XP
          conveyor's 200,000 users would starve it indefinitely;
-      4. user transaction walks — full history per user (XP-ranked, the
+      4. (type, itemCode) transaction walks — full history per item-bearing
+         transaction type (ItemTypeTxFiller, 2026-08-20), directly above the
+         user walks for the same reason #3 is: four streams, ~451 K pages,
+         and then it is done forever;
+      5. user transaction walks — full history per user (XP-ranked, the
          infinite slow one);
-      5. user transaction REFRESH — re-walk the gap between an already
+      6. user transaction REFRESH — re-walk the gap between an already
          scraped user's completion stamp and now (UserTxRefreshFiller,
          2026-08-16) — LAST, because a first pass over a user nobody has
          walked always beats a top-up of one who has.
@@ -1744,10 +2260,11 @@ def build_filler_pool(db: str) -> FillerPool:
     payload shapes, all 200, zero added failed_calls.
 
     Env gates below this master switch (all default ON):
-    WARERA_USER_TX_REFRESH=0 disables #5; WARERA_TX_FILLER=0 disables every
+    WARERA_USER_TX_REFRESH=0 disables #6; WARERA_TX_FILLER=0 disables every
     transaction-history filler (the viewer's --transactions 0 sets this for
     every spawned script); WARERA_ITEM_MARKET_FILLER=0 /
-    WARERA_ENTITY_TX_FILLER=0 / WARERA_USER_TX_FILLER=0 disable individual ones.
+    WARERA_ENTITY_TX_FILLER=0 / WARERA_ITEM_TYPE_TX_FILLER=0 /
+    WARERA_USER_TX_FILLER=0 disable individual ones.
     """
     if os.environ.get("WARERA_FILLERS", "1") == "0":
         return FillerPool([])
@@ -1757,6 +2274,8 @@ def build_filler_pool(db: str) -> FillerPool:
         fillers.append(ItemMarketFiller())
     if tx and os.environ.get("WARERA_ENTITY_TX_FILLER", "1") != "0":
         fillers.append(EntityTxFiller(db))
+    if tx and os.environ.get("WARERA_ITEM_TYPE_TX_FILLER", "1") != "0":
+        fillers.append(ItemTypeTxFiller(db))
     if tx and os.environ.get("WARERA_USER_TX_FILLER", "1") != "0":
         fillers.append(UserTxFiller(db))
         if os.environ.get("WARERA_USER_TX_REFRESH", "1") != "0":
