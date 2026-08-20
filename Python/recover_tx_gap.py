@@ -29,6 +29,9 @@ Usage:
         --reset               # discard saved band cursors and start over
         --verify              # per-minute coverage of the range, no API calls
 
+--from is inclusive of the millisecond it names and --to exclusive of nothing
+(the band's top cursor covers it), so the range you type is the range walked.
+
 Exit: 0 ok / 1 API error / 2 DB error / 3 range still incomplete after
 --max-waves (rerun to continue).
 """
@@ -149,9 +152,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
-    from_ms = parse_until_ms(args.from_)
+    # --from is INCLUSIVE of the millisecond it names; walk_range's bottom is
+    # not (tx_walk.advance keeps `ms > bottom_ms` and retires the band on
+    # `oldest_ms <= bottom_ms`), so the bound is lowered by 1 ms here. The
+    # walk's own callers want the exclusive form — update_tx_window.py passes
+    # the previous cycle's watermark, whose own millisecond is already
+    # stored — but a hand-typed --from is a range the operator wants covered,
+    # and a second-precision timestamp lands exactly on .000, which is where
+    # a burst of same-millisecond rows sits (measured: 251 rows dropped when
+    # --from named a tie millisecond). Overlap costs one re-fetched page and
+    # insert_transaction is an ON CONFLICT upsert.
+    from_ms = parse_until_ms(args.from_) - 1
     to_ms = parse_until_ms(args.to)
-    if to_ms <= from_ms:
+    if to_ms <= from_ms + 1:
         print("--to must be after --from", file=sys.stderr)
         return 2
     if args.verify:
