@@ -30,6 +30,7 @@ from .pages import (
     page_tracker, page_transactions, page_transactions_coverage,
     page_tx_priority, page_user, page_users, page_usage, page_weekly,
 )
+from .private import PRIVATE_ROUTES
 from .search import search
 from .updater import log_events, page_update_status, timer_events, timer_state
 
@@ -51,9 +52,18 @@ ROUTES = {
     "/usage": page_usage,
     "/sql": page_sql,
     "/tx-priority": page_tx_priority,
-
     "/update-status": page_update_status,
 }
+
+# Pages kept out of this repo entirely (extra/private/, gitignored) — nothing
+# when that directory is absent, which is the normal case. Merged AFTER the
+# table above so a private module cannot silently shadow a built-in page.
+for _path, _fn in PRIVATE_ROUTES.items():
+    if _path in ROUTES:
+        print(f"private page {_path} ignored: shadows a built-in route",
+              file=sys.stderr)
+        continue
+    ROUTES[_path] = _fn
 
 # Concurrent SSE streams. ThreadingHTTPServer gives every connection its own
 # thread and a stream holds it for the life of the tab, so this caps how many

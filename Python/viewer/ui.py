@@ -461,6 +461,26 @@ def user_link(row: dict) -> str:
             f"title='{row['user_id']}'>…{row['user_id'][-8:]}</a>")
 
 
+_PRIVATE_NAV_HTML: str | None = None
+
+
+def _private_nav() -> str:
+    """Header links contributed by extra/private/ — empty string for anyone
+    without that directory (see viewer/private.py).
+
+    Imported at CALL time, not at module level: a private page imports this
+    module for esc()/layout(), so importing private.py back here at import
+    time would be a cycle. Cached after the first call — private.py already
+    did the filesystem scan once, at start-up.
+    """
+    global _PRIVATE_NAV_HTML
+    if _PRIVATE_NAV_HTML is None:
+        from .private import PRIVATE_NAV
+        _PRIVATE_NAV_HTML = "".join(
+            f'<a href="{esc(h)}">{esc(label)}</a>' for h, label in PRIVATE_NAV)
+    return _PRIVATE_NAV_HTML
+
+
 def layout(title: str, body: str, refresh: bool = False) -> str:
     meta = '<meta http-equiv="refresh" content="2">' if refresh else ""
     return f"""<!doctype html><html><head><meta charset="utf-8">
@@ -474,7 +494,7 @@ def layout(title: str, body: str, refresh: bool = False) -> str:
 <b id="upd_sec">…</b>s</a></div></div>
 <nav><a href="/">Overview</a><a href="/battles">Battles</a>
 <a href="/users">Users</a><a href="/weekly">Weekly</a><a href="/tracker">Tracker</a><a href="/transactions">Transactions</a><a href="/snipes">Snipes</a><a href="/bounties">Bounties</a><a href="/countries">Countries</a>
-<a href="/tx-priority">Priority</a><a href="/sql">SQL</a></nav>
+<a href="/tx-priority">Priority</a>{_private_nav()}<a href="/sql">SQL</a></nav>
 <hr><main id="main">{body}</main>
 {TIMER_JS}
 {THEME_JS}
