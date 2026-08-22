@@ -365,11 +365,14 @@ The requests go out in <b>parallel</b> and their statements are
         {UPDATE_INTERVAL} s cycle. If a run does overrun, the updater simply
         starts the next one when it ends.<br>
         The step's line on <a href="/update-status">/update-status</a> reports
-        <code>N statements, M rows (x%)</code>: how much of what it fetched
-        was actually NEW. Since the cycle's steps take disjoint shards of the
-        filler pools (2026-08-15) that runs at 80-100%; a sustained low
-        percentage means the walks are re-fetching stored pages and is worth
-        investigating before raising the number above.</p>"""
+        <code>N request(s), S statements, M rows inserted</code>. It used to
+        print M as a percentage of S — the share of what it fetched that was
+        actually new — but since 2026-08-21 the item-type walk sends one
+        statement per <i>page</i> and pre-filters the rows it already holds,
+        so statements and rows are no longer the same unit and the ratio would
+        read several hundred percent. <b>N</b> is now the number to watch: it
+        should equal the configured request count, and a run that buys fewer
+        means the filler pools ran dry.</p>"""
 
 
 def page_stats(q: dict) -> str:

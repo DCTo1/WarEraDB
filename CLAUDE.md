@@ -218,14 +218,22 @@ Every mixed API batch made by `update_battles.py` / `update_live.py` /
    **`battleLoot` joined the type list 2026-08-21** — 30 codes, one stream each, and for it
    the outer `itemCode` IS the looted item; it was the measured unattended hole below, and
    29 of its 30 streams finished within ~20 min of being added.
-   Each stream walks one SLICE of history at a time, split into `ITEM_TYPE_TX_BUCKETS` (20)
-   `tx_walk` bands, and the slices climb from the stream's floor upward — coverage is 100 %
+   Each stream walks one SLICE of history at a time, split into `tx_walk` bands, and the
+   slices climb from the stream's floor upward — coverage is 100 %
    inside 60 days and 71-93 % past 120 d, so oldest-first yields new rows immediately.
-   **Bands are sized in ROWS, not clock time** (`ITEM_TYPE_TX_TARGET_ROWS` = 5,000 ≈ 50 pages):
+   **Bands are sized in ROWS, not clock time** (`ITEM_TYPE_TX_TARGET_ROWS` = 2,500 ≈ 25 pages):
    5,000 rows is 38 min of `dismantleItem` in 2026-08, 6.2 h of it in 2026-01 and 13 days of
    `openCase`/`case2` down there, so `_slice_top` asks our own stored rows where the
-   slice's 100,000th row sits rather than extrapolating a density (which was wrong by 3x —
-   these streams grew ~10x across the period a slice can span). The watermark only moves when EVERY band of a slice
+   slice's last row sits rather than extrapolating a density (which was wrong by 3x —
+   these streams grew ~10x across the period a slice can span). The band COUNT is sized per
+   stream from the rows still ahead of its watermark (`_buckets`, a BOUNDED count), between
+   `ITEM_TYPE_TX_BUCKETS` (20) and `ITEM_TYPE_TX_MAX_BUCKETS` (100) — a flat 20 was the
+   2026-08-20 shape and it starves as the finite streams finish: two remaining combos offered
+   40 units in total, so a 10-request boost bought ONE request and every cycle step re-offered
+   the same pages. Bands are the walk's LATENCY (a sequential chain) and their count is its
+   parallelism. `make_bands` clamps to `MAX_BATCH` unless the caller passes its own `cap`,
+   which this filler does — `tx_walk`'s own callers send a whole wave in one request, this one
+   spreads its bands over many. The watermark only moves when EVERY band of a slice
    retires, and it is stored in `tx_item_type_walks` (migration_27) so a `state/` reset
    resumes instead of re-walking ~451 K pages. `top_ms` is a ceiling captured at bootstrap —
    rows created above it are the 72 h window step's. AHEAD of the user walks for filler 3's
@@ -241,8 +249,12 @@ Every mixed API batch made by `update_battles.py` / `update_live.py` /
    over 12 `battleLoot` streams: 193 rows judged missing by the WHERE clause, 193 by the probe.
    Measured 2026-08-20: filtered pages cost ~0.27 s at EVERY depth (vs 2.30 s for an
    unfiltered page 24 h deep) and 50 of them come back in 1.29 s, so all 45 M rows of the
-   three types are ~3.2 h of pure API time; in production it ran at ~800 pages/min with
-   100.0 items/page and ~6 % of the rows genuinely new.
+   three types are ~3.2 h of pure API time. Parallel *requests* of filtered pages scale
+   almost freely too (2026-08-21: 20 requests × 50 calls = **1,000 pages / 100,000 items in
+   2.49 s**, 0 errors) — the serialisation described under `--backfill-calls` is a property of
+   deep UNFILTERED window pages, not of these. In production the walk went from 73 pages/min
+   of real progress at 3.0x duplication to **1,953 pages/min at 1.31x** (boost 10) and
+   **3,412 pages/min** (boost 20).
 5. **user walk** by XP rank (`userId` filter bypasses the window — full lifetime history).
    Each user's walk starts at their account's ObjectID second (`fillers._user_floor_ms`,
    clamped to the first transaction in existence) — never at a global floor, and never from
@@ -309,7 +321,20 @@ halves are pipelined: the requests go out in PARALLEL (like `update_live.py`'s r
 each wave's statements are flushed by a background writer thread while the next wave is in flight
 (`FillerPool.take_stmts` hands the buffers over; `stmts()` stays non-destructive for the other four
 consumers). A failed flush skips `save_state`, so cursors never advance past unstored pages.
-Measured 2026-08-15 at N=4: ~5s wall for ~2.8s of API + ~3.6s of flush, ~15K statements.
+Measured 2026-08-21 at N=10: 3.6s wall (2.4s api, 1.6s flush overlapped), 500 pages; at N=20:
+~6.5s wall, ~875 statements, ~16K rows genuinely new per cycle, 0 failed calls, 0 deadlocks.
+An empty `top_up` ends the run **only when nothing is in flight** — with requests overlapping
+it usually means every ready unit is already out and its next page needs the cursor the pending
+response carries, so the run waits for one, collects it, and asks again. Reading that as
+"drained" is what limited a configured ten requests to ONE until 2026-08-21 (`filler boost: 1
+request(s), 3070 statements, 0 rows`), because the fillers' per-run dedupe had handed the whole
+pool to the first batch; `ItemTypeTxFiller` now releases each unit as its page is collected,
+which is what makes the retry productive. Its step line reports `N request(s), S statements,
+M rows inserted` — **N is the number to watch** (it should equal the configured count). The old
+`M/S` percentage was retired the same day: one statement can now carry a whole page, so the two
+are no longer the same unit. To judge duplicate FETCHES, sample the band cursors in
+`state/item_type_tx_state.json` against that window's `stats.pages` — see
+`extra/ITEM_TYPE_TX_PARALLELISM_PLAN.md`.
 Pools stop naturally once drained. State lives in `state/*.json` (gitignored, regenerable); since
 the viewer's cycle steps run as parallel subprocesses, filler state writes are serialized under a
 flock (`state/.filler_pool.lock`) —

@@ -155,20 +155,37 @@ ITEM_TYPE_TX_TYPES = ["openCase", "craftItem", "dismantleItem", "battleLoot"]
 # How many buckets one combo's current slice splits into (its parallelism —
 # each bucket is a sequential cursor chain, so the COUNT is what lets a combo
 # occupy many slots of one batch), and how often discovery re-scans for new
-# (type, code) pairs. 20 x 4 combos = 80 ready units, comfortably more than
-# one batch's slack.
+# (type, code) pairs.
+#
+# The count is sized PER COMBO from the rows still ahead of its watermark
+# (_buckets), between these two bounds. A flat 20 was the 2026-08-20 shape and
+# it starves the moment the finite streams start finishing: with two combos
+# left it offers 40 units in total, so a 10-request boost (500 slots) buys ONE
+# request and every other cycle step re-offers the same 40 pages — measured
+# 2026-08-21 at 330 API pages for 109 pages of progress, and a boost flush of
+# 3,070 statements that inserted 0 rows. The MAX is what a long-tail stream
+# needs to fill several parallel requests on its own; the MIN keeps a nearly
+# finished stream (battleLoot|jet, 2,213 rows all told) from collapsing to a
+# single sequential chain.
 ITEM_TYPE_TX_BUCKETS = 20
+ITEM_TYPE_TX_MAX_BUCKETS = 100
 ITEM_TYPE_TX_DISCOVER_INTERVAL_S = 900
 
 # Band size, in ROWS rather than in clock time: traffic per combo spans
 # 372/day (openCase/case2 in 2025-12) to 187,000/day (dismantleItem/scraps in
 # 2026-08), so a fixed span would be 4 pages of one and 1,874 of the other.
-# 5,000 rows = 50 pages is the sequential depth of one band; where that lands
+# 2,500 rows = 25 pages is the sequential depth of one band; where that lands
 # in clock time is asked of our own stored rows per slice (_slice_top).
 # MIN_SPAN only guarantees a slice make_bands can split; DEFAULT_SPAN is for
 # the stretches where we hold no rows at all and so have no evidence either
 # way (an empty band costs a single page).
-ITEM_TYPE_TX_TARGET_ROWS = 5000
+#
+# It was 5,000 until 2026-08-21. A band is the walk's unit of LATENCY (a
+# sequential chain) and the band count its parallelism, so halving the depth
+# while raising the ceiling on the count (ITEM_TYPE_TX_MAX_BUCKETS) buys the
+# same slice in a quarter of the waves — and retires bands, and so advances
+# the watermark, about as often as before rather than 5x less often.
+ITEM_TYPE_TX_TARGET_ROWS = 2500
 ITEM_TYPE_TX_MIN_SPAN_MS = 15 * 60_000
 ITEM_TYPE_TX_DEFAULT_SPAN_MS = 6 * 3_600_000
 
@@ -777,7 +794,7 @@ ON CONFLICT (entity_id) DO NOTHING;"""
         completion stamps travel with the items they follow, so an entity is
         never marked scraped before its rows are stored."""
         out = self.stmts()
-        self._pages = []
+        self._items = []
         self._marks = []
         return out
 
@@ -992,7 +1009,7 @@ WHERE transaction_type_id = (SELECT id FROM transaction_types WHERE type = '{typ
     # It fails OPEN: a type or code we have never stored makes its subselect
     # NULL, `have` empty, and every row insert. It can never skip a row we do
     # not hold — verified 2026-08-21 against an independent per-id probe over
-    # 12 battleLoot streams, 1,153 rows: 193 rows judged missing by this WHERE
+    # 12 battleLoot streams, 1,153 rows: 193 judged missing by this WHERE
     # clause, 193 by the probe, on every page.
     #
     # NOTE for whoever reads update_filler_boost's "N rows (M%)" line: for this
@@ -1151,6 +1168,14 @@ WHERE objectid_to_uuid(e->>'_id') NOT IN (SELECT transaction_id FROM have);"""
                 stats["items"] = stats.get("items", 0) + len(kept)
                 if all(b.get("done") for b in bands):
                     self._close_slice(key, e)
+            # This unit's cursor has MOVED, so it is offerable again — which is
+            # what lets one boost run chain a band several pages deep instead
+            # of stopping at one page per band per cycle (the per-run dedupe
+            # only exists to stop two IN-FLIGHT requests carrying the same
+            # page). Deliberately not done on the error path above: that unit
+            # keeps its cursor and is better retried next cycle than re-sent
+            # into an endpoint that just failed.
+            self._offered.discard((key, kind, idx))
         if self._dirty:
             stats["pages"] = stats.get("pages", 0) + len(slots)
 
@@ -1229,7 +1254,7 @@ WHERE objectid_to_uuid(e->>'_id') NOT IN (SELECT transaction_id FROM have);"""
         watermark and the completion stamp travel with the rows they follow,
         so neither can ever describe data that was not stored."""
         out = self.stmts()
-        self._items = []
+        self._pages = []
         self._marks = []
         self._done = []
         return out
@@ -1331,20 +1356,44 @@ WHERE objectid_to_uuid(e->>'_id') NOT IN (SELECT transaction_id FROM have);"""
         return max(TX_EPOCH_MS, int(rows[0][0].timestamp() * 1000) - 86_400_000)
 
     def _carve(self, key: str, e: dict) -> None:
-        """Split the next slice above the watermark into ITEM_TYPE_TX_BUCKETS
-        bands of ~ITEM_TYPE_TX_TARGET_ROWS rows each."""
+        """Split the next slice above the watermark into bands of
+        ~ITEM_TYPE_TX_TARGET_ROWS rows each, as many of them as the stream has
+        history left to justify (_buckets)."""
         ttype, code = key.split("|")
         lo = int(e["covered_to_ms"])
-        top = self._slice_top(ttype, code, lo, int(e["top_ms"]))
-        bands = make_bands(lo, top, ITEM_TYPE_TX_BUCKETS)
+        n = self._buckets(ttype, code, lo, int(e["top_ms"]))
+        top = self._slice_top(ttype, code, lo, int(e["top_ms"]), n)
+        bands = make_bands(lo, top, n, cap=ITEM_TYPE_TX_MAX_BUCKETS)
         if not bands:
             return
         e["buckets"] = bands
         e["slice_top_ms"] = top
 
-    def _slice_top(self, ttype: str, code: str, lo: int, ceiling: int) -> int:
+    def _buckets(self, ttype: str, code: str, lo: int, ceiling: int) -> int:
+        """How many parallel bands this combo's next slice deserves.
+
+        A stream with a long tail left gets the MAX (its bands are what fill
+        the boost's parallel requests); one that is nearly finished gets the
+        MIN, because splitting 2,000 remaining rows 100 ways is 100 calls to
+        read 20 rows each. Sized from the rows we already hold above the
+        watermark, which is the same evidence _slice_top uses.
+
+        The count is BOUNDED (LIMIT), never a full count(*): the two long-tail
+        streams hold ~19 M rows above their watermark and the answer stops
+        mattering at MAX_BUCKETS x TARGET_ROWS.
+        """
+        want = ITEM_TYPE_TX_MAX_BUCKETS * ITEM_TYPE_TX_TARGET_ROWS
+        rows = query("SELECT count(*) FROM (SELECT 1 FROM transactions\n"
+                     + self._where(ttype, code, lo, ceiling)
+                     + f"\nLIMIT {want}) x;", self.db)
+        have = int(rows[0][0]) if rows and rows[0][0] is not None else 0
+        n = -(-have // ITEM_TYPE_TX_TARGET_ROWS)     # ceil
+        return max(ITEM_TYPE_TX_BUCKETS, min(ITEM_TYPE_TX_MAX_BUCKETS, n))
+
+    def _slice_top(self, ttype: str, code: str, lo: int, ceiling: int,
+                   buckets: int) -> int:
         """Top of the next slice: the point above *lo* holding
-        BUCKETS x TARGET_ROWS rows of this combo.
+        *buckets* x TARGET_ROWS rows of this combo.
 
         Asked EXACTLY, as the timestamp of the (BUCKETS x TARGET_ROWS)-th row
         we already hold above the watermark, rather than extrapolated from a
@@ -1361,7 +1410,7 @@ WHERE objectid_to_uuid(e->>'_id') NOT IN (SELECT transaction_id FROM have);"""
         and NO rows there at all means we have no evidence, so the stretch is
         walked in cheap default-sized steps (an empty band costs one page).
         """
-        want = ITEM_TYPE_TX_TARGET_ROWS * ITEM_TYPE_TX_BUCKETS
+        want = ITEM_TYPE_TX_TARGET_ROWS * buckets
         rows = query(
             "SELECT created_at FROM transactions\n"
             + self._where(ttype, code, lo, ceiling)
@@ -1373,12 +1422,11 @@ WHERE objectid_to_uuid(e->>'_id') NOT IN (SELECT transaction_id FROM have);"""
             if probe:
                 return ceiling     # the remainder holds less than one slice
             return min(ceiling,
-                       lo + ITEM_TYPE_TX_DEFAULT_SPAN_MS * ITEM_TYPE_TX_BUCKETS)
+                       lo + ITEM_TYPE_TX_DEFAULT_SPAN_MS * buckets)
         top = int(rows[0][0].timestamp() * 1000)
         # never carve a slice so thin that make_bands cannot split it — a
         # burst of `want` rows inside one second would otherwise stall the walk
-        return min(ceiling, max(lo + ITEM_TYPE_TX_MIN_SPAN_MS * ITEM_TYPE_TX_BUCKETS,
-                                top))
+        return min(ceiling, max(lo + ITEM_TYPE_TX_MIN_SPAN_MS * buckets, top))
 
     @staticmethod
     def _where(ttype: str, code: str, lo: int, hi: int) -> str:

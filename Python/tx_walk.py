@@ -60,18 +60,25 @@ def band_count(from_ms: int, to_ms: int) -> int:
     return max(1, min(MAX_BATCH, -(-span // BAND_SPAN_MS)))
 
 
-def make_bands(from_ms: int, to_ms: int, n: int | None = None) -> list[dict]:
+def make_bands(from_ms: int, to_ms: int, n: int | None = None,
+               cap: int = MAX_BATCH) -> list[dict]:
     """Split [from_ms, to_ms] into n contiguous bands, newest first.
 
     Band i owns (bottom, top]; its seed cursor is make_cursor(top), which is
     inclusive of top's own millisecond (utils.MAX_OID), so no item at a seam
     can fall between two bands. The one-ms overlap that creates is absorbed
     by the ON CONFLICT upsert.
+
+    *cap* defaults to MAX_BATCH because this module's own callers walk a whole
+    wave in ONE tRPC request, where more bands than a request can hold would
+    simply never be sent. A caller that spreads its bands over many requests
+    passes its own ceiling — fillers.ItemTypeTxFiller does, since for it the
+    band count IS the parallelism it offers the filler pool.
     """
     if to_ms <= from_ms:
         return []
     span = to_ms - from_ms
-    n = max(1, min(n if n else band_count(from_ms, to_ms), MAX_BATCH))
+    n = max(1, min(n if n else band_count(from_ms, to_ms), max(1, cap)))
     step = span / n
     bands = []
     for i in range(n):

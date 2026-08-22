@@ -53,8 +53,13 @@ the other requests overlap it, and the DB flush overlaps them in turn.
 Two limits bound the run:
   * --budget seconds (default 10) stops NEW submissions (in-flight ones
     are always drained), so a slow API can't drag the step out;
-  * an empty top_up ends the run — when a filler pool has nothing pending
-    the request is not bought.
+  * an empty top_up with NOTHING IN FLIGHT ends the run — when a filler
+    pool has nothing pending the request is not bought. With requests in
+    flight an empty top_up means only that every ready unit is already out
+    (its next page needs the cursor the pending response carries), so the
+    run waits for one, collects it, and asks again. Reading that case as
+    "drained" is what limited a configured ten requests to one until
+    2026-08-21 — see the main loop.
 
 That second guarantee is WEAKER than update_priority_tx.py's: the window
 buckets, itemMarket codes and user walks do drain, but the user-lite
@@ -89,17 +94,25 @@ DEFAULT_BUDGET = 10.0
 
 # Rows the flush actually INSERTED into transactions, read inside the flush's
 # own transaction (pg_stat_xact_all_tables is transaction-local, so the other
-# cycle steps writing at the same time don't leak in). Paired with the
-# statement count it gives the duplicate rate — the number that says whether
-# the fillers are fetching pages some other cycle step already fetched this
-# cycle, which is invisible from the API side (every duplicate is a perfectly
-# valid page, it just lands on ON CONFLICT DO NOTHING). It is what showed
-# both the 7-59% baseline and the 82-104% after the filler shards landed.
+# cycle steps writing at the same time don't leak in).
 #
-# A SIGNAL, NOT AN AUDIT: it occasionally reads a few percent above 100 —
-# postgres' pending per-table counters are flushed on a timer, so a little of
-# the previous wave's work can still be attached to the connection when the
-# next wave reads them. Treat single-digit differences as noise.
+# This used to be printed as a PERCENTAGE of the statement count — the
+# duplicate rate, the number that says whether the fillers are fetching pages
+# another cycle step already fetched this cycle, invisible from the API side
+# because every duplicate is a perfectly valid page that just lands on ON
+# CONFLICT DO NOTHING. It is what showed both the 7-59 % baseline and the
+# 82-104 % after the filler shards landed.
+#
+# That ratio DIED on 2026-08-21, when ItemTypeTxFiller.STORE_SQL started
+# sending one statement per PAGE instead of one per row (and pre-filtering the
+# rows we already hold): 200 statements inserting 1,968 rows printed "984 %".
+# Rows and statements are now different units, so the count is printed raw.
+# Judging duplicate FETCHES needs the band-advance sample in
+# extra/ITEM_TYPE_TX_PARALLELISM_PLAN.md instead.
+#
+# A SIGNAL, NOT AN AUDIT either way: postgres' pending per-table counters are
+# flushed on a timer, so a little of the previous wave's work can still be
+# attached to the connection when the next wave reads them.
 ROWS_SQL = """
 SELECT coalesce(sum(st.n_tup_ins), 0)
 FROM pg_stat_xact_all_tables st
@@ -215,7 +228,20 @@ def main() -> int:
             calls: list[tuple[str, dict]] = []
             _, req = pool.top_up(calls)
             if not calls:
-                stop = True  # nothing pending — don't buy an empty request
+                # An empty top_up means "nothing pending" only when nothing is
+                # in flight. With requests overlapping it usually means the
+                # opposite — every ready unit is already out, and its NEXT
+                # page needs the cursor the pending response carries — so the
+                # right move is to wait for one and ask again, not to stop.
+                # Reading it as "drained" is what bought ONE request out of a
+                # configured ten (measured 2026-08-21: `filler boost: 1
+                # request(s), 3070 statements, 0 rows (0%)`), because the
+                # fillers' per-run dedupe had handed the whole pool to the
+                # first batch. The fillers release each unit as its page is
+                # collected (ItemTypeTxFiller.collect), which is what makes
+                # the retry productive.
+                if not inflight:
+                    stop = True  # genuinely nothing pending — buy nothing
                 break
             if started and SUBMIT_STAGGER:
                 time.sleep(SUBMIT_STAGGER)
@@ -275,8 +301,7 @@ def main() -> int:
     # a boosted cycle past UPDATE_INTERVAL (the updater then starts the next
     # run when this one finishes; scheduler_loop defers by half an interval
     # while a run is in flight).
-    hit = (f", {w['rows']:,} rows ({w['rows'] / w['stmts'] * 100:.0f}%)"
-           if w["stmts"] else "")
+    hit = f", {w['rows']:,} rows inserted" if w["stmts"] else ""
     print(f"  filler boost: {sent} request(s), {w['stmts']} statements{hit}, "
           f"{time.time() - t0:.1f}s wall ({t_api:.1f}s api, {w['secs']:.1f}s "
           f"flush overlapped)")
