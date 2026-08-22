@@ -30,10 +30,13 @@ done
 # Type checking
 .venv/bin/pyright Python/ extra/
 
-# The one automated test: an offline proof that no transaction walk loses a
-# same-millisecond block bigger than a page. No DB, no API key, no network —
-# run it after touching fillers.py or tx_walk.py. Exit 0 = every walk clean.
+# The automated tests: offline proofs. No DB, no API key, no network.
+# 1. No transaction walk loses a same-millisecond block bigger than a page.
+#    Run after touching fillers.py or tx_walk.py. Exit 0 = every walk clean.
 .venv/bin/python tests/test_tie_walks.py
+# 2. The 72h window catch-up never claims a range it could not fetch (the
+#    below-the-edge case). Run after touching update_tx_window.py or tx_walk.py.
+.venv/bin/python tests/test_window_edge.py
 
 # (extra/test_roundtrip.py and extra/bench_queries.py are standalone manual
 # scripts against a live DB, not pytest.)
@@ -135,9 +138,22 @@ data is reachable only via per-entity filters: `userId` / `itemCode`). It is own
   `[edge, watermark]` with its bands parked under a *distinct* key (`backfill_pending`) and
   resumed a slice at a time until every one retires, once, forever (`backfill_done`). The
   watermark advances **only when every band retires**; unfinished bands are parked in
-  `state["pending"]` and resumed next cycle, so any length of downtime self-heals. `pending`
-  non-empty for more than a couple of cycles is the "not keeping up" signal and is shown on
-  `/stats`.
+  `state["pending"]` and resumed next cycle, so downtime up to the window length self-heals.
+  `pending` non-empty for more than a couple of cycles is the "not keeping up" signal and is shown
+  on `/stats`.
+  **Beyond the window length it cannot self-heal, and since 2026-08-22 it no longer pretends to.**
+  The endpoint serves 0 items — not an error — below the edge, and `tx_walk.advance` retires a band
+  on an empty page, so after an outage longer than 72 h every band down there retired on its first
+  page, `walk_range` reported no unfinished band, and the watermark jumped the whole way to now:
+  the aged-out hours were written off with no warning and no record (measured offline on an 80 h
+  outage: 8 h gone, 6 empty pages, "closed"). `_backfill` had guarded this since it was written
+  (`_trim_bands`); the catch-up — the path that actually experiences outages — never did. It is the
+  THIRD way a range can fail to be covered, "I cannot cover it", after "I stopped early" and the
+  retired `TransactionFiller`'s "my page cap ran out", and all three used to look identical from
+  outside. The catch-up is now clamped to the edge and records what it skipped as merged spans in
+  `state["unreachable"]`, printed by `--verify` and shown on `/stats`. Those rows are NOT lost from
+  the API — `userId`/`itemCode`/`countryId` bypass the window, so fillers 3-6 still reach them;
+  the record is what tells anyone to go looking. `tests/test_window_edge.py` is the regression gate.
   The backfill's slice is budgeted by `--backfill-calls` (pages per wave, default 4) **and**
   `--backfill-seconds` (default 10) because a page costs more the deeper it is (measured
   2026-08-18: 0.24 s at the edge, 1.02 s at 6 h, 2.30 s at 24 h) and **the API serialises our

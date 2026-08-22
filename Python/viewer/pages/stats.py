@@ -199,6 +199,14 @@ def _filler_table(f: dict, tx: dict, im: dict, et: dict, it: dict, ut: dict,
     window_state = ("up to date" if not pending
                     else f"⚠ {len(pending)} catch-up band(s) still open — "
                          f"watermark HELD until they close")
+    # Hours that aged past the 72h edge before the catch-up reached them —
+    # an outage longer than the window. Unreachable from THIS endpoint, but
+    # the per-entity/itemCode fillers can still recover them.
+    lost = tx.get("unreachable") or []
+    if lost:
+        lost_h = sum(sp["to_ms"] - sp["from_ms"] for sp in lost) / 3600_000
+        window_state += (f" · ⚠ {lost_h:.1f}h in {len(lost)} span(s) aged out "
+                         f"unwalked (see update_tx_window.py --verify)")
 
     rows = [
         ("tx window", f"72 h window, watermark {lag}",

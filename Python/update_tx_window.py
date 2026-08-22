@@ -27,6 +27,15 @@ Python/recover_tx_gap.py — is harmless:
      everything in between — ~20-35 min of transactions per stall, twice
      observed, with no log line. See extra/BUGFIX_PLAN.md section 1.
 
+     It is also clamped to the window EDGE (2026-08-22). The endpoint serves
+     0 items — not an error — below the edge, and tx_walk retires a band on
+     an empty page, so after an outage longer than the window every band
+     down there retired instantly and the walk reported the range covered.
+     Those hours are now clamped off the walk and recorded in
+     state["unreachable"] (shown by --verify and on /stats) instead of being
+     written off silently. They remain reachable through the userId /
+     itemCode / countryId filters, so the history fillers can still get them.
+
   2. BACKFILL — the cold start: the SAME walk over [edge, watermark], its
      bands parked in state["backfill_pending"] (a distinct key — confusing
      the two walks' state is how the retired TransactionFiller lost data)
@@ -97,10 +106,22 @@ BACKFILL_BANDS = MAX_BATCH
 # still records a top and some rows. BACKFILL covers everything below it.
 COLD_START_MS = 60_000
 
+# How many merged unreachable spans state["unreachable"] keeps. They only
+# accrue from outages longer than the window, and adjacent ones fold into
+# one, so this is a bound on a pathological case, not an expected size.
+MAX_UNREACHABLE_SPANS = 50
+
 DEFAULT_STATE = {"newest_id": None, "newest_ms": None, "pending": [],
                  "pending_top_ms": None, "backfill_pending": [],
                  "backfill_top_ms": None, "backfill_done": False,
-                 "window_hours": DEFAULT_WINDOW_HOURS, "stats": {}}
+                 "window_hours": DEFAULT_WINDOW_HOURS, "unreachable": [],
+                 "stats": {}}
+
+
+def _unreachable_ms(state: dict) -> int:
+    """Total wall time the rolling window dropped before we walked it."""
+    return sum(sp["to_ms"] - sp["from_ms"]
+               for sp in (state.get("unreachable") or []))
 
 
 def _iso(ms: int) -> str:
@@ -124,7 +145,32 @@ def _save_state(state: dict) -> None:
     write_json(STATE_FILE, state)
 
 
-def _catch_up(s, db: str, state: dict, now_ms: int, max_waves: int) -> dict:
+def _note_unreachable(state: dict, from_ms: int, to_ms: int) -> None:
+    """Record a span the rolling window dropped before we could walk it.
+
+    Kept as MERGED spans rather than a running total: one outage is clamped
+    again on every cycle until the catch-up finally closes, so accumulating
+    `edge - watermark` each time would count the same hours over and over,
+    and a single (from, to) pair would swallow the healthy stretch between
+    two separate outages. Overlapping/adjacent spans fold into one, so a
+    week-long outage stays a single entry.
+    """
+    if to_ms <= from_ms:
+        return
+    spans = [dict(x) for x in (state.get("unreachable") or [])]
+    spans.append({"from_ms": from_ms, "to_ms": to_ms})
+    spans.sort(key=lambda x: x["from_ms"])
+    merged: list[dict] = []
+    for sp in spans:
+        if merged and sp["from_ms"] <= merged[-1]["to_ms"]:
+            merged[-1]["to_ms"] = max(merged[-1]["to_ms"], sp["to_ms"])
+        else:
+            merged.append(dict(sp))
+    state["unreachable"] = merged[-MAX_UNREACHABLE_SPANS:]
+
+
+def _catch_up(s, db: str, state: dict, now_ms: int, max_waves: int,
+              edge_ms: int) -> dict:
     """Cover (newest_ms, now_ms] with a parallel band walk.
 
     Resumes state["pending"] first (the bands a previous cycle ran out of
@@ -139,11 +185,46 @@ def _catch_up(s, db: str, state: dict, now_ms: int, max_waves: int) -> dict:
     had already completed and committed its rows — leaving the watermark
     pinned forever behind a walk that keeps succeeding.
 
+    EDGE CLAMP (2026-08-22). Everything above is about not confusing "I
+    stopped early" with "the range is covered". This clamp is the third
+    reading of a range that is not covered — "I CANNOT cover it" — and until
+    now the walk could not tell it from success either. The unfiltered
+    endpoint serves nothing below the 72 h edge (a cursor older than the
+    window returns 0 items, not an error), so a band down there gets an
+    empty page, and tx_walk.advance retires a band on an empty page. After
+    an outage longer than the window, every band below the edge therefore
+    retired instantly, the walk reported no unfinished band, and the
+    watermark jumped the whole way to now — writing the unreachable hours
+    off with no warning and no record. Verified offline against an 80 h
+    outage: 8 h below the edge, 6 empty pages, "closed", watermark advanced.
+    _backfill has guarded this since it was written (_trim_bands, whose
+    docstring calls out the same failure); the catch-up, which is the path
+    that actually experiences outages, never did.
+
+    So: clamp the walk to the edge, drop parked bands that have aged out
+    under it, and record what was skipped in state["unreachable"] instead of
+    pretending it was walked. Those rows are gone from THIS endpoint but not
+    from the API — the userId / itemCode / countryId filters bypass the
+    window — so fillers 3-6 can still reach them, and the record is what
+    tells anyone to go looking.
+
     Returns a summary dict for the caller's log line.
     """
     from_ms = state.get("newest_ms") or (now_ms - COLD_START_MS)
+    if from_ms < edge_ms:                       # aged out while we were away
+        _note_unreachable(state, from_ms, edge_ms)
+        from_ms = edge_ms
     pending = [b for b in (state.get("pending") or []) if not b.get("done")]
-    top_ms = state.get("pending_top_ms") or from_ms
+    for b in pending:                           # parked bands can age out too
+        # Measured from the band's BOTTOM, not from where its cursor got to:
+        # the cursor is an opaque token and decoding it here would couple this
+        # to the wire format for a number that is only ever reported. It is
+        # therefore an over-estimate by whatever the band had already walked
+        # below the edge — bounded by one band's span, and only reachable at
+        # all during an outage longer than the window.
+        _note_unreachable(state, b["bottom_ms"], min(b["top_ms"], edge_ms))
+    pending = _trim_bands(pending, edge_ms)
+    top_ms = max(state.get("pending_top_ms") or from_ms, edge_ms)
     # Fresh bands go FIRST so the newest data keeps flowing while a backlog
     # drains; walk_range only ever sends MAX_BATCH pages per wave.
     room = max(1, MAX_BATCH - len(pending))
@@ -153,7 +234,8 @@ def _catch_up(s, db: str, state: dict, now_ms: int, max_waves: int) -> dict:
     if not bands:
         state["pending"] = []      # nothing open and nothing new to open
         return {"from_ms": from_ms, "to_ms": now_ms, "bands": 0, "waves": 0,
-                "pages": 0, "stored": 0, "pending": 0, "closed": True}
+                "pages": 0, "stored": 0, "pending": 0, "closed": True,
+                "lost_ms": _unreachable_ms(state)}
 
     seen = {"waves": 0, "pages": 0}
 
@@ -180,10 +262,12 @@ def _catch_up(s, db: str, state: dict, now_ms: int, max_waves: int) -> dict:
     stats["pages"] = stats.get("pages", 0) + seen["pages"]
     stats["items"] = stats.get("items", 0) + stored
     stats["pending"] = len(unfinished)
+    stats["unreachable_ms"] = _unreachable_ms(state)
     _save_state(state)
     return {"from_ms": from_ms, "to_ms": now_ms, "bands": len(bands),
             "waves": seen["waves"], "pages": seen["pages"], "stored": stored,
-            "pending": len(unfinished), "closed": not unfinished}
+            "pending": len(unfinished), "closed": not unfinished,
+            "lost_ms": _unreachable_ms(state)}
 
 
 def _trim_bands(bands: list[dict], edge_ms: int) -> list[dict]:
@@ -293,7 +377,8 @@ def run_cycle(s, db: str, state: dict, window_hours: float, max_waves: int,
     state["window_hours"] = window_hours
     state.setdefault("stats", {})["cycles"] = state["stats"].get("cycles", 0) + 1
 
-    cu = _catch_up(s, db, state, now_ms, max_waves)   # persists its own outcome
+    # persists its own outcome
+    cu = _catch_up(s, db, state, now_ms, max_waves, edge_ms)
 
     # A backfill failure must NOT bury the catch-up: the catch-up is the
     # live-integrity path (already committed and persisted above), while the
@@ -322,6 +407,15 @@ def run_cycle(s, db: str, state: dict, window_hours: float, max_waves: int,
         print(f"  ⚠ catch-up incomplete: {cu['pending']} band(s) still open — "
               f"watermark HELD at {_iso(cu['from_ms'])} UTC, resuming next cycle",
               flush=True)
+    if cu.get("lost_ms"):
+        spans = state.get("unreachable") or []
+        print(f"  ⚠ {cu['lost_ms'] / 3600_000:.1f}h of the transaction stream "
+              f"aged past the {window_hours:g}h window before it was walked, in "
+              f"{len(spans)} span(s); oldest {_iso(spans[0]['from_ms'])} -> "
+              f"{_iso(spans[0]['to_ms'])} UTC. The unfiltered endpoint can no "
+              f"longer serve these — the userId/itemCode/countryId filters still "
+              f"can, so the history fillers will recover them. "
+              f"`update_tx_window.py --verify` lists every span.", flush=True)
     if backfill_err:
         print(f"  ⚠ backfill wave failed ({backfill_err}) — resumes next cycle; "
               f"the catch-up above is unaffected", flush=True)
@@ -426,6 +520,15 @@ def verify(db: str) -> int:
         oldest = min(b["bottom_ms"] for b in bf_pending)
         print(f"  backfill: {len(bf_pending)} band(s) open covering "
               f"{left_ms / 3600_000:.1f}h, oldest bottom {_iso(oldest)} UTC")
+    lost = state.get("unreachable") or []
+    if lost:
+        print(f"  ⚠ {_unreachable_ms(state) / 3600_000:.1f}h never walked by this "
+              f"endpoint — it aged past the window first (outage longer than "
+              f"{hours:g}h). Still reachable through the per-entity/itemCode "
+              f"filters, i.e. the history fillers:")
+        for sp in lost:
+            print(f"      {_iso(sp['from_ms'])} -> {_iso(sp['to_ms'])} UTC "
+                  f"({(sp['to_ms'] - sp['from_ms']) / 3600_000:.1f}h)")
     return 0
 
 
