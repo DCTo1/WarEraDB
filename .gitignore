@@ -4,3 +4,9 @@ extra/
 Python/__pycache__
 state/
 .claude/
+
+# Generated dumps, regenerable and large: export_users_csv.py writes users.csv
+# into the repo root by default, and the coverage audit's row dumps land beside
+# it. Keep the working copies in extra/ instead.
+/users.csv
+/missing_rows.json

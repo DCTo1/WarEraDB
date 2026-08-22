@@ -55,6 +55,11 @@ done
 .venv/bin/python Python/audit_tx_coverage.py battleLoot jet tank
 .venv/bin/python Python/audit_tx_coverage.py battleLoot --span 2026-05-01..2026-06-01
 
+# Seed users we could never discover ourselves (never fought, never traded) from an
+# external id list. Writes the same placeholder row the discovery paths write, so the
+# user-lite backfill fills it in later. Idempotent; --verify reports without writing.
+.venv/bin/python Python/import_user_ids.py extra/userids-2026-08-21.csv --verify
+
 # Web viewer (auto-updates the DB every 15s; must set WARERA_DB_URL)
 WARERA_DB_URL='postgresql+psycopg://postgres:postgres@localhost:5432/{db}' \
   .venv/bin/python Python/db_web.py        # → http://127.0.0.1:8765
