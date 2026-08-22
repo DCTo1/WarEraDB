@@ -49,6 +49,12 @@ done
 .venv/bin/python Python/update_priority_tx.py --verify   # /tx-priority list state, no API calls
 .venv/bin/python Python/update_filler_boost.py --verify  # what a boost request would carry
 
+# Ground truth: diff a (transactionType, itemCode) stream against the live API.
+# Every --verify above only checks our state against ITSELF; this is the one
+# that can answer "are we missing rows the API would still serve". Read-only.
+.venv/bin/python Python/audit_tx_coverage.py battleLoot jet tank
+.venv/bin/python Python/audit_tx_coverage.py battleLoot --span 2026-05-01..2026-06-01
+
 # Web viewer (auto-updates the DB every 15s; must set WARERA_DB_URL)
 WARERA_DB_URL='postgresql+psycopg://postgres:postgres@localhost:5432/{db}' \
   .venv/bin/python Python/db_web.py        # → http://127.0.0.1:8765
@@ -209,6 +215,9 @@ Every mixed API batch made by `update_battles.py` / `update_live.py` /
    `openCase` / `craftItem` / `dismantleItem` have exactly **four streams** between them:
    `openCase`/`case1`, `openCase`/`case2`, `craftItem`/`scraps`, `dismantleItem`/`scraps`
    (discovered from the last week of `transactions`, so a future `case3` joins on its own).
+   **`battleLoot` joined the type list 2026-08-21** — 30 codes, one stream each, and for it
+   the outer `itemCode` IS the looted item; it was the measured unattended hole below, and
+   29 of its 30 streams finished within ~20 min of being added.
    Each stream walks one SLICE of history at a time, split into `ITEM_TYPE_TX_BUCKETS` (20)
    `tx_walk` bands, and the slices climb from the stream's floor upward — coverage is 100 %
    inside 60 days and 71-93 % past 120 d, so oldest-first yields new rows immediately.
@@ -249,6 +258,23 @@ Every mixed API batch made by `update_battles.py` / `update_live.py` /
    users whose `last_active_at` outran it by a day. Without it a finished user was frozen
    forever and depended entirely on the 72h window step having swept up their activity.
    `WARERA_USER_TX_REFRESH=0` disables it.
+
+**The battleLoot hole, found and closed 2026-08-21 (`Python/audit_tx_coverage.py`).**
+`battleLoot` carries an `itemCode` across 30 codes, so it is auditable and repairable exactly
+like filler 4's other types — but it was NOT in `ITEM_TYPE_TX_TYPES`, so nothing had ever
+re-walked it. An exhaustive diff against the API found **10.7 %** of the 12 rarest codes
+missing (5,575 of 52,109, full history) and **4.0 %** of the 18 big ones across May (11,200 of
+278,118), i.e. **~75 K rows** type-wide, spread over every month from 2026-04 and only tapering
+in 2026-08. The loss was time-clustered on battle-end bursts — 2026-05-08 14:58 holds 3,706
+battleLoot rows against ~0 in every neighbouring minute — the same page-cap signature the
+retired `TransactionFiller` left on `openCase`/`dismantleItem`. Adding the type to
+`ITEM_TYPE_TX_TYPES` was the whole fix (the discovery query already keys on the outer
+`itemCode`); 29 of the 30 streams finished inside ~20 min, and re-auditing says **100.00 %,
+0 missing** on both the rare codes (22,962 rows) and the big ones over May (70,272 rows).
+`trading` probes 100 % and `wage` (no `itemCode`, no secondary entity — reachable only
+per-user) probes clean, so there is no known unattended type left. Re-run the audit after any
+walk change: it is the only check that compares against the API rather than against our own
+state.
 
 `WARERA_FILLERS=0` is the pool-wide kill switch (added 2026-08-17 when the cursor format
 changed under every filler at once; default ON again since the four send sites route through

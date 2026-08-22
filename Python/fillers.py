@@ -133,11 +133,22 @@ ENTITY_TX_DISCOVER_INTERVAL_S = 900
 
 # ItemTypeTxFiller (2026-08-20): the item-bearing transaction types whose full
 # history is walked through the API's itemCode filter. The (type, code) pairs
-# themselves are DISCOVERED from recent data — these three types have only two
-# distinct outer codes between them (case1/case2 for openCase, scraps for
+# themselves are DISCOVERED from recent data — the first three types have only
+# two distinct outer codes between them (case1/case2 for openCase, scraps for
 # craftItem/dismantleItem, measured 2026-08-20), so the list of TYPES is the
-# knob: add "trading" / "battleLoot" here and their codes join on their own.
-ITEM_TYPE_TX_TYPES = ["openCase", "craftItem", "dismantleItem"]
+# knob: add a type here and its codes join on their own.
+#
+# battleLoot joined 2026-08-21. It was the one MEASURED unattended hole in
+# transaction coverage (Python/audit_tx_coverage.py, 2026-08-21): it carries an
+# outer itemCode across 30 codes, so it is repairable exactly like the other
+# three, but nothing had ever re-walked it — an exhaustive API diff found
+# 10.7 % of the 12 rarest codes missing over full history and 4.0 % of the 18
+# big ones across May, ~75 K rows type-wide, time-clustered on battle-end
+# bursts (the retired TransactionFiller's page-cap signature). It is a SMALL
+# addition to this walk: 30 streams, 1,677,190 rows stored, every row carrying
+# an item_code and every code seen in the last week, so ~17.5 K pages — about
+# 1 % of what openCase/dismantleItem still have left.
+ITEM_TYPE_TX_TYPES = ["openCase", "craftItem", "dismantleItem", "battleLoot"]
 
 # How many buckets one combo's current slice splits into (its parallelism —
 # each bucket is a sequential cursor chain, so the COUNT is what lets a combo
@@ -847,9 +858,12 @@ class ItemTypeTxFiller:
     complete stream of history. What it does NOT match is the item NESTED in
     the row: `dismantleItem`+`sniper` returns 0 rows, because the filter reads
     the OUTER `itemCode` — the input / the case, i.e. exactly what
-    transactions.item_code_id stores. So ITEM_TYPE_TX_TYPES' three types have
-    only FOUR streams between them (measured 2026-08-20): openCase/case1,
-    openCase/case2, craftItem/scraps, dismantleItem/scraps.
+    transactions.item_code_id stores. So the first three of
+    ITEM_TYPE_TX_TYPES have only FOUR streams between them (measured
+    2026-08-20): openCase/case1, openCase/case2, craftItem/scraps,
+    dismantleItem/scraps. battleLoot (added 2026-08-21) is the opposite shape
+    — 30 codes, each its own stream, and for it the outer itemCode IS the
+    looted item.
 
     Why this is worth a filler of its own, when the user walks already fetch
     these rows: they fetch them only for users somebody walked. Sampling 3,200
