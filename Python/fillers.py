@@ -53,6 +53,7 @@ handed to the ordinary fillers above. Listed users are excluded from
 UserTxFiller entirely (its _excluded set and its candidate query).
 """
 
+import json
 import os
 import re
 import time
@@ -61,7 +62,8 @@ from db import exec_sql, query
 from tx_walk import advance, build_stmts, make_bands
 from update_users_lite import Filler
 from utils import (MAX_BATCH, MIN_OID, PAGE_LIMIT, STATE_DIR, filler_shard,
-                   make_cursor, read_json, shard_owns, to_unix_ms, write_json)
+                   make_cursor, prepare_transaction, read_json, shard_owns,
+                   to_unix_ms, write_json)
 
 ITEM_MARKET_STATE = os.path.join(STATE_DIR, "item_market_state.json")
 ITEM_TYPE_TX_STATE = os.path.join(STATE_DIR, "item_type_tx_state.json")
@@ -775,7 +777,7 @@ ON CONFLICT (entity_id) DO NOTHING;"""
         completion stamps travel with the items they follow, so an entity is
         never marked scraped before its rows are stored."""
         out = self.stmts()
-        self._items = []
+        self._pages = []
         self._marks = []
         return out
 
@@ -971,10 +973,49 @@ WHERE transaction_type_id = (SELECT id FROM transaction_types WHERE type = '{typ
   AND item_code_id = (SELECT id FROM item_codes WHERE code = '{code}')
   AND transactions_scraped_at IS NULL;"""
 
+    # One page's rows, minus the ones we already hold (2026-08-21).
+    #
+    # ~94 % of what this walk fetches is already stored — it is re-reading
+    # history to prove there are no holes in it — and every one of those rows
+    # used to run the whole insert_transaction body (get_inventory_id,
+    # extract_skills, get_item_id and its row locks) only to land on ON
+    # CONFLICT DO NOTHING. Measured on 5,000 real rows against live tsdb:
+    # 5,094 rows/s as one statement per row, 6,092 rows/s set-based, and
+    # 41,512 rows/s with this filter. The cost is INSIDE the function, so the
+    # only real saving is not calling it.
+    #
+    # `have` is scoped to this page's own (type, code) and [min, max] created_at,
+    # which is what keeps it chunk-pruned and segmentby-selective (the
+    # transactions hypertable segments by transaction_type_id): 268,682 ids for
+    # a five-DAY slice came back in 0.35 s, and a page spans seconds.
+    #
+    # It fails OPEN: a type or code we have never stored makes its subselect
+    # NULL, `have` empty, and every row insert. It can never skip a row we do
+    # not hold — verified 2026-08-21 against an independent per-id probe over
+    # 12 battleLoot streams, 1,153 rows: 193 rows judged missing by this WHERE
+    # clause, 193 by the probe, on every page.
+    #
+    # NOTE for whoever reads update_filler_boost's "N rows (M%)" line: for this
+    # filler that ratio is now ~100 % by construction and no longer says
+    # anything about duplicate FETCHES.
+    STORE_SQL = """
+WITH have AS (
+    SELECT transaction_id FROM transactions
+     WHERE transaction_type_id = (SELECT id FROM transaction_types WHERE type = '{type}')
+       AND item_code_id = (SELECT id FROM item_codes WHERE code = '{code}')
+       AND created_at >= to_timestamp({lo})
+       AND created_at <= to_timestamp({hi})
+)
+SELECT insert_transaction(e)
+FROM jsonb_array_elements($JSON${js}$JSON$::jsonb) e
+WHERE objectid_to_uuid(e->>'_id') NOT IN (SELECT transaction_id FROM have);"""
+
     def __init__(self, db: str) -> None:
         self.db = db
         self.state = read_json(ITEM_TYPE_TX_STATE, {"combos": {}, "stats": {}})
-        self._items: list[dict] = []
+        # (combo key, that page's items) — grouped per PAGE, not one flat list,
+        # because STORE_SQL's `have` window is only cheap while it is narrow.
+        self._pages: list[tuple[str, list[dict]]] = []
         self._marks: list[str] = []        # combos whose watermark advanced
         self._done: list[str] = []         # combos finished THIS run
         self._offer = 0       # round-robin position into the combo order
@@ -1087,7 +1128,7 @@ WHERE transaction_type_id = (SELECT id FROM transaction_types WHERE type = '{typ
                 if not its:
                     self._finish(key, e)   # no history at all for this stream
                     continue
-                self._items.extend(its)
+                self._store(key, its)
                 stats["items"] = stats.get("items", 0) + len(its)
                 e["top_ms"] = to_unix_ms(its[0]["createdAt"])
             elif kind == "floor":
@@ -1096,7 +1137,7 @@ WHERE transaction_type_id = (SELECT id FROM transaction_types WHERE type = '{typ
                     # the derived floor was NOT the bottom — drop to the first
                     # transaction that exists and let the slices climb from
                     # there (the page itself is stored, not thrown away)
-                    self._items.extend(its)
+                    self._store(key, its)
                     stats["items"] = stats.get("items", 0) + len(its)
                     e["floor_ms"] = TX_EPOCH_MS
                     e["covered_to_ms"] = TX_EPOCH_MS
@@ -1106,12 +1147,17 @@ WHERE transaction_type_id = (SELECT id FROM transaction_types WHERE type = '{typ
                 if idx >= len(bands):
                     continue         # slice re-carved under us: nothing to do
                 kept = advance(bands[idx], data)
-                self._items.extend(kept)
+                self._store(key, kept)
                 stats["items"] = stats.get("items", 0) + len(kept)
                 if all(b.get("done") for b in bands):
                     self._close_slice(key, e)
         if self._dirty:
             stats["pages"] = stats.get("pages", 0) + len(slots)
+
+    def _store(self, key: str, items: list[dict]) -> None:
+        """Queue one page's rows for this combo (see STORE_SQL)."""
+        if items:
+            self._pages.append((key, items))
 
     def _close_slice(self, key: str, e: dict) -> None:
         """Every band of the slice retired → the range really is covered, so
@@ -1148,7 +1194,24 @@ WHERE transaction_type_id = (SELECT id FROM transaction_types WHERE type = '{typ
     # ---------------- statements & state ----------------
 
     def stmts(self) -> list[str]:
-        out = build_stmts(self._items)
+        out: list[str] = []
+        for key, items in self._pages:
+            ttype, code = key.split("|")
+            seen: set[str] = set()
+            rows = []
+            for it in items:                    # dedupe by _id, as build_stmts does
+                tid = it.get("_id")
+                if not tid or tid in seen:
+                    continue
+                seen.add(tid)
+                rows.append(prepare_transaction(it))
+            if not rows:
+                continue
+            ms = [to_unix_ms(it["createdAt"]) for it in items]
+            out.append(self.STORE_SQL.format(
+                type=ttype, code=code,
+                lo=min(ms) / 1000.0, hi=max(ms) / 1000.0,
+                js=json.dumps(rows, ensure_ascii=False, separators=(",", ":"))))
         for key in self._marks:
             ttype, code = key.split("|")
             e = self.state.get("combos", {}).get(key) or {}

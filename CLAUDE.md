@@ -230,6 +230,15 @@ Every mixed API batch made by `update_battles.py` / `update_live.py` /
    resumes instead of re-walking ~451 K pages. `top_ms` is a ceiling captured at bootstrap —
    rows created above it are the 72 h window step's. AHEAD of the user walks for filler 3's
    reason: finite, and it drains for good. `WARERA_ITEM_TYPE_TX_FILLER=0` disables it.
+   Its rows are stored by `STORE_SQL`, **one statement per PAGE that pre-filters the rows we
+   already hold** (a `have` CTE scoped to that page's own `(type, code)` and created_at
+   range). ~94 % of what this walk fetches is already stored, and each of those rows used to
+   run the whole `insert_transaction` body — `get_item_id`'s row locks included — only to land
+   on `ON CONFLICT DO NOTHING`. Measured 2026-08-21 on 5,000 real rows: 5,094 rows/s one
+   statement per row, 6,092 set-based, **41,512 with the filter** (the cost is INSIDE the
+   function, so the only saving is not calling it). It fails OPEN — an unknown type/code makes
+   `have` empty and every row inserts — and was verified against an independent per-id probe
+   over 12 `battleLoot` streams: 193 rows judged missing by the WHERE clause, 193 by the probe.
    Measured 2026-08-20: filtered pages cost ~0.27 s at EVERY depth (vs 2.30 s for an
    unfiltered page 24 h deep) and 50 of them come back in 1.29 s, so all 45 M rows of the
    three types are ~3.2 h of pure API time; in production it ran at ~800 pages/min with
